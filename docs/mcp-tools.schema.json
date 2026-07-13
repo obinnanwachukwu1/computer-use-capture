@@ -216,6 +216,10 @@
                   "unavailable"
                 ]
               },
+              "formatFingerprint": {
+                "type": "string",
+                "description": "Stable fingerprint of the observed Computer Use transport shape, when one was available at start. Used only for compatibility diagnostics."
+              },
               "detail": {
                 "type": "string"
               }

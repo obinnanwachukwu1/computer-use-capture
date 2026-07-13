@@ -47,8 +47,16 @@ server.setRequestHandler(CallToolRequestSchema, async request => {
       recorder_discard: "discard",
       recorder_capabilities: "capabilities"
     })[name];
+    const activeRecordingBeforeStart = name === "recorder_start"
+      ? await service.activeRecordingId()
+      : null;
     const result = await service[method](args);
     if (!validate.output(result)) {
+      if (name === "recorder_start"
+          && result?.recordingId
+          && result.recordingId !== activeRecordingBeforeStart) {
+        await service.discard({ recordingId: result.recordingId }).catch(() => {});
+      }
       throw new RecorderError("storage_unavailable", "Server produced a result outside its MCP output contract", {
         data: { validationErrors: validate.output.errors }
       });

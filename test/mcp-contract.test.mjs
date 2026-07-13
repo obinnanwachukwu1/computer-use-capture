@@ -3,9 +3,28 @@ import test from "node:test";
 import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import Ajv2020 from "ajv/dist/2020.js";
+import addFormats from "ajv-formats";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { RecorderService } from "../lib/recorder-service.mjs";
+
+test("recorder_start contract accepts the adapter fingerprint it emits", async () => {
+  const contract = JSON.parse(await readFile(path.resolve("docs/mcp-tools.schema.json"), "utf8"));
+  const startTool = contract.tools.find(tool => tool.name === "recorder_start");
+  const ajv = new Ajv2020({ allErrors: true, strict: false });
+  addFormats(ajv);
+  const validate = ajv.compile(startTool.outputSchema);
+  assert.equal(validate({
+    recordingId: "rec_contractfingerprint",
+    state: "recording",
+    startedAt: "2026-07-13T20:12:15.098Z",
+    introspection: {
+      codexSession: "attached",
+      formatFingerprint: "d2bcf99da22c6aeb"
+    }
+  }), true, JSON.stringify(validate.errors));
+});
 
 test("MCP server publishes the reviewed seven-tool contract", async () => {
   const store = await mkdtemp(path.join(os.tmpdir(), "agentrecorder-mcp-"));

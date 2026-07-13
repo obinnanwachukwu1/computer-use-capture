@@ -188,6 +188,32 @@ test("resolves native geometry by identity, post-action focus, and structural an
   assert.equal(latestPartialTree.targetResolution.provenance, "ax-identity");
   assert.equal(latestPartialTree.semanticTarget.nativeElementIndex, 42);
 
+  const exactIdentityInPartialTree = resolveAccessibilityTarget({
+    event: {
+      ...base,
+      accessibilityTarget: {
+        role: "button",
+        description: "New Tab",
+        identifier: "NewTabButton"
+      }
+    },
+    observations: [{
+      observedAt: "2026-07-13T14:09:55.600Z",
+      windowBounds,
+      treeComplete: false,
+      elements: [{
+        index: 50,
+        role: "AXButton",
+        description: "New Tab",
+        identifier: "NewTabButton",
+        bounds: { x: 950, y: 50, width: 37, height: 52 }
+      }]
+    }],
+    captureStartedAt: "2026-07-13T14:00:00.000Z", captureWidth: 1000, captureHeight: 800
+  });
+  assert.equal(exactIdentityInPartialTree.targetResolution.provenance, "ax-identity");
+  assert.equal(exactIdentityInPartialTree.semanticTarget.nativeElementIndex, 50);
+
   const subroleIdentity = resolveAccessibilityTarget({
     event: { ...base, accessibilityTarget: { role: "standard window", label: "TraceCode" } },
     observations: [{
