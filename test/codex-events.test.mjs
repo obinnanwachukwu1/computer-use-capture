@@ -311,6 +311,39 @@ test("resolves native geometry by identity, post-action focus, and structural an
   assert.equal(namedMissingSibling.targetResolution.provenance, "unresolved");
 });
 
+test("records a semantic viewport relocation when Computer Use brings an offscreen target into view", () => {
+  const event = {
+    timestamp: "2026-07-13T14:09:55.500Z",
+    action: "click",
+    args: { app: "Safari", element_index: 96 },
+    accessibilityTarget: { role: "button", label: "30 days" },
+    timing: {
+      toolCallStartedAt: "2026-07-13T14:09:55.000Z",
+      toolCallEndedAt: "2026-07-13T14:09:56.300Z"
+    }
+  };
+  const windowBounds = { x: 100, y: 50, width: 1000, height: 800 };
+  const resolved = resolveAccessibilityTarget({
+    event,
+    observations: [
+      {
+        observedAt: "2026-07-13T14:09:54.800Z", windowBounds, treeComplete: true,
+        elements: [{ index: 105, role: "AXButton", title: "30 days", bounds: { x: 820, y: 900, width: 70, height: 32 } }]
+      },
+      {
+        observedAt: "2026-07-13T14:09:55.900Z", windowBounds, treeComplete: true,
+        elements: [{ index: 105, role: "AXButton", title: "30 days", bounds: { x: 820, y: 420, width: 70, height: 32 } }]
+      }
+    ],
+    captureStartedAt: "2026-07-13T14:00:00.000Z", captureWidth: 1000, captureHeight: 800
+  });
+  assert.equal(resolved.semanticTarget.viewportRelocation.kind, "target-entered-viewport");
+  assert.equal(resolved.semanticTarget.viewportRelocation.fromVisibleFraction, 0);
+  assert.ok(Math.abs(resolved.semanticTarget.viewportRelocation.toVisibleFraction - 1) < 1e-9);
+  assert.ok(resolved.semanticTarget.viewportRelocation.displacementNorm > 0.5);
+  assert.equal(resolved.semanticTarget.viewportRelocation.postActionOffsetMs, 400);
+});
+
 test("retains unknown future sky actions for fail-open compatibility", () => {
   const [call] = extractSkyCalls(`await sky.future_action({ x: 12, y: 34 });`);
   assert.equal(call.method, "future_action");

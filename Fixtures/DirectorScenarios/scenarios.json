@@ -52,6 +52,16 @@
       "expectedEpisodes":0,"expectedEpisodeActions":0,"expectedShots":0
     },
     {
+      "name": "offscreen-semantic-target-relocation",
+      "duration": 10,
+      "events": [
+        {"action":"click","time":3,"coordinates":{"xNorm":0.76,"yNorm":0.48}},
+        {"action":"click","time":5,"coordinates":{"xNorm":0.82,"yNorm":0.52},"semanticTarget":{"bounds":{"xNorm":0.79,"yNorm":0.49,"widthNorm":0.06,"heightNorm":0.05},"viewportRelocation":{"kind":"target-entered-viewport","displacementNorm":0.62,"fromVisibleFraction":0,"toVisibleFraction":1,"postActionOffsetMs":450}}}
+      ],
+      "motion": [],
+      "expectedEpisodes":0,"expectedEpisodeActions":0,"expectedShots":2
+    },
+    {
       "name": "reveal-followed-by-unrelated-actions",
       "duration": 18,
       "events": [

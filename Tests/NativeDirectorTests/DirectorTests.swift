@@ -127,6 +127,18 @@ private func composition(
     #expect(directed.actions[0].attention?.evidence.count == 1)
 }
 
+@Test func offscreenSemanticTargetRelocationStartsANewEstablishingShot() throws {
+    let directed = try composition("""
+    [
+      {"action":"click","time":3,"coordinates":{"xNorm":0.76,"yNorm":0.48}},
+      {"action":"click","time":4.3,"coordinates":{"xNorm":0.82,"yNorm":0.52},"semanticTarget":{"bounds":{"xNorm":0.79,"yNorm":0.49,"widthNorm":0.06,"heightNorm":0.05},"viewportRelocation":{"kind":"target-entered-viewport","displacementNorm":0.62,"fromVisibleFraction":0,"toVisibleFraction":1,"postActionOffsetMs":450}}}
+    ]
+    """, duration: 8)
+    #expect(directed.shots.count == 2)
+    #expect(directed.actions[1].requiresEstablishingTransition)
+    #expect(abs(directed.actions[1].relocationSettleDelay - 0.45) < 0.001)
+}
+
 @Test func revealedRegionCreatesTwoLevelAttentionEpisode() throws {
     let directed = try composition("""
     [

@@ -30,8 +30,16 @@ public struct Timeline: Codable, Sendable {
                 public let widthNorm: Double?
                 public let heightNorm: Double?
             }
+            public struct ViewportRelocation: Codable, Sendable {
+                public let kind: String?
+                public let displacementNorm: Double?
+                public let fromVisibleFraction: Double?
+                public let toVisibleFraction: Double?
+                public let postActionOffsetMs: Double?
+            }
             public let bounds: Bounds?
             public let role: String?
+            public let viewportRelocation: ViewportRelocation?
         }
         public struct TargetResolution: Codable, Sendable {
             public let provenance: String?
@@ -90,6 +98,8 @@ public struct DirectedAction: Sendable {
     public let emphasis: String?
     public let holdExtension: Double
     public let requiresExactTarget: Bool
+    public let requiresEstablishingTransition: Bool
+    public let relocationSettleDelay: Double
     public let attention: AttentionDecision?
     public let episodeID: Int?
 
@@ -671,6 +681,8 @@ public struct NativeComposition: Sendable {
             emphasis: event.editingIntent?.emphasis,
             holdExtension: max(0, (event.editingIntent?.holdMs ?? 0) / 1000),
             requiresExactTarget: event.args?.element_index != nil,
+            requiresEstablishingTransition: event.semanticTarget?.viewportRelocation?.kind == "target-entered-viewport",
+            relocationSettleDelay: clamp((event.semanticTarget?.viewportRelocation?.postActionOffsetMs ?? 0) / 1000, 0, 1.2),
             attention: nil, episodeID: nil
         )
     }
@@ -713,7 +725,10 @@ public struct NativeComposition: Sendable {
                     pointConfidence: 0.52,
                     cursorAllowed: allowInferredTargets,
                     emphasis: action.emphasis, holdExtension: action.holdExtension,
-                    requiresExactTarget: action.requiresExactTarget, attention: action.attention,
+                    requiresExactTarget: action.requiresExactTarget,
+                    requiresEstablishingTransition: action.requiresEstablishingTransition,
+                    relocationSettleDelay: action.relocationSettleDelay,
+                    attention: action.attention,
                     episodeID: action.episodeID
                 )
             }
@@ -785,6 +800,8 @@ public struct NativeComposition: Sendable {
                 cursorAllowed: action.cursorAllowed,
                 emphasis: action.emphasis, holdExtension: action.holdExtension,
                 requiresExactTarget: action.requiresExactTarget,
+                requiresEstablishingTransition: action.requiresEstablishingTransition,
+                relocationSettleDelay: action.relocationSettleDelay,
                 attention: AttentionDecision(
                     bounds: bounds, confidence: confidence, behavior: behavior, evidence: evidence
                 ),
@@ -874,6 +891,8 @@ public struct NativeComposition: Sendable {
                     cursorAllowed: action.cursorAllowed,
                     emphasis: action.emphasis, holdExtension: action.holdExtension,
                     requiresExactTarget: action.requiresExactTarget,
+                    requiresEstablishingTransition: action.requiresEstablishingTransition,
+                    relocationSettleDelay: action.relocationSettleDelay,
                     attention: decision, episodeID: episodeID
                 )
             }
@@ -915,7 +934,8 @@ public struct NativeComposition: Sendable {
             let samePlace = clusterFits && (viewportOverlap >= 0.4 || distance <= 0.24)
             let sameEpisode = previousAction?.episodeID != nil && previousAction?.episodeID == action.episodeID
             let joinsInEditedTime = sameEpisode || gap <= 1.6 || (samePlace && gap <= 3.8)
-            if !shots.isEmpty && joinsInEditedTime && (samePlace || gap <= 0.75 || semantic) {
+            let requiresBoundary = previousAction != nil && action.requiresEstablishingTransition
+            if !requiresBoundary && !shots.isEmpty && joinsInEditedTime && (samePlace || gap <= 0.75 || semantic) {
                 shots[shots.count - 1].actions.append(action)
                 shots[shots.count - 1].focusEnd = actionHoldEnd(action)
                 shots[shots.count - 1].end = shots[shots.count - 1].focusEnd + 0.58

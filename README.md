@@ -99,6 +99,8 @@ Click timing is phase-based rather than a fixed telemetry offset. The rollout ad
 
 Shot grouping uses edited output time rather than raw agent time. Nearby controls are clustered when their projected camera viewports overlap and all targets fit inside one stable zoom envelope. Strongly overlapping targets can bridge up to 3.8 seconds in the edited video; the camera stays zoomed and pans between them instead of returning to 1x. A cluster-fit constraint prevents chains of individually nearby actions from gradually drifting across the screen.
 
+Accessibility reconstruction also preserves viewport relocations. When the same semantic target is outside the captured window before a Computer Use action and clearly inside it afterward, the director treats that geometry change as a shot boundary rather than ordinary layout motion. It establishes the full window before the pointer trip, holds the wide context while the application scrolls or navigates, shows the factual click, and focuses the newly visible region only after it settles.
+
 ```sh
 swift run -c release native-compose \
   artifacts/milestone-product-demo.mov \

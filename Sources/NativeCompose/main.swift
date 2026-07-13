@@ -569,14 +569,24 @@ private func buildCameraMoves(composition: NativeComposition, base: CameraState)
         guard let settled = composition.settledCamera(forActionID: action.id) else { continue }
         let actionOutput = composition.outputTime(atSourceTime: action.time)
         let sameShot = previousAction.flatMap { shotByAction[$0.id] } == shotByAction[action.id]
+        let trip = composition.pointerTrip(forActionID: action.id)
 
-        if let previousAction, !sameShot, actionOutput - previousActionOutput > 2.0 {
-            let nominalStart = previousActionOutput + (previousAction.kind == "click" ? 0.52 : 0.68)
-            let start = max(nominalStart, (moves.last?.end ?? nominalStart) + 0.60)
-            appendMove(label: "shot-zoom-out", start: start, end: start + 0.62, to: base)
+        if let previousAction, !sameShot,
+           (actionOutput - previousActionOutput > 2.0 || action.requiresEstablishingTransition) {
+            if action.requiresEstablishingTransition, let trip {
+                let tripStart = composition.outputTime(atSourceTime: trip.start)
+                let end = tripStart - 0.08
+                let earliest = previousActionOutput + (previousAction.kind == "click" ? 0.28 : 0.38)
+                let start = max(earliest, end - 0.56)
+                appendMove(label: "viewport-relocation-zoom-out", start: start, end: end, to: base)
+            } else {
+                let nominalStart = previousActionOutput + (previousAction.kind == "click" ? 0.52 : 0.68)
+                let start = max(nominalStart, (moves.last?.end ?? nominalStart) + 0.60)
+                appendMove(label: "shot-zoom-out", start: start, end: start + 0.62, to: base)
+            }
         }
 
-        if let trip = composition.pointerTrip(forActionID: action.id) {
+        if let trip {
             let tripStart = composition.outputTime(atSourceTime: trip.start)
             let projectedStart = projectPointThroughCamera(trip.from, camera: pose, outputSize: logicalOutputSize)
             let safe = CGRect(
@@ -597,7 +607,19 @@ private func buildCameraMoves(composition: NativeComposition, base: CameraState)
                 let cursor = composition.cursor(at: sourceTime).point
                 return safe.contains(projectPointThroughCamera(cursor, camera: camera, outputSize: logicalOutputSize))
             }
-            if !safe.contains(projectedStart) || !directKeepsPointerVisible {
+            if action.requiresEstablishingTransition {
+                // Computer Use may scroll an offscreen semantic target into
+                // view before activation. Establish the relocated viewport
+                // first, show the factual click in that wide context, and
+                // only then focus the new region.
+                let focusStart = max(delayedEnd, actionOutput + 0.08 + action.relocationSettleDelay)
+                appendMove(
+                    label: "action-\(action.id)-relocation-focus",
+                    start: focusStart,
+                    end: focusStart + 0.62,
+                    to: settled
+                )
+            } else if !safe.contains(projectedStart) || !directKeepsPointerVisible {
                 let route = CGRect(
                     x: min(trip.from.x, trip.to.x), y: min(trip.from.y, trip.to.y),
                     width: abs(trip.to.x - trip.from.x), height: abs(trip.to.y - trip.from.y)
