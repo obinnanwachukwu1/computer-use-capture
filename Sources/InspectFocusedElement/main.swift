@@ -22,6 +22,7 @@ guard let application = NSRunningApplication.runningApplications(
 }
 
 let appElement = AXUIElementCreateApplication(application.processIdentifier)
+AXUIElementSetMessagingTimeout(appElement, 1.0)
 
 let identityAttributes: [(attribute: String, key: String)] = [
     (kAXRoleAttribute, "role"),
@@ -43,6 +44,7 @@ let identityAttributes: [(attribute: String, key: String)] = [
 
 if watchesChanges {
     let stopState = StopState()
+    let changeState = ChangeState()
     signal(SIGINT, SIG_IGN)
     signal(SIGTERM, SIG_IGN)
     let interruptSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .global())
@@ -52,24 +54,50 @@ if watchesChanges {
     interruptSource.resume()
     terminationSource.resume()
 
+    var observer: AXObserver?
+    var notificationRegistrations = 0
+    if AXObserverCreate(application.processIdentifier, { _, _, _, context in
+        guard let context else { return }
+        Unmanaged<ChangeState>.fromOpaque(context).takeUnretainedValue().markDirty()
+    }, &observer) == .success, let observer {
+        let context = Unmanaged.passUnretained(changeState).toOpaque()
+        for notification in [
+            kAXFocusedUIElementChangedNotification,
+            kAXWindowCreatedNotification,
+            kAXLayoutChangedNotification,
+            kAXValueChangedNotification
+        ] {
+            if AXObserverAddNotification(observer, appElement, notification as CFString, context) == .success {
+                notificationRegistrations += 1
+            }
+        }
+        CFRunLoopAddSource(CFRunLoopGetCurrent(), AXObserverGetRunLoopSource(observer), .defaultMode)
+    }
+
     var previousSignature: String?
+    var lastFallbackSnapshot = Date.distantPast
     while !stopState.isStopped {
+        _ = CFRunLoopRunInMode(.defaultMode, 0.2, true)
+        guard changeState.consumeDirty() || Date().timeIntervalSince(lastFallbackSnapshot) >= 1.5 else { continue }
+        let walkStarted = ContinuousClock.now
         var output = accessibilitySnapshot(
             appElement: appElement,
             bundleIdentifier: bundleIdentifier,
             pid: application.processIdentifier
         )
+        output["notificationRegistrations"] = notificationRegistrations
+        output["samplingMode"] = notificationRegistrations > 0 ? "notifications-with-fallback" : "fallback-only"
+        let walkDuration = walkStarted.duration(to: .now)
         let signatureData = try JSONSerialization.data(withJSONObject: output, options: [.sortedKeys])
         let signature = String(decoding: signatureData, as: UTF8.self)
         if signature != previousSignature {
             output["observedAt"] = isoTimestamp()
+            output["walkDurationMs"] = Double(walkDuration.components.seconds) * 1000
+                + Double(walkDuration.components.attoseconds) / 1e15
             writeJSONLine(output)
             previousSignature = signature
         }
-        // A complete indexed AX snapshot is intentionally sampled at a low
-        // rate. It is passive telemetry, and UI structure changes much less
-        // frequently than captured video frames.
-        Thread.sleep(forTimeInterval: 0.5)
+        lastFallbackSnapshot = Date()
     }
     interruptSource.cancel()
     terminationSource.cancel()
@@ -91,6 +119,18 @@ final class StopState: @unchecked Sendable {
 
     var isStopped: Bool { lock.withLock { stopped } }
     func stop() { lock.withLock { stopped = true } }
+}
+
+final class ChangeState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var dirty = true
+    func markDirty() { lock.withLock { dirty = true } }
+    func consumeDirty() -> Bool {
+        lock.withLock {
+            defer { dirty = false }
+            return dirty
+        }
+    }
 }
 
 func focusedElementSnapshot(
@@ -131,10 +171,14 @@ func accessibilitySnapshot(
         "pid": pid,
         "focused": false,
     ]
+    let frontmostBundleIdentifier = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+    output["frontmostBundleIdentifier"] = frontmostBundleIdentifier
+    output["targetIsFrontmost"] = frontmostBundleIdentifier == bundleIdentifier
+    output["frontmostIsSystemSurface"] = isSystemOwnedSurface(frontmostBundleIdentifier)
 
     var indexedElements: [[String: Any]] = []
     var nextIndex = 0
-    var visited = Set<CFHashCode>()
+    var visited: [CFHashCode: [AXUIElement]] = [:]
     collectIndexedElements(
         appElement,
         index: &nextIndex,
@@ -143,6 +187,9 @@ func accessibilitySnapshot(
         isApplicationRoot: true
     )
     output["elements"] = indexedElements
+    output["elementCount"] = indexedElements.count
+    output["treeComplete"] = bundleIdentifier != "com.apple.Safari"
+        || indexedElements.contains { $0["role"] as? String == "AXWebArea" }
     if output["windowBounds"] == nil,
        let window = indexedElements.first(where: { $0["role"] as? String == "AXWindow" }),
        let bounds = window["bounds"] {
@@ -151,15 +198,26 @@ func accessibilitySnapshot(
     return output
 }
 
+func isSystemOwnedSurface(_ bundleIdentifier: String?) -> Bool {
+    guard let bundleIdentifier else { return false }
+    return bundleIdentifier.contains(".xpc.")
+        || bundleIdentifier.hasSuffix(".xpc")
+        || bundleIdentifier == "com.apple.SecurityAgent"
+        || bundleIdentifier == "com.apple.CoreServicesUIAgent"
+        || bundleIdentifier == "com.apple.universalaccessAuthWarn"
+        || bundleIdentifier == "com.apple.TCC"
+}
+
 func collectIndexedElements(
     _ element: AXUIElement,
     index: inout Int,
-    visited: inout Set<CFHashCode>,
+    visited: inout [CFHashCode: [AXUIElement]],
     output: inout [[String: Any]],
     isApplicationRoot: Bool = false
 ) {
-    let identity = CFHash(element)
-    guard visited.insert(identity).inserted else { return }
+    let identityHash = CFHash(element)
+    if visited[identityHash, default: []].contains(where: { CFEqual($0, element) }) { return }
+    visited[identityHash, default: []].append(element)
 
     // Computer Use numbers the application's visible descendants, not the
     // synthetic AXApplication root itself. Preserve that same DFS index while
@@ -184,9 +242,26 @@ func collectIndexedElements(
         output.append(item)
     }
 
-    for child in copyElementArrayAttribute(element, kAXChildrenAttribute) {
+    for child in copyTraversalChildren(element) {
         collectIndexedElements(child, index: &index, visited: &visited, output: &output)
     }
+}
+
+func copyTraversalChildren(_ element: AXUIElement) -> [AXUIElement] {
+    // WebKit exposes different semantic descendants through different AX
+    // collection attributes depending on layout, clipping, and transient UI.
+    // Walk their union and let pointer identity deduplicate nodes. Restricting
+    // traversal to AXChildren alone drops real, visible controls on some pages.
+    let attributes = [
+        kAXChildrenAttribute,
+        kAXVisibleChildrenAttribute,
+        kAXContentsAttribute,
+        "AXChildrenInNavigationOrder",
+        kAXRowsAttribute,
+        kAXColumnsAttribute,
+        kAXTabsAttribute,
+    ]
+    return attributes.flatMap { copyElementArrayAttribute(element, $0) }
 }
 
 func writeJSONLine(_ value: [String: Any]) {

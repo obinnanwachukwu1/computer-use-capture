@@ -91,6 +91,7 @@ enum CaptureCodec: String {
 enum CaptureError: LocalizedError {
     case usage(String)
     case safariWindowNotFound
+    case safariWindowAmbiguous(Int)
     case writerSetup(String)
     case noFrames
 
@@ -100,6 +101,8 @@ enum CaptureError: LocalizedError {
             return message
         case .safariWindowNotFound:
             return "No onscreen Safari window was found"
+        case .safariWindowAmbiguous(let count):
+            return "Expected one eligible onscreen Safari window, found \(count)"
         case .noFrames:
             return "ScreenCaptureKit did not deliver any complete frames"
         }
@@ -153,8 +156,10 @@ final class MovieWriter: NSObject, SCStreamOutput, @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard appendError == nil else { return }
+        guard input.isReadyForMoreMediaData else { return }
 
         let presentationTime = sampleBuffer.presentationTimeStamp
+        var firstFrameMessage: String?
         if firstPresentationTime == nil {
             firstPresentationTime = presentationTime
             let attachments = CMSampleBufferGetSampleAttachmentsArray(
@@ -165,16 +170,19 @@ final class MovieWriter: NSObject, SCStreamOutput, @unchecked Sendable {
             let contentScale = (info?[.contentScale] as? NSNumber)?.doubleValue ?? .nan
             let bufferWidth = CMSampleBufferGetImageBuffer(sampleBuffer).map(CVPixelBufferGetWidth) ?? 0
             let bufferHeight = CMSampleBufferGetImageBuffer(sampleBuffer).map(CVPixelBufferGetHeight) ?? 0
-            writeStandardOutput(
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            let wallTime = formatter.string(from: Date())
+            firstFrameMessage =
                 "CAPTURE_FRAME buffer=\(bufferWidth)x\(bufferHeight) " +
-                    "scaleFactor=\(scaleFactor) contentScale=\(contentScale)\n"
-            )
+                    "scaleFactor=\(scaleFactor) contentScale=\(contentScale) " +
+                    "wallTime=\(wallTime) ptsSeconds=\(presentationTime.seconds)\n"
             writer.startSession(atSourceTime: presentationTime)
         }
 
-        guard input.isReadyForMoreMediaData else { return }
         if input.append(sampleBuffer) {
             frameCount += 1
+            if let firstFrameMessage { writeStandardOutput(firstFrameMessage) }
         } else {
             appendError = writer.error ?? CaptureError.writerSetup("Failed to append a video frame")
         }
@@ -226,15 +234,16 @@ struct CaptureSafari {
                 false,
                 onScreenWindowsOnly: true
             )
-            guard let safariWindow = content.windows
+            let safariWindows = content.windows
                 .filter({ $0.owningApplication?.bundleIdentifier == "com.apple.Safari" })
                 .filter({ $0.frame.width >= 320 && $0.frame.height >= 240 })
-                .max(by: { lhs, rhs in
-                    lhs.frame.width * lhs.frame.height < rhs.frame.width * rhs.frame.height
-                })
-            else {
+            guard !safariWindows.isEmpty else {
                 throw CaptureError.safariWindowNotFound
             }
+            guard safariWindows.count == 1 else {
+                throw CaptureError.safariWindowAmbiguous(safariWindows.count)
+            }
+            let safariWindow = safariWindows[0]
             guard let safariApplication = safariWindow.owningApplication else {
                 throw CaptureError.writerSetup("Safari window has no owning application")
             }

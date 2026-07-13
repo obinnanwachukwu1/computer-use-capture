@@ -8,14 +8,14 @@
     "asyncModel": "Long-running work (rendering) is returned as a render job id and polled with recorder_get. Tool calls never block on unbounded work. The MCP 2025-11-25 experimental tasks utility is intentionally not required; it may be adopted additively later.",
     "wireBehavior": [
       "Every tool defines outputSchema; successful results are returned in structuredContent conforming to it, with a human-readable text block as fallback content.",
-      "All failures (including input validation) are returned as tool execution errors: result.isError = true with structuredContent conforming to errorModel.errorSchema, so the calling model can self-correct.",
+      "All failures (including input validation) are returned as tool execution errors: result.isError = true with a JSON text content block conforming to errorModel.errorSchema. structuredContent is omitted on errors because MCP SDKs validate it against the tool's success outputSchema even when isError is true.",
       "Computer Use is never proxied, wrapped, or modified. Between recorder_start and recorder_stop the agent uses its existing Computer Use tools unchanged."
     ]
   },
   "identifiers": {
-    "recordingId": "rec_<ulid> — stable for the lifetime of the project store entry.",
-    "renderId": "ren_<ulid> — one per enqueued render; never reused.",
-    "actionId": "act_<seq> — stable per recording; derived from rollout call identity (event timestamp + call index within invocation), NOT from array position, so it survives timeline reprocessing."
+    "recordingId": "rec_<time-and-random-id> — stable for the lifetime of the project store entry.",
+    "renderId": "ren_<time-and-random-id> — one per enqueued render; never reused.",
+    "actionId": "act_<16-hex-digest> — stable per recording; derived from rollout call id, record timestamp, call index, method, and parsed source offset, NOT from output array position, so it survives timeline reprocessing."
   },
   "stateMachines": {
     "recording": {
@@ -56,7 +56,7 @@
     }
   },
   "errorModel": {
-    "transport": "Tool execution error: result.isError = true; structuredContent matches errorSchema below.",
+    "transport": "Tool execution error: result.isError = true; the JSON text content block matches errorSchema below and structuredContent is omitted.",
     "errorSchema": {
       "type": "object",
       "required": [
@@ -150,6 +150,11 @@
             "type": "string",
             "maxLength": 64,
             "description": "If a recording started with the same key is still active, that recording is returned instead of an error."
+          },
+          "threadId": {
+            "type": "string",
+            "maxLength": 80,
+            "description": "Optional explicit Codex task/thread binding. Prefer this when available; otherwise stop-time discovery fails closed if multiple matching sessions contain in-window actions."
           }
         },
         "additionalProperties": false
@@ -288,6 +293,10 @@
             "type": "string",
             "const": "stopped"
           },
+          "stoppedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
           "durationSeconds": {
             "type": "number"
           },
@@ -295,9 +304,10 @@
             "type": "string",
             "enum": [
               "settled",
-              "truncated"
+              "truncated",
+              "ambiguous"
             ],
-            "description": "'truncated' means the action log was still being written at the settle deadline; late actions may be missing."
+            "description": "'truncated' means the action log was still being written at the settle deadline; 'ambiguous' means multiple unbound Codex tasks emitted in-window actions, so the recorder failed closed and omitted reconstructed actions."
           },
           "actions": {
             "type": "array",
@@ -308,12 +318,13 @@
                 "actionId",
                 "kind",
                 "atMs",
-                "provenance"
+                "provenance",
+                "renderedCursor"
               ],
               "properties": {
                 "actionId": {
                   "type": "string",
-                  "pattern": "^act_[0-9]+$"
+                    "pattern": "^act_[0-9a-f]{16}$"
                 },
                 "kind": {
                   "type": "string",
@@ -342,6 +353,10 @@
                     "ax-structural",
                     "unresolved"
                   ]
+                },
+                "renderedCursor": {
+                  "type": "boolean",
+                  "description": "Whether the current factual cursor policy will render this action's cursor. The completed render report remains authoritative for visually inferred opt-in targets."
                 },
                 "confidence": {
                   "type": "number",
@@ -559,7 +574,7 @@
                   "properties": {
                     "actionId": {
                       "type": "string",
-                      "pattern": "^act_[0-9]+$"
+                      "pattern": "^act_[0-9a-f]{16}$"
                     },
                     "emphasis": {
                       "type": "string",
@@ -658,6 +673,7 @@
         "additionalProperties": false
       },
       "outputSchema": {
+        "type": "object",
         "oneOf": [
           {
             "type": "object",
@@ -728,7 +744,8 @@
                     "actionId",
                     "kind",
                     "atMs",
-                    "provenance"
+                    "provenance",
+                    "renderedCursor"
                   ],
                   "properties": {
                     "actionId": {
@@ -749,6 +766,9 @@
                         "ax-structural",
                         "unresolved"
                       ]
+                    },
+                    "renderedCursor": {
+                      "type": "boolean"
                     },
                     "confidence": {
                       "type": "number"
@@ -848,6 +868,9 @@
                       "uri": {
                         "type": "string",
                         "format": "uri"
+                      },
+                      "bytes": {
+                        "type": "integer"
                       }
                     },
                     "additionalProperties": false
@@ -908,7 +931,8 @@
                     "enum": [
                       "queued",
                       "analyzing",
-                      "rendering"
+                      "rendering",
+                      "completed"
                     ]
                   },
                   "percent": {
@@ -958,7 +982,7 @@
               },
               "pointerRendering": {
                 "type": "object",
-                "description": "Epistemic summary of the rendered cursor: how many pointer actions were shown at factual targets, shown at inferred targets (only if allowInferredTargets), or omitted because their target stayed unresolved.",
+                "description": "Epistemic summary of the rendered cursor: factual targets, opt-in inferred targets, inferred targets deliberately omitted by policy, and unresolved targets.",
                 "properties": {
                   "factual": {
                     "type": "integer"
@@ -966,11 +990,30 @@
                   "inferredRendered": {
                     "type": "integer"
                   },
+                  "inferredOmitted": {
+                    "type": "integer"
+                  },
                   "omittedUnresolved": {
                     "type": "integer"
                   }
                 },
                 "additionalProperties": false
+              },
+              "actions": {
+                "type": "array",
+                "description": "Authoritative per-action cursor decisions from the completed composition report.",
+                "items": {
+                  "type": "object",
+                  "required": ["actionId", "kind", "provenance", "confidence", "renderedCursor"],
+                  "properties": {
+                    "actionId": { "type": "string" },
+                    "kind": { "type": "string" },
+                    "provenance": { "type": "string" },
+                    "confidence": { "type": "number" },
+                    "renderedCursor": { "type": "boolean" }
+                  },
+                  "additionalProperties": false
+                }
               },
               "error": {
                 "type": "object",
@@ -1152,7 +1195,15 @@
                 },
                 "available": {
                   "type": "boolean",
-                  "description": "Running with an eligible on-screen window right now."
+                  "description": "Exactly one eligible on-screen window is available right now."
+                },
+                "windowCount": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "selection": {
+                  "type": "string",
+                  "const": "single-eligible-window-required"
                 }
               },
               "additionalProperties": false

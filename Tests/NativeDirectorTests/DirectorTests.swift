@@ -29,11 +29,12 @@ private func composition(
     reduceWaiting: Bool = false,
     waitingTime: Double = 0.1,
     motion: [VisualMotionObservation] = [],
-    interactionPhases: [Int: InteractionPhases] = [:]
+    interactionPhases: [Int: InteractionPhases] = [:],
+    allowInferredTargets: Bool = false
 ) throws -> NativeComposition {
     let json = """
     {
-      "composition": {"cursorScale": 3, "director": {"deadTimeRate": 6, "cursorCompression": 0.1, "zoomStrength": 1}},
+      "composition": {"cursorScale": 3, "director": {"deadTimeRate": 6, "cursorCompression": 0.1, "zoomStrength": 1, "allowInferredTargets": \(allowInferredTargets)}},
       "events": \(events)
     }
     """
@@ -223,6 +224,33 @@ private struct TimelineFixture: Encodable {
     #expect(directed.shots.isEmpty)
 }
 
+@Test func systemUIOcclusionIsEvidenceFreeForPointerAndMotion() throws {
+    let timeline = try JSONDecoder().decode(Timeline.self, from: Data("""
+    {
+      "occlusionSpans": [{"startTime": 2.5, "endTime": 3.1}],
+      "events": [{"actionId":"act_0123456789abcdef","action":"click","time":3,"coordinates":{"xNorm":0.8,"yNorm":0.2},"targetResolution":{"provenance":"direct","confidence":0.99}}]
+    }
+    """.utf8))
+    let directed = NativeComposition(
+        timeline: timeline,
+        size: size,
+        contentRect: rect,
+        sourceDuration: 8,
+        motionObservations: [
+            VisualMotionObservation(
+                time: 3.3,
+                normalizedBounds: CGRect(x: 0.1, y: 0.1, width: 0.8, height: 0.7),
+                changedFraction: 0.4,
+                magnitude: 1,
+                kind: .appearance
+            )
+        ]
+    )
+    #expect(directed.actions[0].rendersCursor == false)
+    #expect(directed.actions[0].attention == nil)
+    #expect(directed.shots.isEmpty)
+}
+
 @Test func semanticBoundsAreFirstClassAttentionEvidence() throws {
     let directed = try composition("""
     [{"action":"type_text","time":4,"semanticTarget":{"bounds":{"xNorm":0.2,"yNorm":0.25,"widthNorm":0.4,"heightNorm":0.08}}}]
@@ -383,7 +411,8 @@ private struct TimelineFixture: Encodable {
     ])
     #expect(directed.actions[0].point != nil)
     #expect(directed.actions[0].pointProvenance == "visual-inferred")
-    #expect(directed.anchors.count == 1)
+    #expect(directed.anchors.isEmpty)
+    #expect(directed.actions[0].rendersCursor == false)
     #expect(directed.actions[0].attention?.evidence.contains { $0.source == .visualPointer } == true)
 
     // Inferred cursor motion is editorial evidence, not a factual camera
@@ -393,6 +422,23 @@ private struct TimelineFixture: Encodable {
     #expect(adjusted.x == camera.x)
     #expect(adjusted.y == camera.y)
     #expect(adjusted.logScale == camera.logScale)
+}
+
+@Test func inferredCursorRequiresExplicitRecipeOptIn() throws {
+    let directed = try composition("""
+    [{"action":"click","time":3}]
+    """, motion: [
+        VisualMotionObservation(
+            time: 3.2,
+            normalizedBounds: CGRect(x: 0.72, y: 0.2, width: 0.12, height: 0.08),
+            changedFraction: 0.02,
+            magnitude: 0.7,
+            kind: .appearance
+        )
+    ], allowInferredTargets: true)
+    #expect(directed.actions[0].pointProvenance == "visual-inferred")
+    #expect(directed.actions[0].rendersCursor)
+    #expect(directed.anchors.count == 1)
 }
 
 @Test func noResponseClickRemainsUnresolvedWithoutInventingCameraAttention() throws {
@@ -598,4 +644,27 @@ private struct TimelineFixture: Encodable {
     )
     #expect(directed.cursor(at: 2.45).point != straight.cursor(at: 2.45).point)
     #expect(directed.cursor(at: 3).point == straight.cursor(at: 3).point)
+}
+@Test func contentRectPreservesWideSourceAspectAndProjectsSemanticTargetsInsideIt() throws {
+    let rect = aspectFittedContentRect(
+        canvas: CGSize(width: 1440, height: 1050), sourceAspect: 16.0 / 9.0, scale: 0.84
+    )
+    #expect(abs(rect.width / rect.height - 16.0 / 9.0) < 0.0001)
+    #expect(abs(rect.midX - 720) < 0.001)
+    #expect(abs(rect.midY - 525) < 0.001)
+    #expect(rect.width <= 1440 * 0.84 + 0.001)
+    #expect(rect.height <= 1050 * 0.84 + 0.001)
+    let timeline = try JSONDecoder().decode(Timeline.self, from: Data("""
+    {"events":[{"action":"type_text","time":1,"semanticTarget":{"bounds":{"xNorm":0.8,"yNorm":0.8,"widthNorm":0.1,"heightNorm":0.1}}}]}
+    """.utf8))
+    let directed = NativeComposition(
+        timeline: timeline,
+        size: CGSize(width: 1440, height: 1050),
+        contentRect: rect,
+        sourceDuration: 3
+    )
+    let target = try #require(directed.actions[0].semanticBounds)
+    #expect(rect.contains(CGPoint(x: target.minX, y: target.minY)))
+    #expect(rect.contains(CGPoint(x: target.maxX, y: target.maxY)))
+    #expect(abs(target.midX - (rect.minX + rect.width * 0.85)) < 0.001)
 }

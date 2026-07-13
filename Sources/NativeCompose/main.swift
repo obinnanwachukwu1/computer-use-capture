@@ -78,6 +78,13 @@ struct DecodedFrame {
     let buffer: CVPixelBuffer
 }
 
+struct CursorMetadata: Decodable {
+    let logicalWidth: CGFloat
+    let logicalHeight: CGFloat
+    let hotspotX: CGFloat
+    let hotspotY: CGFloat
+}
+
 let logicalOutputSize = CGSize(width: 1440, height: 1050)
 let renderScale: CGFloat = {
     let arguments = CommandLine.arguments
@@ -96,13 +103,6 @@ let outputSize = CGSize(width: width, height: height)
 // composition. This ratio also matches the default Screen Studio-like balance
 // of window, shadow, and wallpaper more closely.
 let contentScale: CGFloat = 0.84
-let contentRect = CGRect(
-    x: logicalOutputSize.width * (1 - contentScale) / 2,
-    y: logicalOutputSize.height * (1 - contentScale) / 2,
-    width: logicalOutputSize.width * contentScale,
-    height: logicalOutputSize.height * contentScale
-)
-let renderContentRect = contentRect.scaled(by: renderScale)
 
 do {
     let options = try Options.parse()
@@ -121,7 +121,15 @@ func render(_ options: Options) async throws {
     let asset = AVURLAsset(url: options.source)
     let sourceDuration = try await asset.load(.duration).seconds
     let track = try require(try await asset.loadTracks(withMediaType: .video).first, "source has no video track")
+    let naturalSize = try await track.load(.naturalSize)
+    guard naturalSize.width > 0, naturalSize.height > 0 else { throw Failure("source has invalid dimensions") }
+    let contentRect = aspectFittedContentRect(
+        canvas: logicalOutputSize,
+        sourceAspect: naturalSize.width / naturalSize.height,
+        scale: contentScale
+    )
     let timingProbes = interactionTimingProbes(timeline: timeline)
+    emitProgress(phase: "analyzing", percent: 0)
     // The same decoded-frame prepass serves two independent consumers:
     // waiting reduction and the default attention director.
     let motionAnalysis = try MotionAnalyzer.analyze(
@@ -158,12 +166,12 @@ func render(_ options: Options) async throws {
     guard composition.outputDuration > 0 else { throw Failure("director produced an empty composition") }
     print("native director actions=\(composition.actions.count) shots=\(composition.shots.count) source=\(String(format: "%.2f", sourceDuration))s output=\(String(format: "%.2f", composition.outputDuration))s waiting=\(options.reduceWaiting ? "cut" : "compressed")")
     let pointerActions = composition.actions.filter { ["click", "drag"].contains($0.kind) }
-    let factualPointers = pointerActions.filter {
-        ($0.point != nil || $0.to != nil) && $0.pointProvenance?.hasSuffix("-inferred") != true
-    }
-    let inferredPointers = pointerActions.filter { $0.pointProvenance?.hasSuffix("-inferred") == true }
+    let factualPointers = pointerActions.filter { $0.rendersCursor && isFactualCursorTarget($0) }
+    let inferredRenderedPointers = pointerActions.filter { $0.rendersCursor && !isFactualCursorTarget($0) }
+    let inferredPointers = pointerActions.filter { ($0.point != nil || $0.to != nil) && !$0.rendersCursor }
     let missingPointers = pointerActions.filter { $0.point == nil && $0.to == nil }
-    print("native pointer coverage=\(pointerActions.count - missingPointers.count)/\(pointerActions.count) factual=\(factualPointers.count) inferred=\(inferredPointers.count) unresolved=\(missingPointers.map(\.id))")
+    print("native pointer coverage=\(factualPointers.count + inferredRenderedPointers.count)/\(pointerActions.count) factual=\(factualPointers.count) inferredRendered=\(inferredRenderedPointers.count) inferredOmitted=\(inferredPointers.count) unresolved=\(missingPointers.map(\.actionId))")
+    try writeCompositionReport(composition: composition, output: options.output, state: "planned")
     let attentionSummary = composition.actions.compactMap { action in
         action.attention.map { "\(action.kind)@\(String(format: "%.1f", action.time)):\($0.behavior.rawValue)[\($0.evidence.map(\.source.rawValue).joined(separator: "+"))]" }
     }.joined(separator: " | ")
@@ -211,8 +219,10 @@ func render(_ options: Options) async throws {
     guard reader.canAdd(readerOutput) else { throw Failure("cannot add video reader output") }
     reader.add(readerOutput)
 
-    try? FileManager.default.removeItem(at: options.output)
-    let writer = try AVAssetWriter(outputURL: options.output, fileType: .mp4)
+    let temporaryOutput = options.output.deletingLastPathComponent()
+        .appendingPathComponent(".\(options.output.lastPathComponent).partial-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: temporaryOutput) }
+    let writer = try AVAssetWriter(outputURL: temporaryOutput, fileType: .mp4)
     let writerInput = AVAssetWriterInput(mediaType: .video, outputSettings: [
         AVVideoCodecKey: AVVideoCodecType.h264,
         AVVideoWidthKey: width,
@@ -241,7 +251,9 @@ func render(_ options: Options) async throws {
 
     let wallpaper = try loadImage(options.wallpaper)
     let cursor = try loadImage(options.cursor)
+    let cursorMetadata = try loadCursorMetadata(options.cursor)
     let totalFrames = Int(ceil(composition.outputDuration * Double(options.fps)))
+    emitProgress(phase: "rendering", percent: 0)
     let cameraSamples = try precomputeCameraSamples(composition: composition, frameCount: totalFrames, fps: options.fps, samples: options.samples)
     try writeCameraTrajectoryAudit(
         composition: composition,
@@ -292,6 +304,8 @@ func render(_ options: Options) async throws {
             sourceFrames: decodedFrames,
             wallpaper: wallpaper,
             cursor: cursor,
+            cursorMetadata: cursorMetadata,
+            contentRect: contentRect,
             composition: composition,
             frame: frame,
             fps: options.fps,
@@ -306,7 +320,10 @@ func render(_ options: Options) async throws {
         guard adaptor.append(outputBuffer, withPresentationTime: CMTime(value: CMTimeValue(frame), timescale: options.fps)) else {
             throw Failure(writer.error?.localizedDescription ?? "writer rejected frame \(frame)")
         }
-        if frame % Int(options.fps) == 0 { print("native frame \(frame)/\(totalFrames)") }
+        if frame % Int(options.fps) == 0 {
+            print("native frame \(frame)/\(totalFrames)")
+            emitProgress(phase: "rendering", percent: Double(frame) / Double(max(1, totalFrames)) * 100)
+        }
         if let lastBefore = decodedFrames.lastIndex(where: { $0.time <= minimumSourceTime }), lastBefore > 1 {
             decodedFrames.removeFirst(lastBefore - 1)
         }
@@ -316,7 +333,57 @@ func render(_ options: Options) async throws {
     await writer.finishWriting()
     guard writer.status == .completed else { throw Failure(writer.error?.localizedDescription ?? "writer failed") }
     reader.cancelReading()
+    try? FileManager.default.removeItem(at: options.output)
+    try FileManager.default.moveItem(at: temporaryOutput, to: options.output)
+    try writeCompositionReport(composition: composition, output: options.output, state: "completed")
+    emitProgress(phase: "completed", percent: 100)
     print("temporal blur frames=\(motionBlurredFrames)/\(totalFrames)")
+}
+
+func emitProgress(phase: String, percent: Double) {
+    let payload: [String: Any] = ["phase": phase, "percent": min(100, max(0, percent))]
+    guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) else { return }
+    print("AGENTRECORDER_PROGRESS \(String(decoding: data, as: UTF8.self))")
+}
+
+func writeCompositionReport(composition: NativeComposition, output: URL, state: String) throws {
+    let pointerActions = composition.actions.filter { ["click", "drag"].contains($0.kind) }
+    let report: [String: Any] = [
+        "version": 1,
+        "state": state,
+        "output": output.path,
+        "durationSeconds": composition.outputDuration,
+        "pointerRendering": [
+            "factual": pointerActions.filter { $0.rendersCursor && isFactualCursorTarget($0) }.count,
+            "inferredRendered": pointerActions.filter { $0.rendersCursor && !isFactualCursorTarget($0) }.count,
+            "inferredOmitted": pointerActions.filter {
+                !$0.rendersCursor && $0.pointProvenance == "visual-inferred"
+            }.count,
+            "omittedUnresolved": pointerActions.filter {
+                !$0.rendersCursor && $0.pointProvenance != "visual-inferred"
+            }.count
+        ],
+        "actions": composition.actions.map { action in
+            [
+                "actionId": action.actionId,
+                "kind": action.kind,
+                "provenance": action.pointProvenance ?? "unresolved",
+                "confidence": action.pointConfidence,
+                "renderedCursor": action.rendersCursor
+            ] as [String: Any]
+        }
+    ]
+    let data = try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])
+    let url = output.deletingPathExtension().appendingPathExtension("composition.json")
+    try data.write(to: url, options: .atomic)
+}
+
+func isFactualCursorTarget(_ action: DirectedAction) -> Bool {
+    switch action.pointProvenance {
+    case "direct", "ax-identity", "ax-focus": true
+    case "ax-structural": action.pointConfidence >= 0.75
+    default: false
+    }
 }
 
 func interactionTimingProbes(timeline: Timeline) -> [InteractionTimingProbe] {
@@ -419,7 +486,7 @@ func precomputeCameraSamples(composition: NativeComposition, frameCount: Int, fp
             emergencyVisibilityCorrections += 1
             emergencyCorrectionIndices.append(index)
         }
-        result.append(state)
+        result.append(unconstrained)
     }
     print("native camera emergency-visibility-corrections=\(emergencyVisibilityCorrections)/\(count)")
     if !emergencyCorrectionIndices.isEmpty {
@@ -438,13 +505,42 @@ func precomputeCameraSamples(composition: NativeComposition, frameCount: Int, fp
             String(format: "%.2f-%.2f", Double($0.lowerBound) / rate, Double($0.upperBound) / rate)
         }.joined(separator: ",")
         print("native camera emergency-ranges-out=\(summary)")
-        throw Failure("camera plan violated factual visibility at output times \(summary); refusing to render a corrective camera jump")
+        // A valid recording must never fail because a heuristic camera plan
+        // cropped factual input. Widen to the guaranteed-visible base pose for
+        // the offending span and blend over a 350 ms shoulder so the recovery
+        // remains a continuous camera move rather than an emergency jump.
+        let shoulder = max(1, Int(rate * 0.35))
+        for range in ranges {
+            let expandedStart = max(0, range.lowerBound - shoulder)
+            let expandedEnd = min(count - 1, range.upperBound + shoulder)
+            for index in expandedStart...expandedEnd {
+                let strength: CGFloat
+                if range.contains(index) { strength = 1 }
+                else if index < range.lowerBound {
+                    strength = CGFloat(smoothRecovery(Double(index - expandedStart) / Double(max(1, range.lowerBound - expandedStart))))
+                } else {
+                    strength = CGFloat(smoothRecovery(Double(expandedEnd - index) / Double(max(1, expandedEnd - range.upperBound))))
+                }
+                let original = result[index]
+                result[index] = CameraState(
+                    x: original.x + (base.x - original.x) * strength,
+                    y: original.y + (base.y - original.y) * strength,
+                    logScale: original.logScale + (base.logScale - original.logScale) * strength
+                )
+            }
+        }
+        print("native camera recovery=base-pose-smoothed ranges=\(ranges.count)")
     }
     let moveSummary = moves.map {
         "\($0.label){\(String(format: "%.2f", $0.start))-\(String(format: "%.2f", $0.end)),scale:\(String(format: "%.2f", exp($0.from.logScale)))->\(String(format: "%.2f", exp($0.to.logScale)))}"
     }.joined(separator: " | ")
     print("native camera moves=\(moveSummary)")
     return result
+}
+
+private func smoothRecovery(_ value: Double) -> Double {
+    let t = min(1, max(0, value))
+    return t * t * t * (t * (t * 6 - 15) + 10)
 }
 
 private func buildCameraMoves(composition: NativeComposition, base: CameraState) -> [CameraMove] {
@@ -648,6 +744,8 @@ func composeMotionBlurredFrame(
     sourceFrames: [DecodedFrame],
     wallpaper: CIImage,
     cursor: CIImage,
+    cursorMetadata: CursorMetadata,
+    contentRect: CGRect,
     composition: NativeComposition,
     frame: Int,
     fps: Int32,
@@ -673,7 +771,7 @@ func composeMotionBlurredFrame(
             y: centerCamera.y + (sampled.y - centerCamera.y) * shutter,
             logScale: centerCamera.logScale + (sampled.logScale - centerCamera.logScale) * shutter
         )
-        let base = composeBase(source: source, wallpaper: wallpaper)
+        let base = composeBase(source: source, wallpaper: wallpaper, contentRect: contentRect)
         let scale = exp(camera.logScale)
         let transform = CGAffineTransform(translationX: outputSize.width / 2, y: outputSize.height / 2)
             .scaledBy(x: scale, y: scale)
@@ -685,7 +783,8 @@ func composeMotionBlurredFrame(
             state: cursorState,
             camera: camera,
             cameraScale: scale,
-            cursorScale: composition.cursorScale
+            cursorScale: composition.cursorScale,
+            metadata: cursorMetadata
         )
         if let previous = accumulated {
             accumulated = withCursor.applyingFilter("CIMix", parameters: [
@@ -702,7 +801,8 @@ func composeMotionBlurredFrame(
             composition: composition,
             sourceTime: sourceTime,
             camera: centerCamera,
-            observations: motionObservations
+            observations: motionObservations,
+            contentRect: contentRect
         )
     }
     return result
@@ -713,7 +813,8 @@ func directorDebugOverlay(
     composition: NativeComposition,
     sourceTime: Double,
     camera: CameraState,
-    observations: [VisualMotionObservation]
+    observations: [VisualMotionObservation],
+    contentRect: CGRect
 ) -> CIImage {
     var result = background
     func projected(_ bounds: CGRect) -> CGRect {
@@ -774,9 +875,11 @@ func writeDirectorDebugReport(composition: NativeComposition, motionAnalysis: Mo
     let actions: [[String: Any]] = composition.actions.map { action in
         var item: [String: Any] = [
             "id": action.id,
+            "actionId": action.actionId,
             "kind": action.kind,
             "sourceTime": action.time,
-            "outputTime": composition.outputTime(atSourceTime: action.time)
+            "outputTime": composition.outputTime(atSourceTime: action.time),
+            "renderedCursor": action.rendersCursor
         ]
         if let episodeID = action.episodeID { item["episodeID"] = episodeID }
         if let point = action.point {
@@ -784,7 +887,8 @@ func writeDirectorDebugReport(composition: NativeComposition, motionAnalysis: Mo
                 "x": point.x,
                 "y": point.y,
                 "provenance": action.pointProvenance ?? "unknown",
-                "factual": action.pointProvenance?.hasSuffix("-inferred") != true
+                "confidence": action.pointConfidence,
+                "factual": action.rendersCursor
             ] as [String: Any]
         }
         if let phase = composition.interactionPhases[action.id] {
@@ -860,8 +964,9 @@ func interpolatedSourceImage(at time: Double, frames: [DecodedFrame]) -> CIImage
     ])
 }
 
-func composeBase(source: CIImage, wallpaper: CIImage) -> CIImage {
+func composeBase(source: CIImage, wallpaper: CIImage, contentRect: CGRect) -> CIImage {
     let canvas = CGRect(origin: .zero, size: outputSize)
+    let renderContentRect = contentRect.scaled(by: renderScale)
     var result = aspectFill(wallpaper, into: canvas)
     let rounded = CIFilter.roundedRectangleGenerator()
     rounded.extent = renderContentRect
@@ -902,11 +1007,12 @@ func overlayCursor(
     state: CursorState,
     camera: CameraState,
     cameraScale: CGFloat,
-    cursorScale: CGFloat
+    cursorScale: CGFloat,
+    metadata: CursorMetadata
 ) -> CIImage {
-    let logicalWidth: CGFloat = 28
-    let logicalHeight: CGFloat = 40
-    let hotspotFromTop = CGPoint(x: 5, y: 5)
+    let logicalWidth = metadata.logicalWidth
+    let logicalHeight = metadata.logicalHeight
+    let hotspotFromTop = CGPoint(x: metadata.hotspotX, y: metadata.hotspotY)
     let visualScale = cursorScale * state.scale * cameraScale * renderScale
     let logicalCursorWidth = logicalWidth * visualScale
     let imageScale = logicalCursorWidth / cursor.extent.width
@@ -924,6 +1030,11 @@ func overlayCursor(
         .transformed(by: CGAffineTransform(rotationAngle: state.rotation))
         .transformed(by: CGAffineTransform(translationX: projected.x, y: projected.y))
     return placedCursor.composited(over: background).cropped(to: CGRect(origin: .zero, size: outputSize))
+}
+
+func loadCursorMetadata(_ cursorURL: URL) throws -> CursorMetadata {
+    let metadataURL = URL(fileURLWithPath: cursorURL.path + ".json")
+    return try JSONDecoder().decode(CursorMetadata.self, from: Data(contentsOf: metadataURL))
 }
 
 func aspectFill(_ image: CIImage, into rect: CGRect) -> CIImage {

@@ -10,6 +10,8 @@ import {
   parseAccessibilityElements
 } from "../lib/codex-events.mjs";
 import { resolveAccessibilityTarget } from "../lib/accessibility-resolver.mjs";
+import { mapEventCoordinates, validateCoordinateSpace } from "../lib/coordinate-mapper.mjs";
+import { redactEventForPersistence } from "../lib/redaction.mjs";
 
 test("extracts unchanged sky x-y actions through local variables", () => {
   const calls = extractSkyCalls(`
@@ -21,6 +23,45 @@ test("extracts unchanged sky x-y actions through local variables", () => {
     { method: "get_app_state", args: { app: "com.apple.Safari" } },
     { method: "click", args: { app: "com.apple.Safari", x: 640, y: 430 } }
   ]);
+});
+
+test("persistence redaction removes screenshot cache paths", () => {
+  const redacted = redactEventForPersistence({
+    action: "click",
+    coordinateResolution: {
+      provenance: "direct",
+      screenshot: { width: 1000, height: 800, evidence: "/private/var/com.openai.sky/screenshot.png" }
+    }
+  });
+  assert.deepEqual(redacted.coordinateResolution.screenshot, { width: 1000, height: 800 });
+  assert.equal(JSON.stringify(redacted).includes("com.openai.sky"), false);
+});
+
+test("evaluates arithmetic coordinates but marks calls inside control flow uncertain", () => {
+  const calls = extractSkyCalls(`
+    const rect = { x: 100, width: 80 };
+    await sky.click({ app: "Safari", x: rect.x + rect.width / 2, y: 200 });
+    if (false) await sky.click({ app: "Safari", x: 1, y: 2 });
+  `);
+  assert.equal(calls[0].args.x, 140);
+  assert.equal(calls[0].argumentsComplete, true);
+  assert.equal(calls[0].executionUncertain, false);
+  assert.equal(calls[1].executionUncertain, true);
+});
+
+test("does not let conditional assignments or object spreads masquerade as static facts", () => {
+  const conditional = extractSkyCalls(`
+    let point = { app: "Safari", x: 10, y: 20 };
+    if (ready) point = { app: "Safari", x: 90, y: 100 };
+    await sky.click(point);
+  `);
+  assert.equal(conditional[0].argumentsComplete, false);
+
+  const spread = extractSkyCalls(`
+    const point = { app: "Safari", x: 10, y: 20 };
+    await sky.click({ ...point, x: 30 });
+  `);
+  assert.equal(spread[0].argumentsComplete, false);
 });
 
 test("parses Computer Use element-index descriptors without requiring coordinates", () => {
@@ -66,6 +107,12 @@ Window: "TraceCode", App: Safari.
   assert.equal(state.elements.get(32).label, "Pause trace");
   assert.equal(state.elements.has(33), false);
   assert.equal(state.elements.get(34).label, "2x");
+
+  state = mergeAccessibilityState(state, `
+The following is a diff from the previous accessibility tree.
+- 34 text 2x
+  `);
+  assert.equal(state.elements.has(34), false);
 
   const variants = parseAccessibilityElements(`
     40 AXListMarker •
@@ -123,6 +170,23 @@ test("resolves native geometry by identity, post-action focus, and structural an
   });
   assert.equal(stablePage.targetResolution.provenance, "ax-identity");
   assert.equal(stablePage.semanticTarget.nativeElementIndex, 11);
+
+  const latestPartialTree = resolveAccessibilityTarget({
+    event: { ...base, accessibilityTarget: { role: "button", label: "24H" } },
+    observations: [
+      {
+        observedAt: "2026-07-13T14:09:54.000Z", windowBounds, treeComplete: true,
+        elements: [{ index: 42, role: "AXButton", title: "24H", bounds: { x: 800, y: 100, width: 36, height: 24 } }]
+      },
+      {
+        observedAt: "2026-07-13T14:09:55.000Z", windowBounds, treeComplete: false,
+        elements: [{ index: 12, role: "AXButton", title: "Page Menu", bounds: { x: 500, y: 50, width: 20, height: 20 } }]
+      }
+    ],
+    captureStartedAt: "2026-07-13T14:00:00.000Z", captureWidth: 1000, captureHeight: 800
+  });
+  assert.equal(latestPartialTree.targetResolution.provenance, "ax-identity");
+  assert.equal(latestPartialTree.semanticTarget.nativeElementIndex, 42);
 
   const subroleIdentity = resolveAccessibilityTarget({
     event: { ...base, accessibilityTarget: { role: "standard window", label: "TraceCode" } },
@@ -198,6 +262,27 @@ test("resolves native geometry by identity, post-action focus, and structural an
   });
   assert.equal(structural.targetResolution.provenance, "ax-structural");
   assert.equal(structural.semanticTarget.nativeElementIndex, 42);
+
+  const namedMissingSibling = resolveAccessibilityTarget({
+    event: {
+      ...base,
+      accessibilityTarget: { elementIndex: 94, role: "button", label: "1H" },
+      accessibilityContext: {
+        targetIndex: 94,
+        before: { elementIndex: 93, role: "container", label: "Time range" },
+        after: { elementIndex: 95, role: "button", label: "24H" }
+      }
+    },
+    observations: [{
+      observedAt: "2026-07-13T14:09:55.600Z", windowBounds,
+      elements: [
+        { index: 41, role: "AXGroup", title: "Time range", bounds: { x: 800, y: 100, width: 110, height: 32 } },
+        { index: 42, role: "AXButton", title: "24H", bounds: { x: 840, y: 104, width: 36, height: 24 } }
+      ]
+    }],
+    captureStartedAt: "2026-07-13T14:00:00.000Z", captureWidth: 1000, captureHeight: 800
+  });
+  assert.equal(namedMissingSibling.targetResolution.provenance, "unresolved");
 });
 
 test("retains unknown future sky actions for fail-open compatibility", () => {
@@ -216,7 +301,8 @@ test("normalizes both historical direct MCP and current node_repl envelopes", as
       payload: {
         type: "mcp_tool_call_end",
         invocation: { server: "computer-use", tool: "click", arguments: { app: "Safari", x: 10, y: 20 } },
-        duration: { secs: 1, nanos: 0 }
+        duration: { secs: 1, nanos: 0 },
+        result: { Ok: { content: [] } }
       }
     },
     {
@@ -229,7 +315,8 @@ test("normalizes both historical direct MCP and current node_repl envelopes", as
           tool: "js",
           arguments: { code: "await sky.press_key({app:'Safari', key:'Return'})" }
         },
-        duration: { secs: 1, nanos: 0 }
+        duration: { secs: 1, nanos: 0 },
+        result: { Ok: { content: [] } }
       }
     }
   ];
@@ -255,7 +342,7 @@ test("joins element-index actions to the preceding Computer Use accessibility st
       payload: {
         type: "mcp_tool_call_end",
         invocation: { server: "node_repl", tool: "js", arguments: {
-          code: "await sky.get_app_state({app:'com.apple.Safari'})"
+          code: "await sky.get_app_state({app:'Safari'})"
         } },
         duration: { secs: 0, nanos: 200_000_000 },
         result: { Ok: { content: [{ type: "text", text: "11 link Start practicing, Value: tracecode.app/dashboard" }] } }
@@ -269,7 +356,8 @@ test("joins element-index actions to the preceding Computer Use accessibility st
         invocation: { server: "node_repl", tool: "js", arguments: {
           code: "await sky.click({app:'com.apple.Safari', element_index:11})"
         } },
-        duration: { secs: 0, nanos: 400_000_000 }
+        duration: { secs: 0, nanos: 400_000_000 },
+        result: { Ok: { content: [] } }
       }
     }
   ];
@@ -287,6 +375,7 @@ test("joins element-index actions to the preceding Computer Use accessibility st
     label: "Start practicing",
     value: "tracecode.app/dashboard"
   });
+  assert.match(result.events[0].actionId, /^act_[0-9a-f]{16}$/);
 });
 
 test("does not invent actions for failed Computer Use calls", async () => {
@@ -312,4 +401,115 @@ test("does not invent actions for failed Computer Use calls", async () => {
   });
   assert.equal(result.events.length, 0);
   assert.equal(result.warnings[0].type, "tool_call_failed");
+});
+
+test("skips structurally uncertain calls instead of fabricating actions", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "agentrecorder-uncertain-"));
+  const sessionFile = path.join(directory, "rollout.jsonl");
+  const record = {
+    timestamp: "2026-06-17T00:00:02.000Z", type: "event_msg",
+    payload: {
+      type: "mcp_tool_call_end",
+      call_id: "call_uncertain",
+      invocation: { server: "node_repl", tool: "js", arguments: {
+        code: "if (ready) await sky.click({app:'Safari', x:10, y:20})"
+      } },
+      duration: { secs: 1, nanos: 0 }, result: { Ok: { content: [], isError: false } }
+    }
+  };
+  await writeFile(sessionFile, JSON.stringify(record));
+  const result = await extractComputerUseEvents({
+    sessionFile, captureStartedAt: "2026-06-17T00:00:00.000Z", captureEndedAt: "2026-06-17T00:00:04.000Z"
+  });
+  assert.equal(result.events.length, 0);
+  assert.equal(result.warnings[0].type, "action_unverifiable");
+});
+
+test("validates direct coordinate evidence per event and fails closed on window drift", () => {
+  const event = {
+    actionId: "act_aabbccddeeff0011", action: "click", timestamp: "2026-07-13T12:00:02.000Z",
+    args: { x: 500, y: 400 }
+  };
+  const screenshotSpace = { width: 1000, height: 800, confidence: "event_nearby", ageMs: 50 };
+  assert.equal(validateCoordinateSpace({ screenshotSpace, captureWidth: 2000, captureHeight: 1600 }).valid, true);
+  const mapped = mapEventCoordinates({ event, screenshotSpace, captureWidth: 2000, captureHeight: 1600 });
+  assert.equal(mapped.coordinates.captureX, 1000);
+  assert.equal(mapped.coordinateResolution.confidence, 0.99);
+
+  const drifted = mapEventCoordinates({
+    event, screenshotSpace, captureWidth: 2000, captureHeight: 1600,
+    observations: [
+      { observedAt: "2026-07-13T12:00:00.000Z", targetIsFrontmost: true, windowBounds: { x: 0, y: 0, width: 1000, height: 800 } },
+      { observedAt: "2026-07-13T12:00:02.000Z", targetIsFrontmost: true, windowBounds: { x: 50, y: 0, width: 1000, height: 800 } }
+    ]
+  });
+  assert.equal(drifted.coordinates, undefined);
+  assert.equal(drifted.coordinateResolution.reason, "capture-window-geometry-changed");
+});
+
+test("system-owned foreground UI blocks both direct and AX-inferred cursor targets", () => {
+  const timestamp = "2026-07-13T12:00:02.000Z";
+  const observations = [{
+    observedAt: "2026-07-13T12:00:01.900Z",
+    targetIsFrontmost: false,
+    frontmostIsSystemSurface: true,
+    frontmostBundleIdentifier: "com.apple.appkit.xpc.openAndSavePanelService",
+    windowBounds: { x: 0, y: 0, width: 1000, height: 800 },
+    elements: [{ index: 5, role: "AXButton", title: "Save", bounds: { x: 800, y: 700, width: 80, height: 30 } }]
+  }];
+  const direct = resolveAccessibilityTarget({
+    event: {
+      actionId: "act_aabbccddeeff0011", action: "click", timestamp,
+      args: { x: 800, y: 700 },
+      coordinateResolution: { provenance: "unresolved", reason: "target-app-not-frontmost" }
+    },
+    observations,
+    captureStartedAt: "2026-07-13T12:00:00.000Z",
+    captureWidth: 1000,
+    captureHeight: 800
+  });
+  assert.equal(direct.targetResolution.provenance, "unresolved");
+  assert.equal(direct.targetResolution.reason, "target-app-not-frontmost");
+
+  const indexed = resolveAccessibilityTarget({
+    event: {
+      actionId: "act_bbccddee00112233", action: "click", timestamp,
+      args: { element_index: 5 },
+      accessibilityTarget: { role: "button", label: "Save" },
+      timing: { toolCallStartedAt: timestamp, toolCallEndedAt: timestamp }
+    },
+    observations,
+    captureStartedAt: "2026-07-13T12:00:00.000Z",
+    captureWidth: 1000,
+    captureHeight: 800
+  });
+  assert.equal(indexed.targetResolution.provenance, "unresolved");
+  assert.equal(indexed.targetResolution.reason, "system-ui-frontmost");
+});
+
+test("an unrelated ordinary frontmost app does not invalidate application-filter capture", () => {
+  const resolved = resolveAccessibilityTarget({
+    event: {
+      actionId: "act_ccddee0011223344", action: "click",
+      timestamp: "2026-07-13T12:00:02.000Z",
+      args: { element_index: 5 },
+      accessibilityTarget: { role: "button", label: "Continue" },
+      timing: {
+        toolCallStartedAt: "2026-07-13T12:00:01.800Z",
+        toolCallEndedAt: "2026-07-13T12:00:02.200Z"
+      }
+    },
+    observations: [{
+      observedAt: "2026-07-13T12:00:01.900Z",
+      targetIsFrontmost: false,
+      frontmostIsSystemSurface: false,
+      frontmostBundleIdentifier: "com.openai.codex",
+      windowBounds: { x: 0, y: 0, width: 1000, height: 800 },
+      elements: [{ index: 5, role: "AXButton", title: "Continue", bounds: { x: 800, y: 700, width: 80, height: 30 } }]
+    }],
+    captureStartedAt: "2026-07-13T12:00:00.000Z",
+    captureWidth: 1000,
+    captureHeight: 800
+  });
+  assert.equal(resolved.targetResolution.provenance, "ax-identity");
 });

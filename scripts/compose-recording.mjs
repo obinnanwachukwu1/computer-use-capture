@@ -1,18 +1,27 @@
 import { spawn } from "node:child_process";
-import { access } from "node:fs/promises";
+import { access, mkdir } from "node:fs/promises";
 import path from "node:path";
 
+const repoRoot = path.resolve(import.meta.dirname, "..");
+const expectedParentPID = Number(process.env.AGENTRECORDER_PARENT_PID);
+if (Number.isInteger(expectedParentPID)) {
+  const parentWatch = setInterval(() => {
+    if (process.ppid !== expectedParentPID) process.kill(process.pid, "SIGTERM");
+  }, 1000);
+  parentWatch.unref();
+}
 const base = path.resolve(process.argv[2] ?? "artifacts/recording");
 const videoPath = `${base}.mov`;
 const timelinePath = `${base}.timeline.json`;
-const outputPath = `${base}.directed.mp4`;
 const cliArgs = process.argv.slice(3);
+const outputIndex = cliArgs.indexOf("--output");
+const outputPath = outputIndex >= 0 ? path.resolve(cliArgs[outputIndex + 1]) : `${base}.directed.mp4`;
 const outputScaleIndex = cliArgs.indexOf("--output-scale");
 const outputScale = outputScaleIndex >= 0
   ? cliArgs[outputScaleIndex + 1]
   : process.env.AGENTRECORDER_OUTPUT_SCALE ?? "1";
 await Promise.all([access(videoPath), access(timelinePath)]);
-await ensureTahoeWallpaper();
+await Promise.all([ensureTahoeWallpaper(), ensureMacOSCursor()]);
 
 await run("swift", ["build", "-c", "release", "--product", "native-compose"]);
 const nativeArgs = [
@@ -38,18 +47,30 @@ const waitingTime = waitingTimeIndex >= 0
   ? cliArgs[waitingTimeIndex + 1]
   : process.env.AGENTRECORDER_WAITING_TIME_MS;
 if (waitingTime !== undefined) nativeArgs.push("--waiting-time", waitingTime);
-await run(path.resolve(".build/release/native-compose"), nativeArgs);
+await run(path.join(repoRoot, ".build/release/native-compose"), nativeArgs);
 
 function run(command, args) {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { cwd: process.cwd(), stdio: "inherit" });
+    const child = spawn(command, args, { cwd: repoRoot, stdio: "inherit" });
+    const forward = signal => child.exitCode === null && child.kill(signal);
+    const onInterrupt = () => forward("SIGINT");
+    const onTerminate = () => forward("SIGTERM");
+    process.once("SIGINT", onInterrupt);
+    process.once("SIGTERM", onTerminate);
+    const cleanup = () => {
+      process.off("SIGINT", onInterrupt);
+      process.off("SIGTERM", onTerminate);
+    };
     child.once("error", reject);
-    child.once("exit", code => code === 0 ? resolve() : reject(new Error(`${command} exited with code ${code}`)));
+    child.once("exit", code => {
+      cleanup();
+      code === 0 ? resolve() : reject(new Error(`${command} exited with code ${code}`));
+    });
   });
 }
 
 async function ensureTahoeWallpaper() {
-  const destination = path.resolve("artifacts/tahoe-light.jpg");
+  const destination = path.join(repoRoot, "artifacts/tahoe-light.jpg");
   try {
     await access(destination);
     return;
@@ -57,7 +78,21 @@ async function ensureTahoeWallpaper() {
     // Generate a local still from the wallpaper installed with macOS Tahoe.
   }
   const source = "/System/Library/ExtensionKit/Extensions/NeptuneOneWallpaper.appex/Contents/Resources/TahoeLight.heic";
+  await mkdir(path.dirname(destination), { recursive: true });
   await access(source);
   await run("sips", ["-s", "format", "jpeg", "-s", "formatOptions", "92", source, "--out", destination]);
   await run("sips", ["-Z", "2400", destination]);
+}
+
+async function ensureMacOSCursor() {
+  const destination = path.join(repoRoot, "artifacts/macos-arrow.png");
+  try {
+    await Promise.all([access(destination), access(`${destination}.json`)]);
+    return;
+  } catch {
+    // Generated from the installed macOS cursor artwork and metadata.
+  }
+  await mkdir(path.dirname(destination), { recursive: true });
+  await run("swift", ["build", "-c", "release", "--product", "export-macos-cursor"]);
+  await run(path.join(repoRoot, ".build/release/export-macos-cursor"), [destination]);
 }

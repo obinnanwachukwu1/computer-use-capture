@@ -1,4 +1,4 @@
-# Agent Recorder proof
+# Agent Recorder
 
 This macOS-only proof records a Safari window with ScreenCaptureKit while Codex uses the original Computer Use tool unchanged. It reconstructs Computer Use actions afterward from the current Codex task's read-only event stream, maps screenshot coordinates into capture coordinates, and renders a synthetic cursor plus spring-driven camera motion with a native Metal/Core Image compositor.
 
@@ -19,11 +19,11 @@ Element-index actions do not move the real macOS pointer and do not contain x/y 
 
 The coordinate resolver retains complete Computer Use accessibility state while merging diff and sliced outputs, understands the combined macOS/AppKit role vocabulary, and records neighboring named elements as structural anchors. Change-driven native snapshots are treated as state intervals: the latest tree before an action remains valid until a newer tree is observed, so a control does not become "stale" merely because the agent thought for several seconds. Native resolution tries identity, post-action focus, and anchor-aligned tree position in that order. Every result records provenance (`direct`, `ax-identity`, `ax-focus`, `ax-structural`, or `unresolved`) and native AX snapshots are persisted beside the capture for replayable diagnostics. Element-index coordinates are never borrowed from motion or another action; unresolved targets remain explicit instead of producing a plausible but false cursor location.
 
-The automatic product-demo preset renders the native macOS cursor at `3x`. The processor accepts `cursorScale` as an override without changing its native hotspot.
+The automatic product-demo preset renders the native macOS cursor at `3x`. The processor accepts `cursorScale` as an override without changing its native hotspot. Pointer actions are rendered only when their target provenance clears the factual-confidence policy; inferred targets may steer framing but are cursorless unless an edit explicitly opts in.
 
 ## Automatic composition
 
-The editorless `product-demo` preset turns the captured action stream into grouped shots, curved cursor travel, native-hotspot click springs, drag trajectories, an always-visible cursor, scale-aware camera bounds, and action-protected dead-time acceleration. The director transforms the complete composition—not only the captured video—so the Tahoe wallpaper, padding, authored shadow, rounded frame, and window zoom and reframe together. Source and semantic coordinates are mapped through the content rectangle before shot generation, keeping targets correct when padding changes. A separate read-only macOS Accessibility observer records change-driven indexed geometry snapshots plus focused state; typing actions receive normalized semantic bounds and frame the whole control without moving the cursor. If no focused bounds are available, typing does not invent a zoom target. Scroll events never create or steer camera shots.
+The editorless `product-demo` preset turns the captured action stream into grouped shots, curved cursor travel, native-hotspot click springs, drag trajectories, factual-action cursor visibility, scale-aware camera bounds, and action-protected dead-time acceleration. Idle cursor position is unconstrained, but every rendered click or drag is kept visible. The director transforms the complete composition—not only the captured video—so the Tahoe wallpaper, padding, authored shadow, rounded frame, and window zoom and reframe together. Source and semantic coordinates are mapped through an aspect-preserving content rectangle derived from the captured source before shot generation, keeping targets correct across window shapes and padding changes. A separate read-only macOS Accessibility observer records change-driven indexed geometry snapshots plus focused state; typing actions receive normalized semantic bounds and frame the whole control without moving the cursor. If no focused bounds are available, typing does not invent a zoom target. Scroll events never create or steer camera shots.
 
 The native attention director treats pointer intent, drag paths, Accessibility bounds, and action-attributed visual response as evidence for one camera decision. Pointer evidence remains high confidence, but a substantial UI response can widen the decision to include both the control and the changed region—for example, a range button and the chart it updates. Tiny periodic changes remain sensitive enough to preserve time without steering the camera, and whole-page scroll motion is excluded. Adjacent-frame differences remain the timing signal. Framing uses settled snapshots from before and after each action, separates changed pixels into connected components, and locally matches displaced content against its previous position. Newly revealed or transformed components steer the camera; existing panels that merely translate to make room are retained as motion context but excluded from the framing union. Visual observations are assigned to only the nearest plausible action, including frames captured just before tool-result telemetry is written. Grouped shots retain the broadest decision so a later point click cannot crop an earlier large response out of view. The sidecar stores a small agent-editable recipe:
 
@@ -46,6 +46,26 @@ This is the editing surface for now: an agent can change intent-level values and
 The historical Computer Use compatibility audit is in [`docs/computer-use-compatibility.md`](docs/computer-use-compatibility.md).
 The AX and Computer Use descriptor audit is in [`docs/accessibility-vocabulary.md`](docs/accessibility-vocabulary.md). Re-run the local corpus audit with `npm run audit:accessibility`.
 
+## MCP workflow
+
+The MCP server implements the seven-tool contract in [`docs/mcp-tools.schema.json`](docs/mcp-tools.schema.json). Start it over stdio with:
+
+```sh
+npm install
+npm run mcp
+```
+
+The intended agent flow is deliberately small:
+
+1. `recorder_capabilities` builds/locates the native preflight helper, checks Screen Recording and Accessibility, requires exactly one eligible Safari window, and probes the observed Codex/screenshot adapter shapes.
+2. `recorder_start` returns only after the first video frame is committed. The agent then uses Computer Use normally; the recorder receives no per-action calls.
+3. `recorder_stop` finalizes capture, waits for the Codex event log to settle, reconstructs factual actions, and normally enqueues the default render.
+4. `recorder_get` polls the render. `recorder_edit` applies high-level intents and enqueues another render; `recorder_cancel` cancels a render; `recorder_discard` permanently removes the recording and every artifact.
+
+The server allows one active recording and one active render per recording. IDs—not caller-supplied paths—address everything. Projects live under `~/Library/Application Support/AgentRecorder/projects` by default, with a manifest, source video, value-redacted Accessibility sidecar, timeline, logs, and render artifacts. Files persist until `recorder_discard`; the raw AX stream is private temporary state and is removed after reconstruction or process exit. A store lock prevents two MCP daemons from mutating the same project store.
+
+The default edit intent reduces visually static waiting to 100 ms, uses semantic zoom strength `1`, a native `3x` natural-path cursor, standard motion blur, and never renders inferred cursor targets. Edits reference stable `act_<digest>` IDs and can change waiting, zoom strength, cursor path/scale/tilt, motion blur, per-action emphasis, and per-action holds without exposing renderer internals.
+
 ## Run
 
 ```sh
@@ -65,7 +85,7 @@ Run the complete editorless native composition pipeline:
 npm run compose -- artifacts/my-recording
 ```
 
-The output is `artifacts/my-recording.directed.mp4`. The compose command generates a renderer-sized copy of the installed macOS Tahoe Light wallpaper when needed. ScreenCaptureKit shadows are explicitly disabled; Core Image generates the rounded window mask and two-layer shadow. The compositor evaluates the director on a fixed offline clock, renders at native 1440x1050, and writes hardware H.264 directly through AVFoundation.
+The output is `artifacts/my-recording.directed.mp4`. The compose command generates a renderer-sized copy of the installed macOS Tahoe Light wallpaper when needed. ScreenCaptureKit shadows are explicitly disabled; Core Image generates the rounded window mask and two-layer shadow. The compositor evaluates the director on a fixed offline clock, uses a 1440x1050 presentation canvas with an aspect-preserving window region derived from the source, and writes hardware H.264 directly through AVFoundation.
 
 ## Native 60fps composition with temporal motion sampling
 
@@ -101,6 +121,8 @@ The output video includes cyan final-attention bounds, red appearance components
 
 Generalization contracts live in `Fixtures/DirectorScenarios/scenarios.json`. They cover contained modal work, popovers, side panels, chart updates followed by departure, scroll motion, and reveals followed by unrelated actions. `swift test` validates episode membership and shot behavior for every scenario alongside the lower-level motion and camera tests.
 
+Real captures can be promoted into privacy-local golden plans without committing video or task data to Git. `AGENTRECORDER_STORE=... npm run golden:update -- rec_...` snapshots the stable director decisions inside that recording's project; `npm run test:golden -- rec_...` reruns the native motion prepass and plan, then fails if action provenance, attention bounds, timing source, camera pose, shot grouping, motion classification, or edited duration changes. The implementation was verified against a live two-click Computer Use capture in addition to the synthetic suite.
+
 ### Agent waiting time
 
 The director removes visually static agent waiting by default while preserving interaction and visible motion at their natural speed. The default retained still-frame handle is 100 milliseconds; customize it with:
@@ -116,7 +138,10 @@ Use `--keep-waiting` (or `AGENTRECORDER_REDUCE_WAITING=0`) when a faithful, uncu
 ## Current limitations
 
 - Safari is the only capture target and screenshot adapter name currently wired in.
-- Action timestamps are estimated within each Computer Use tool-call duration; the event stream does not expose the exact injection instant.
+- Video time is anchored to the first committed ScreenCaptureKit frame. Action timestamps are still estimated within each Computer Use tool-call duration because the event stream does not expose the exact injection instant; target-local visual timing refines clicks when evidence exists.
 - Coordinate clicks and drags use their logged coordinates. Element-index actions use passive role/title/value matching against recorder-side AX snapshots; ambiguous or missing matches fail open without inventing a cursor target.
+- A moved or resized target window invalidates direct coordinates for the affected span rather than silently remapping them. The v1 capture does not follow the window mid-recording.
+- System-owned foreground surfaces such as open/save or permission panels are not present in Safari-only capture. The recorder marks those spans and suppresses authoritative pointer reconstruction instead of depicting a click on inert Safari content.
 - Camera, cursor, and neighboring source-video frames are temporally sampled together. Optical-flow interpolation is not yet used, so extremely fast source-only animation can still reveal ordinary cross-frame blending.
-- The task JSONL and screenshot cache are private Codex implementation seams. Schema probes and adapter versioning are required before treating this as a distributable product.
+- The task JSONL and screenshot cache are private Codex implementation seams. Runtime probes, fingerprints, ambiguity handling, and fail-closed coordinate validation isolate their failure, but compatibility still needs continuous corpus coverage as Codex evolves.
+- Capture and composition are video-only. Audio must not be added until waiting cuts and speed changes have a track-aware keep/stretch policy.

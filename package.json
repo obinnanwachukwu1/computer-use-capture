@@ -1,5 +1,5 @@
 {
-  "name": "agentrecorder-spike",
+  "name": "agent-recorder",
   "private": true,
   "version": "0.1.0",
   "type": "module",
@@ -9,9 +9,16 @@
     "demo": "python3 -m http.server 4173 --directory demo",
     "compose": "node scripts/compose-recording.mjs",
     "record": "node scripts/record-session.mjs",
-    "audit:accessibility": "node scripts/audit-accessibility-vocabulary.mjs"
+    "audit:accessibility": "node scripts/audit-accessibility-vocabulary.mjs",
+    "golden:update": "node scripts/golden-director-plans.mjs update",
+    "test:golden": "node scripts/golden-director-plans.mjs verify",
+    "mcp": "node scripts/mcp-server.mjs"
   },
   "dependencies": {
-    "acorn": "^8.17.0"
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "acorn": "^8.17.0",
+    "ajv": "^8.20.0",
+    "ajv-formats": "^3.0.1",
+    "zod": "^4.4.3"
   }
 }

@@ -10,6 +10,7 @@ let package = Package(
         .executable(name: "export-macos-cursor", targets: ["ExportMacOSCursor"]),
         .executable(name: "inspect-focused-element", targets: ["InspectFocusedElement"]),
         .executable(name: "native-compose", targets: ["NativeCompose"]),
+        .executable(name: "recorder-preflight", targets: ["RecorderPreflight"]),
     ],
     targets: [
         .executableTarget(name: "CaptureSafari"),
@@ -17,6 +18,7 @@ let package = Package(
         .executableTarget(name: "InspectFocusedElement"),
         .target(name: "NativeDirector"),
         .executableTarget(name: "NativeCompose", dependencies: ["NativeDirector"]),
+        .executableTarget(name: "RecorderPreflight"),
         .testTarget(name: "NativeDirectorTests", dependencies: ["NativeDirector"]),
     ]
 )

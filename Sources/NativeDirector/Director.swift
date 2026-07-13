@@ -2,6 +2,10 @@ import CoreGraphics
 import Foundation
 
 public struct Timeline: Codable, Sendable {
+    public struct OcclusionSpan: Codable, Sendable {
+        public let startTime: Double
+        public let endTime: Double
+    }
     public struct Event: Codable, Sendable {
         public struct PointValue: Codable, Sendable {
             public let xNorm: Double?
@@ -33,9 +37,14 @@ public struct Timeline: Codable, Sendable {
             public let provenance: String?
             public let confidence: Double?
         }
+        public struct EditingIntent: Codable, Sendable {
+            public let emphasis: String?
+            public let holdMs: Double?
+        }
         public struct Arguments: Codable, Sendable {
             public let element_index: Int?
         }
+        public let actionId: String?
         public let time: Double?
         public let action: String?
         public let method: String?
@@ -44,6 +53,7 @@ public struct Timeline: Codable, Sendable {
         public let args: Arguments?
         public let semanticTarget: SemanticTarget?
         public let targetResolution: TargetResolution?
+        public let editingIntent: EditingIntent?
     }
     public struct CompositionOptions: Codable, Sendable {
         public struct Recipe: Codable, Sendable {
@@ -52,6 +62,7 @@ public struct Timeline: Codable, Sendable {
             public let zoomStrength: Double?
             public let cursorPath: String?
             public let cursorTiltStrength: Double?
+            public let allowInferredTargets: Bool?
         }
         public let cursorScale: Double?
         public let director: Recipe?
@@ -60,10 +71,12 @@ public struct Timeline: Codable, Sendable {
     public let events: [Event]
     public let composition: CompositionOptions?
     public let capture: Capture?
+    public let occlusionSpans: [OcclusionSpan]?
 }
 
 public struct DirectedAction: Sendable {
     public let id: Int
+    public let actionId: String
     public let kind: String
     public let time: Double
     public let point: CGPoint?
@@ -72,9 +85,23 @@ public struct DirectedAction: Sendable {
     public let duration: Double
     public let semanticBounds: CGRect?
     public let pointProvenance: String?
+    public let pointConfidence: Double
+    public let cursorAllowed: Bool
+    public let emphasis: String?
+    public let holdExtension: Double
     public let requiresExactTarget: Bool
     public let attention: AttentionDecision?
     public let episodeID: Int?
+
+    public var rendersCursor: Bool {
+        guard point != nil || to != nil else { return false }
+        if cursorAllowed { return true }
+        switch pointProvenance {
+        case "direct", "ax-identity", "ax-focus": return true
+        case "ax-structural": return pointConfidence >= 0.75
+        default: return false
+        }
+    }
 }
 
 public enum EvidenceSource: String, Sendable, Equatable {
@@ -204,12 +231,25 @@ public func projectPointThroughCamera(_ point: CGPoint, camera: CameraState, out
     )
 }
 
+public func aspectFittedContentRect(canvas: CGSize, sourceAspect: CGFloat, scale: CGFloat) -> CGRect {
+    let maximum = CGSize(width: canvas.width * scale, height: canvas.height * scale)
+    let width = min(maximum.width, maximum.height * sourceAspect)
+    let height = width / sourceAspect
+    return CGRect(
+        x: (canvas.width - width) / 2,
+        y: (canvas.height - height) / 2,
+        width: width,
+        height: height
+    )
+}
+
 public struct DirectorRecipe: Sendable {
     public let deadTimeRate: Double
     public let cursorCompression: Double
     public let zoomStrength: Double
     public let cursorPath: CursorPathStyle
     public let cursorTiltStrength: Double
+    public let allowInferredTargets: Bool
 }
 
 public enum CursorPathStyle: String, Sendable {
@@ -257,21 +297,40 @@ public struct NativeComposition: Sendable {
                     ?? timeline.composition?.director?.cursorTiltStrength
                     ?? 1,
                 0, 1.5
-            )
+            ),
+            allowInferredTargets: timeline.composition?.director?.allowInferredTargets ?? false
         )
         cursorScale = CGFloat(timeline.composition?.cursorScale ?? 3)
         self.interactionPhases = interactionPhases
-        let normalizedActions = timeline.events.enumerated().compactMap {
+        let allowInferredTargets = recipe.allowInferredTargets
+        let occlusionRanges = (timeline.occlusionSpans ?? []).compactMap { span -> ClosedRange<Double>? in
+            guard span.startTime.isFinite, span.endTime.isFinite, span.endTime >= span.startTime else { return nil }
+            return span.startTime...span.endTime
+        }
+        let occludedActionIDs = Set(timeline.events.enumerated().compactMap { entry -> Int? in
+            guard let time = entry.element.time,
+                  occlusionRanges.contains(where: { $0.contains(time) }) else { return nil }
+            return entry.offset
+        })
+        let normalizedActions = timeline.events.enumerated().compactMap { entry in
             Self.normalize(
-                $0.element, id: $0.offset, size: size, contentRect: contentRect,
-                activationTime: interactionPhases[$0.offset]?.activation
+                entry.element, id: entry.offset, size: size, contentRect: contentRect,
+                allowInferredTargets: allowInferredTargets,
+                activationTime: interactionPhases[entry.offset]?.activation,
+                evidenceOccluded: occlusionRanges.contains { range in
+                    range.contains(entry.element.time ?? -.infinity)
+                }
             )
         }.sorted { $0.time < $1.time }
         let attentionActions = Self.inferAttention(
             actions: normalizedActions,
-            observations: motionObservations,
+            observations: motionObservations.filter { observation in
+                !occlusionRanges.contains { $0.contains(observation.time) }
+            },
             size: size,
-            contentRect: contentRect
+            contentRect: contentRect,
+            allowInferredTargets: allowInferredTargets,
+            occludedActionIDs: occludedActionIDs
         )
         // Pointer coordinates are action facts. Never synthesize them from a
         // previous or subsequent action; unresolved element references remain
@@ -528,7 +587,7 @@ public struct NativeComposition: Sendable {
         var required = CGRect.null
         for interval in pointerTravel {
             guard let action = actions.first(where: { $0.id == interval.actionID }),
-                  action.pointProvenance?.hasSuffix("-inferred") != true else { continue }
+                  action.rendersCursor else { continue }
             let confirmationEnd = action.kind == "drag"
                 ? action.time + action.duration / 2 + 0.25
                 : action.time + 0.32
@@ -549,7 +608,7 @@ public struct NativeComposition: Sendable {
 
     private func clickScale(at time: Double) -> CGFloat {
         var scale: CGFloat = 1
-        for action in actions where action.kind == "click" {
+        for action in actions where action.kind == "click" && action.rendersCursor {
             let relative = time - action.time
             if relative < -0.1 || relative > 0.75 { continue }
             if relative < 0 {
@@ -563,7 +622,9 @@ public struct NativeComposition: Sendable {
 
     private static func normalize(
         _ event: Timeline.Event, id: Int, size: CGSize, contentRect: CGRect,
-        activationTime: Double? = nil
+        allowInferredTargets: Bool,
+        activationTime: Double? = nil,
+        evidenceOccluded: Bool = false
     ) -> DirectedAction? {
         guard let kind = event.action ?? event.method,
               let rawTime = event.time, rawTime.isFinite else { return nil }
@@ -592,9 +653,9 @@ public struct NativeComposition: Sendable {
         let to = point(event.coordinates?.to)
         let semanticPoint = bounds.map { CGPoint(x: $0.midX, y: $0.midY) }
         let direct = event.coordinates.map { Timeline.Event.PointValue(xNorm: $0.xNorm, yNorm: $0.yNorm) }
-        let actionPoint = point(direct) ?? semanticPoint
-        let pointProvenance = event.targetResolution?.provenance
-            ?? (point(direct) != nil ? "direct" : semanticPoint != nil ? "ax-identity" : nil)
+        let actionPoint = evidenceOccluded ? nil : point(direct) ?? semanticPoint
+        let pointProvenance = evidenceOccluded ? "unresolved" : event.targetResolution?.provenance
+            ?? (point(direct) != nil || (from != nil && to != nil) ? "direct" : semanticPoint != nil ? "ax-identity" : nil)
         let measured = (event.timing?.toolCallDurationMs ?? 0) / 1000
         let duration: Double
         if kind == "drag" { duration = clamp(measured == 0 ? 0.75 : measured, 0.45, 1.6) }
@@ -602,8 +663,13 @@ public struct NativeComposition: Sendable {
         else if typingActions.contains(kind) { duration = clamp(measured == 0 ? 0.8 : measured, 0.4, 2.2) }
         else { duration = clamp(measured == 0 ? 0.28 : measured, 0.16, 1.2) }
         return DirectedAction(
-            id: id, kind: kind, time: time, point: actionPoint, from: from, to: to,
-            duration: duration, semanticBounds: bounds, pointProvenance: pointProvenance,
+            id: id, actionId: event.actionId ?? "act_\(id)", kind: kind, time: time, point: actionPoint,
+            from: evidenceOccluded ? nil : from, to: evidenceOccluded ? nil : to,
+            duration: duration, semanticBounds: evidenceOccluded ? nil : bounds, pointProvenance: pointProvenance,
+            pointConfidence: evidenceOccluded ? 0 : event.targetResolution?.confidence ?? 0,
+            cursorAllowed: !evidenceOccluded && allowInferredTargets && (actionPoint != nil || to != nil),
+            emphasis: event.editingIntent?.emphasis,
+            holdExtension: max(0, (event.editingIntent?.holdMs ?? 0) / 1000),
             requiresExactTarget: event.args?.element_index != nil,
             attention: nil, episodeID: nil
         )
@@ -613,13 +679,16 @@ public struct NativeComposition: Sendable {
         actions: [DirectedAction],
         observations: [VisualMotionObservation],
         size: CGSize,
-        contentRect: CGRect
+        contentRect: CGRect,
+        allowInferredTargets: Bool,
+        occludedActionIDs: Set<Int>
     ) -> [DirectedAction] {
         // A visual response belongs to the most recent action that could have
         // caused it. This prevents one animation from widening several shots.
         var observationsByAction: [Int: [VisualMotionObservation]] = [:]
         for observation in observations {
             guard let action = actions.last(where: {
+                !occludedActionIDs.contains($0.id) &&
                 // Computer-use telemetry may be written when the tool result
                 // returns, after the first changed frame is already captured.
                 observation.time >= $0.time - 0.6 && observation.time <= $0.time + 1.3
@@ -628,6 +697,7 @@ public struct NativeComposition: Sendable {
         }
 
         return actions.map { originalAction in
+            guard !occludedActionIDs.contains(originalAction.id) else { return originalAction }
             var action = originalAction
             if pointerActions.contains(action.kind), action.kind != "drag", action.point == nil,
                !action.requiresExactTarget,
@@ -636,10 +706,13 @@ public struct NativeComposition: Sendable {
                    actionTime: action.time, size: size, contentRect: contentRect
                ) {
                 action = DirectedAction(
-                    id: action.id, kind: action.kind, time: action.time,
+                    id: action.id, actionId: action.actionId, kind: action.kind, time: action.time,
                     point: inferredPoint, from: action.from, to: action.to,
                     duration: action.duration, semanticBounds: action.semanticBounds,
                     pointProvenance: "visual-inferred",
+                    pointConfidence: 0.52,
+                    cursorAllowed: allowInferredTargets,
+                    emphasis: action.emphasis, holdExtension: action.holdExtension,
                     requiresExactTarget: action.requiresExactTarget, attention: action.attention,
                     episodeID: action.episodeID
                 )
@@ -705,9 +778,12 @@ public struct NativeComposition: Sendable {
             else { behavior = .point }
             let confidence = evidence.map(\.confidence).max() ?? 0
             return DirectedAction(
-                id: action.id, kind: action.kind, time: action.time, point: action.point,
+                id: action.id, actionId: action.actionId, kind: action.kind, time: action.time, point: action.point,
                 from: action.from, to: action.to, duration: action.duration,
                 semanticBounds: action.semanticBounds, pointProvenance: action.pointProvenance,
+                pointConfidence: action.pointConfidence,
+                cursorAllowed: action.cursorAllowed,
+                emphasis: action.emphasis, holdExtension: action.holdExtension,
                 requiresExactTarget: action.requiresExactTarget,
                 attention: AttentionDecision(
                     bounds: bounds, confidence: confidence, behavior: behavior, evidence: evidence
@@ -791,9 +867,12 @@ public struct NativeComposition: Sendable {
                     )
                 }
                 result[index] = DirectedAction(
-                    id: action.id, kind: action.kind, time: action.time, point: action.point,
+                    id: action.id, actionId: action.actionId, kind: action.kind, time: action.time, point: action.point,
                     from: action.from, to: action.to, duration: action.duration,
                     semanticBounds: action.semanticBounds, pointProvenance: action.pointProvenance,
+                    pointConfidence: action.pointConfidence,
+                    cursorAllowed: action.cursorAllowed,
+                    emphasis: action.emphasis, holdExtension: action.holdExtension,
                     requiresExactTarget: action.requiresExactTarget,
                     attention: decision, episodeID: episodeID
                 )
@@ -863,10 +942,10 @@ public struct NativeComposition: Sendable {
     }
 
     private static func actionHoldEnd(_ action: DirectedAction) -> Double {
-        if typingActions.contains(action.kind) { return action.time + action.duration / 2 + 0.55 }
-        if action.kind == "drag" { return action.time + action.duration / 2 + 0.35 }
-        if action.kind == "click" { return action.time + 0.55 }
-        return action.time + 0.35
+        if typingActions.contains(action.kind) { return action.time + action.duration / 2 + 0.55 + action.holdExtension }
+        if action.kind == "drag" { return action.time + action.duration / 2 + 0.35 + action.holdExtension }
+        if action.kind == "click" { return action.time + 0.55 + action.holdExtension }
+        return action.time + 0.35 + action.holdExtension
     }
 
     fileprivate static func actionScale(_ action: DirectedAction, size: CGSize, recipe: DirectorRecipe) -> CGFloat {
@@ -898,7 +977,8 @@ public struct NativeComposition: Sendable {
             scale = lerp(1.48, 1.24, clamp(span / 0.55, 0, 1))
         }
         let value = scale ?? (action.kind == "click" ? 1.44 : 1.34)
-        return 1 + (value - 1) * CGFloat(recipe.zoomStrength)
+        let emphasis = action.emphasis == "reduced" ? 0.6 : action.emphasis == "strong" ? 1.25 : 1
+        return 1 + (value - 1) * CGFloat(recipe.zoomStrength) * emphasis
     }
 
     private static func buildAnchors(
@@ -906,7 +986,7 @@ public struct NativeComposition: Sendable {
         phases: [Int: InteractionPhases]
     ) -> [PointerAnchor] {
         var result: [PointerAnchor] = []
-        for action in actions where pointerActions.contains(action.kind) {
+        for action in actions where pointerActions.contains(action.kind) && action.rendersCursor {
             if action.kind == "drag", let from = action.from, let to = action.to {
                 result.append(PointerAnchor(actionID: action.id, time: action.time - action.duration / 2, point: from, kind: "drag-start"))
                 result.append(PointerAnchor(actionID: action.id, time: action.time + action.duration / 2, point: to, kind: "drag-end"))
@@ -1070,6 +1150,7 @@ private extension CGRect {
 }
 
 private func actionFocus(_ action: DirectedAction) -> CGPoint? {
+    if action.emphasis == "none" { return nil }
     if let bounds = action.attention?.bounds { return CGPoint(x: bounds.midX, y: bounds.midY) }
     if action.kind == "drag", let from = action.from, let to = action.to { return CGPoint(x: midpoint(from.x, to.x), y: midpoint(from.y, to.y)) }
     if action.pointProvenance == "context-inferred" { return nil }
