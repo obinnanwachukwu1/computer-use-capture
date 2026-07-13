@@ -631,9 +631,17 @@ private func buildCameraMoves(composition: NativeComposition, base: CameraState)
                 let routePose = composition.cameraPose(
                     containing: route, maximumScale: min(exp(pose.logScale), exp(settled.logScale))
                 )
+                // If a tight semantic focus leaves the idle cursor outside the
+                // next route, the camera must briefly establish that departure
+                // point before the cursor becomes factual input again. Keep
+                // this exceptional lead proportional and close to the trip;
+                // ordinary visible departures continue to let the cursor lead.
+                let tripDuration = max(0, tripEnd - tripStart)
+                let routeStart = tripStart - min(0.18, tripDuration * 0.22)
+                let routeEnd = delayedStart + max(0, delayedEnd - delayedStart) * 0.55
                 appendMove(
                     label: "action-\(action.id)-route-fit",
-                    start: tripStart - 0.72, end: tripStart - 0.08, to: routePose
+                    start: routeStart, end: routeEnd, to: routePose
                 )
                 // Let the pointer establish intent first, then follow from the
                 // stable route viewport to the attention model's click target.

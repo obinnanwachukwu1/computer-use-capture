@@ -96,6 +96,36 @@ private func composition(
     #expect(responsive.actions[0].attention!.bounds.contains(CGPoint(x: 820, y: 640)))
 }
 
+@Test func overlappingWideResponsesShareOneTightShotPose() throws {
+    let directed = try composition("""
+    [
+      {"action":"click","time":3,"coordinates":{"xNorm":0.82,"yNorm":0.28}},
+      {"action":"click","time":5,"coordinates":{"xNorm":0.76,"yNorm":0.28}}
+    ]
+    """, motion: [
+        VisualMotionObservation(
+            time: 3.7,
+            normalizedBounds: CGRect(x: 0.12, y: 0.20, width: 0.74, height: 0.48),
+            changedFraction: 0.14,
+            magnitude: 0.9
+        ),
+        VisualMotionObservation(
+            time: 5.7,
+            normalizedBounds: CGRect(x: 0.15, y: 0.22, width: 0.68, height: 0.44),
+            changedFraction: 0.12,
+            magnitude: 0.85
+        )
+    ])
+    #expect(directed.shots.count == 1)
+    #expect(directed.actions.allSatisfy { $0.attention?.behavior == .wideResponse })
+    let first = try #require(directed.settledCamera(forActionID: 0))
+    let second = try #require(directed.settledCamera(forActionID: 1))
+    #expect(abs(first.x - second.x) < 0.001)
+    #expect(abs(first.y - second.y) < 0.001)
+    #expect(abs(first.logScale - second.logScale) < 0.000_001)
+    #expect(exp(first.logScale) > 1.15)
+}
+
 @Test func tinyCaretMotionPreservesPointerFraming() throws {
     let directed = try composition("""
     [{"action":"click","time":3,"coordinates":{"xNorm":0.5,"yNorm":0.5}}]

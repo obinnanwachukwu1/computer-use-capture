@@ -420,18 +420,61 @@ public struct NativeComposition: Sendable {
     public func settledCamera(forActionID actionID: Int) -> CameraState? {
         guard let action = actions.first(where: { $0.id == actionID }),
               let focus = actionFocus(action) else { return nil }
-        let desiredScale = Self.actionScale(action, size: size, recipe: recipe)
-        let framingBounds = action.attention?.bounds ?? CGRect(x: focus.x, y: focus.y, width: 1, height: 1)
-        let fitX = framingBounds.width > 0 ? size.width * 0.85 / framingBounds.width : .greatestFiniteMagnitude
-        let fitY = framingBounds.height > 0 ? size.height * 0.78 / framingBounds.height : .greatestFiniteMagnitude
+        let stableWideResponse = stableWideResponseCluster(containing: actionID)
+        let framingBounds = stableWideResponse?.bounds
+            ?? action.attention?.bounds
+            ?? CGRect(x: focus.x, y: focus.y, width: 1, height: 1)
+        let desiredScale = stableWideResponse?.scale
+            ?? Self.actionScale(action, size: size, recipe: recipe)
+        let isWideResponse = action.attention?.behavior == .wideResponse
+        let horizontalCoverage: CGFloat = isWideResponse ? 0.94 : 0.85
+        let verticalCoverage: CGFloat = isWideResponse ? 0.86 : 0.78
+        let fitX = framingBounds.width > 0 ? size.width * horizontalCoverage / framingBounds.width : .greatestFiniteMagnitude
+        let fitY = framingBounds.height > 0 ? size.height * verticalCoverage / framingBounds.height : .greatestFiniteMagnitude
         let scale = max(1, min(desiredScale, min(fitX, fitY)))
         let limitX = size.width / (2 * scale)
         let limitY = size.height / (2 * scale)
         return CameraState(
-            x: clamp(focus.x, limitX, size.width - limitX),
-            y: clamp(focus.y, limitY, size.height - limitY),
+            x: clamp(framingBounds.midX, limitX, size.width - limitX),
+            y: clamp(framingBounds.midY, limitY, size.height - limitY),
             logScale: log(scale)
         )
+    }
+
+    /// Consecutive controls can animate the same large region (for example a
+    /// chart's range buttons). When their response bounds substantially
+    /// contain one another, they are one visual subject and should settle on
+    /// one shot-level pose rather than stair-step between per-action poses.
+    /// A region or unrelated wide response breaks the cluster, preserving
+    /// deliberate pans between distinct subjects in a longer grouped shot.
+    private func stableWideResponseCluster(containing actionID: Int) -> (bounds: CGRect, scale: CGFloat)? {
+        guard let shot = shots.first(where: { $0.actions.contains(where: { $0.id == actionID }) }),
+              let index = shot.actions.firstIndex(where: { $0.id == actionID }),
+              let initial = shot.actions[index].attention,
+              initial.behavior == .wideResponse
+        else { return nil }
+
+        var lower = index
+        var upper = index
+        var bounds = initial.bounds
+        while lower > 0 {
+            guard let candidate = shot.actions[lower - 1].attention,
+                  candidate.behavior == .wideResponse,
+                  candidate.bounds.overlapRatio(with: bounds) >= 0.80
+            else { break }
+            lower -= 1
+            bounds = bounds.union(candidate.bounds)
+        }
+        while upper + 1 < shot.actions.count {
+            guard let candidate = shot.actions[upper + 1].attention,
+                  candidate.behavior == .wideResponse,
+                  candidate.bounds.overlapRatio(with: bounds) >= 0.80
+            else { break }
+            upper += 1
+            bounds = bounds.union(candidate.bounds)
+        }
+        guard upper > lower else { return nil }
+        return (bounds, shot.scale)
     }
 
     public func pointerTrip(forActionID actionID: Int) -> PointerTrip? {
