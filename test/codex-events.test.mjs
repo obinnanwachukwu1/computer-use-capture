@@ -332,6 +332,41 @@ test("normalizes both historical direct MCP and current node_repl envelopes", as
   ]);
 });
 
+test("carries only statically proven values across persistent node_repl invocations", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "agentrecorder-repl-env-"));
+  const sessionFile = path.join(directory, "rollout.jsonl");
+  const resultEnvelope = { Ok: { content: [] } };
+  const record = (timestamp, code, result = resultEnvelope) => ({
+    timestamp,
+    type: "event_msg",
+    payload: {
+      type: "mcp_tool_call_end",
+      invocation: { server: "node_repl", tool: "js", arguments: { code } },
+      duration: { secs: 0, nanos: 100_000_000 },
+      result
+    }
+  });
+  const records = [
+    record("2026-06-17T00:00:00.500Z", "var persistentApp = 'com.apple.Safari';"),
+    record("2026-06-17T00:00:01.000Z", "await sky.get_app_state({app:persistentApp})", {
+      Ok: { content: [{ type: "text", text: "11 button Refresh" }] }
+    }),
+    record("2026-06-17T00:00:02.000Z", "await sky.click({app:persistentApp, element_index:11})"),
+    record("2026-06-17T00:00:02.500Z", "persistentApp = await discoverApp();"),
+    record("2026-06-17T00:00:03.000Z", "await sky.click({app:persistentApp, element_index:11})")
+  ];
+  await writeFile(sessionFile, records.map(value => JSON.stringify(value)).join("\n"));
+  const extracted = await extractComputerUseEvents({
+    sessionFile,
+    captureStartedAt: "2026-06-17T00:00:00.000Z",
+    captureEndedAt: "2026-06-17T00:00:04.000Z"
+  });
+  assert.equal(extracted.events.length, 1);
+  assert.equal(extracted.events[0].args.app, "com.apple.Safari");
+  assert.equal(extracted.events[0].accessibilityTarget.label, "Refresh");
+  assert.equal(extracted.warnings.filter(warning => warning.type === "action_unverifiable").length, 1);
+});
+
 test("joins element-index actions to the preceding Computer Use accessibility state", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "agentrecorder-index-"));
   const sessionFile = path.join(directory, "rollout.jsonl");
