@@ -182,7 +182,8 @@ func render(_ options: Options) async throws {
     print("native attention=\(attentionSummary)")
     let timingSummary = composition.actions.compactMap { action in
         composition.interactionPhases[action.id].map { phase in
-            "\(action.kind)#\(action.id) raw=\(String(format: "%.3f", phase.rawEstimate)) arrival=\(String(format: "%.3f", phase.pointerArrival)) activation=\(String(format: "%.3f", phase.activation)) source=\(phase.source)"
+            let orderedAfter = phase.preActivationActivityEnd.map { " orderedAfter=\(String(format: "%.3f", $0 + 0.05))" } ?? ""
+            return "\(action.kind)#\(action.id) raw=\(String(format: "%.3f", phase.rawEstimate)) arrival=\(String(format: "%.3f", phase.pointerArrival)) activation=\(String(format: "%.3f", phase.activation))\(orderedAfter) source=\(phase.source)"
         }
     }.joined(separator: " | ")
     if !timingSummary.isEmpty { print("native timing=\(timingSummary)") }
@@ -935,6 +936,7 @@ func writeDirectorDebugReport(composition: NativeComposition, motionAnalysis: Mo
                 "source": phase.source
             ]
             if let responseOnset = phase.responseOnset { timing["responseOnset"] = responseOnset }
+            if let end = phase.preActivationActivityEnd { timing["preActivationActivityEnd"] = end }
             if let threshold = phase.activityThreshold { timing["activityThreshold"] = threshold }
             item["timing"] = timing
         }

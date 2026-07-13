@@ -408,8 +408,38 @@ private struct TimelineFixture: Encodable {
     )
     #expect(abs(phases.pointerArrival - 10.20) < 0.001)
     #expect(abs(phases.activation - 10.72) < 0.001)
+    #expect(abs((phases.preActivationActivityEnd ?? 0) - 10.24) < 0.001)
     #expect(abs((phases.responseOnset ?? 0) - 11.05) < 0.001)
     #expect(phases.source == "target-visual")
+}
+
+@Test func scrollAndViewportRelocationFinishBeforePointerTravel() throws {
+    let afterExplicitScroll = try composition("""
+    [
+      {"action":"scroll","time":3,"timing":{"toolCallDurationMs":800}},
+      {"action":"click","time":4.2,"coordinates":{"xNorm":0.78,"yNorm":0.35}}
+    ]
+    """, duration: 7)
+    let scrollOrderedTrip = try #require(afterExplicitScroll.pointerTrip(forActionID: 1))
+    #expect(scrollOrderedTrip.start >= 3.4)
+
+    let relocationPhases = InteractionPhases(
+        rawEstimate: 4.1,
+        toolStart: 3.8,
+        toolEnd: 4.9,
+        pointerArrival: 4.05,
+        activation: 4.72,
+        responseOnset: 4.95,
+        source: "target-visual",
+        activityThreshold: 0.55,
+        preActivationActivityEnd: 4.32
+    )
+    let afterInternalRelocation = try composition("""
+    [{"action":"click","time":4.1,"coordinates":{"xNorm":0.82,"yNorm":0.52},"semanticTarget":{"bounds":{"xNorm":0.79,"yNorm":0.49,"widthNorm":0.06,"heightNorm":0.05},"viewportRelocation":{"kind":"target-entered-viewport","displacementNorm":0.62,"fromVisibleFraction":0,"toVisibleFraction":1,"postActionOffsetMs":450}}}]
+    """, duration: 7, interactionPhases: [0: relocationPhases])
+    let relocationOrderedTrip = try #require(afterInternalRelocation.pointerTrip(forActionID: 0))
+    #expect(relocationOrderedTrip.start >= 4.37)
+    #expect(relocationOrderedTrip.end <= relocationPhases.activation)
 }
 
 @Test func interactionTimingFallsBackToSemanticToolCompletionWithoutMagicOffset() {

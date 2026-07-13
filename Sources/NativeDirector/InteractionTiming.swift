@@ -16,6 +16,7 @@ public struct InteractionPhases: Sendable {
     public let toolEnd: Double
     public let pointerArrival: Double
     public let activation: Double
+    public let preActivationActivityEnd: Double?
     public let responseOnset: Double?
     public let source: String
     public let activityThreshold: Double?
@@ -28,13 +29,15 @@ public struct InteractionPhases: Sendable {
         activation: Double,
         responseOnset: Double?,
         source: String,
-        activityThreshold: Double? = nil
+        activityThreshold: Double? = nil,
+        preActivationActivityEnd: Double? = nil
     ) {
         self.rawEstimate = rawEstimate
         self.toolStart = toolStart
         self.toolEnd = toolEnd
         self.pointerArrival = pointerArrival
         self.activation = activation
+        self.preActivationActivityEnd = preActivationActivityEnd
         self.responseOnset = responseOnset
         self.source = source
         self.activityThreshold = activityThreshold
@@ -91,7 +94,8 @@ public enum InteractionPhaseDetector {
             activation: activation,
             responseOnset: response?.start,
             source: source,
-            activityThreshold: threshold
+            activityThreshold: threshold,
+            preActivationActivityEnd: hover?.end
         )
     }
 

@@ -190,6 +190,7 @@ public struct PointerAnchor: Sendable {
     public let time: Double
     public let point: CGPoint
     public let kind: String
+    public let notBefore: Double?
 }
 
 public struct PointerTrip: Sendable {
@@ -1049,16 +1050,31 @@ public struct NativeComposition: Sendable {
         phases: [Int: InteractionPhases]
     ) -> [PointerAnchor] {
         var result: [PointerAnchor] = []
-        for action in actions where pointerActions.contains(action.kind) && action.rendersCursor {
+        for (index, action) in actions.enumerated() where pointerActions.contains(action.kind) && action.rendersCursor {
+            let phase = phases[action.id]
+            let precedingScrollEnd = index > 0 && actions[index - 1].kind == "scroll"
+                ? actions[index - 1].time + actions[index - 1].duration / 2
+                : nil
+            let relocationEnd = action.requiresEstablishingTransition
+                ? phase?.preActivationActivityEnd.map { $0 + 0.05 }
+                : nil
+            let notBefore = [precedingScrollEnd, relocationEnd].compactMap { $0 }.max()
             if action.kind == "drag", let from = action.from, let to = action.to {
-                result.append(PointerAnchor(actionID: action.id, time: action.time - action.duration / 2, point: from, kind: "drag-start"))
-                result.append(PointerAnchor(actionID: action.id, time: action.time + action.duration / 2, point: to, kind: "drag-end"))
+                result.append(PointerAnchor(actionID: action.id, time: action.time - action.duration / 2, point: from, kind: "drag-start", notBefore: notBefore))
+                result.append(PointerAnchor(actionID: action.id, time: action.time + action.duration / 2, point: to, kind: "drag-end", notBefore: nil))
             } else if let point = action.point {
                 result.append(PointerAnchor(
                     actionID: action.id,
-                    time: phases[action.id]?.pointerArrival ?? action.time,
+                    // Target-local activity before activation is the viewport
+                    // arriving, not cursor hover, when Computer Use relocated
+                    // an offscreen semantic target. The pointer belongs to the
+                    // established frame and therefore lands at activation.
+                    time: action.requiresEstablishingTransition
+                        ? phase?.activation ?? action.time
+                        : phase?.pointerArrival ?? action.time,
                     point: point,
-                    kind: action.kind
+                    kind: action.kind,
+                    notBefore: notBefore
                 ))
             }
         }
@@ -1075,7 +1091,7 @@ public struct NativeComposition: Sendable {
             if index == 0 {
                 return PointerTravelInterval(
                     actionID: next.actionID,
-                    start: max(0, next.time - 1.15),
+                    start: max(0, next.time - 1.15, next.notBefore ?? 0),
                     end: next.time,
                     from: initial,
                     to: next.point,
@@ -1101,7 +1117,7 @@ public struct NativeComposition: Sendable {
             let end = next.time - 0.08
             return PointerTravelInterval(
                 actionID: next.actionID,
-                start: max(previous.time + 0.1, end - duration),
+                start: max(previous.time + 0.1, end - duration, next.notBefore ?? 0),
                 end: end,
                 from: previous.point,
                 to: next.point,
