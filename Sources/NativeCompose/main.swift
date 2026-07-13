@@ -129,6 +129,9 @@ func render(_ options: Options) async throws {
         scale: contentScale
     )
     let timingProbes = interactionTimingProbes(timeline: timeline)
+    let relocationActionIDs = Set(timeline.events.enumerated().compactMap { id, event in
+        event.semanticTarget?.viewportRelocation?.kind == "target-entered-viewport" ? id : nil
+    })
     emitProgress(phase: "analyzing", percent: 0)
     // The same decoded-frame prepass serves two independent consumers:
     // waiting reduction and the default attention director.
@@ -138,7 +141,8 @@ func render(_ options: Options) async throws {
         context: context,
         sourceDuration: sourceDuration,
         actionTimes: timeline.events.compactMap(\.time),
-        timingProbes: timingProbes
+        timingProbes: timingProbes,
+        relocationActionIDs: relocationActionIDs
     )
     if options.reduceWaiting {
         print("motion analysis samples=\(motionAnalysis.sampledFrames) moving=\(motionAnalysis.motionFrames) ranges=\(motionAnalysis.ranges.count)")

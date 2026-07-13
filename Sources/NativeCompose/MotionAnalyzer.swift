@@ -21,6 +21,11 @@ struct InteractionTimingProbe {
     let normalizedTarget: CGRect
 }
 
+private struct ResponseFrame {
+    let time: Double
+    let pixels: [UInt8]
+}
+
 enum MotionAnalyzer {
     static func analyze(
         asset: AVAsset,
@@ -29,6 +34,7 @@ enum MotionAnalyzer {
         sourceDuration: Double,
         actionTimes: [Double] = [],
         timingProbes: [InteractionTimingProbe] = [],
+        relocationActionIDs: Set<Int> = [],
         samplesPerSecond: Double = 12,
         channelThreshold: Int = 20,
         changedPixelFraction: Double = 0.00004
@@ -59,6 +65,7 @@ enum MotionAnalyzer {
         var afterSnapshots: [Int: [UInt8]] = [:]
         var localPrevious: [Int: [UInt8]] = [:]
         var localActivity: [Int: [InteractionActivitySample]] = [:]
+        var responseFrames: [Int: [ResponseFrame]] = [:]
         var nextProgressTime = 10.0
 
         while let sample = output.copyNextSampleBuffer() {
@@ -101,6 +108,24 @@ enum MotionAnalyzer {
                 colorSpace: colorSpace
             )
             sampledFrames += 1
+            let activeResponseProbes = timingProbes.filter {
+                time >= min($0.toolStart, $0.rawEstimate) - 0.30 &&
+                time <= max($0.toolEnd, $0.rawEstimate) + 1.0
+            }
+            if !activeResponseProbes.isEmpty {
+                // The interaction windows are short, but retaining every
+                // analysis frame at 320x234 for every click scales poorly on
+                // longer recordings. A half-resolution copy preserves the
+                // regional motion needed for framing while bounding memory.
+                let responsePixels = halfScaleRGBA(
+                    pixels, sourceWidth: analysisWidth, sourceHeight: analysisHeight
+                )
+                for probe in activeResponseProbes {
+                    responseFrames[probe.actionID, default: []].append(
+                        ResponseFrame(time: time, pixels: responsePixels)
+                    )
+                }
+            }
             if time >= nextProgressTime {
                 let percent = sourceDuration > 0 ? min(100, Int(time / sourceDuration * 100)) : 0
                 print("motion analysis \(percent)% source=\(Int(time))s/\(Int(sourceDuration))s samples=\(sampledFrames)")
@@ -150,6 +175,61 @@ enum MotionAnalyzer {
             )
             return (probe.actionID, phases)
         })
+        // Measure click responses around the observed activation rather than
+        // a fixed offset from the tool envelope. This captures the complete
+        // region affected by controls such as animated charts and expanding
+        // disclosures. For a factual viewport relocation, both frames are
+        // deliberately taken after the new viewport is established; comparing
+        // against the old viewport would make the scroll overlap and erase the
+        // real response during ambient-motion rejection.
+        let responseWidth = analysisWidth / 2
+        let responseHeight = analysisHeight / 2
+        for probe in timingProbes {
+            guard let phase = interactionPhases[probe.actionID],
+                  let frames = responseFrames[probe.actionID], frames.count >= 2,
+                  let before = frames.last(where: { $0.time <= phase.activation + 0.02 })
+            else { continue }
+            let desiredResponseTime = phase.activation + 0.68
+            let after = frames.first(where: { $0.time >= desiredResponseTime })
+                ?? frames.last(where: { $0.time >= phase.activation + 0.30 })
+            guard let after, after.time > before.time else { continue }
+            let rawResponse = SpatialMotion.components(
+                previous: before.pixels, current: after.pixels,
+                width: responseWidth, height: responseHeight,
+                channelThreshold: channelThreshold, changedPixelFraction: changedPixelFraction
+            )
+            let classifiedResponse = SpatialMotion.postActivationResponseComponents(rawResponse)
+            let response: [DetectedMotionComponent]
+            if relocationActionIDs.contains(probe.actionID) {
+                response = classifiedResponse
+            } else {
+                let baselineEnd = frames.last(where: { $0.time <= phase.activation - 0.10 })
+                let baselineStart = baselineEnd.flatMap { end in
+                    frames.last(where: { $0.time <= end.time - 0.35 })
+                }
+                let baseline: [DetectedMotionComponent] = if let baselineStart, let baselineEnd {
+                    SpatialMotion.postActivationResponseComponents(SpatialMotion.components(
+                        previous: baselineStart.pixels, current: baselineEnd.pixels,
+                        width: responseWidth, height: responseHeight,
+                        channelThreshold: channelThreshold, changedPixelFraction: changedPixelFraction
+                    ))
+                } else {
+                    []
+                }
+                response = SpatialMotion.causalComponents(
+                    baseline: baseline, response: classifiedResponse
+                )
+            }
+            observations += response.map {
+                VisualMotionObservation(
+                    time: after.time,
+                    normalizedBounds: $0.normalizedBounds,
+                    changedFraction: $0.changedFraction,
+                    magnitude: $0.magnitude,
+                    kind: $0.kind
+                )
+            }
+        }
         return MotionAnalysis(
             ranges: MotionDetection.ranges(forMotionTimes: motionTimes),
             sampledFrames: sampledFrames,
@@ -203,6 +283,25 @@ enum MotionAnalyzer {
             channels += 3
         }
         return channels == 0 ? 0 : Double(total) / Double(channels)
+    }
+
+    private static func halfScaleRGBA(
+        _ source: [UInt8], sourceWidth: Int, sourceHeight: Int
+    ) -> [UInt8] {
+        let width = sourceWidth / 2
+        let height = sourceHeight / 2
+        var result = [UInt8](repeating: 0, count: width * height * 4)
+        for y in 0..<height {
+            for x in 0..<width {
+                let sourceOffset = ((y * 2) * sourceWidth + x * 2) * 4
+                let destinationOffset = (y * width + x) * 4
+                result[destinationOffset] = source[sourceOffset]
+                result[destinationOffset + 1] = source[sourceOffset + 1]
+                result[destinationOffset + 2] = source[sourceOffset + 2]
+                result[destinationOffset + 3] = source[sourceOffset + 3]
+            }
+        }
+        return result
     }
 
 }

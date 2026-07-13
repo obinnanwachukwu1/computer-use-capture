@@ -326,6 +326,28 @@ private struct TimelineFixture: Encodable {
     #expect(components.contains { $0.kind == .appearance })
 }
 
+@Test func localizedPostActivationTranslationBecomesResponseWhileBroadScrollRemainsTranslation() {
+    let local = SpatialMotion.postActivationResponseComponents([
+        DetectedMotionComponent(
+            normalizedBounds: CGRect(x: 0.20, y: 0.48, width: 0.43, height: 0.21),
+            changedFraction: 0.014, magnitude: 1, kind: .translation
+        ),
+        DetectedMotionComponent(
+            normalizedBounds: CGRect(x: 0.70, y: 0.48, width: 0.25, height: 0.24),
+            changedFraction: 0.009, magnitude: 1, kind: .translation
+        )
+    ])
+    #expect(local.allSatisfy { $0.kind == .transformation })
+
+    let broad = SpatialMotion.postActivationResponseComponents([
+        DetectedMotionComponent(
+            normalizedBounds: CGRect(x: 0.05, y: 0.08, width: 0.90, height: 0.78),
+            changedFraction: 0.35, magnitude: 1, kind: .translation
+        )
+    ])
+    #expect(broad[0].kind == .translation)
+}
+
 @Test func causalMotionRejectsAnimationAlreadyActiveBeforeAction() {
     let ambient = DetectedMotionComponent(
         normalizedBounds: CGRect(x: 0.05, y: 0.15, width: 0.3, height: 0.2),

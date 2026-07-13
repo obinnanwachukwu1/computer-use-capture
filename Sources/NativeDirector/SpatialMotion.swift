@@ -6,9 +6,41 @@ public struct DetectedMotionComponent: Sendable {
     public let changedFraction: Double
     public let magnitude: Double
     public let kind: VisualMotionKind
+
+    public init(normalizedBounds: CGRect, changedFraction: Double, magnitude: Double, kind: VisualMotionKind) {
+        self.normalizedBounds = normalizedBounds
+        self.changedFraction = changedFraction
+        self.magnitude = magnitude
+        self.kind = kind
+    }
 }
 
 public enum SpatialMotion {
+    /// Localized translations immediately following activation are part of
+    /// the action response (for example chart bars changing height or a
+    /// disclosure expanding). Broad coherent translation still describes the
+    /// viewport itself moving and remains excluded from attention framing.
+    public static func postActivationResponseComponents(
+        _ components: [DetectedMotionComponent],
+        broadTranslationCoverage: CGFloat = 0.42
+    ) -> [DetectedMotionComponent] {
+        let translated = components.filter { $0.kind == .translation }
+        guard !translated.isEmpty else { return components }
+        let union = translated.dropFirst().reduce(translated[0].normalizedBounds) {
+            $0.union($1.normalizedBounds)
+        }
+        guard union.width * union.height < broadTranslationCoverage else { return components }
+        return components.map { component in
+            guard component.kind == .translation else { return component }
+            return DetectedMotionComponent(
+                normalizedBounds: component.normalizedBounds,
+                changedFraction: component.changedFraction,
+                magnitude: component.magnitude,
+                kind: .transformation
+            )
+        }
+    }
+
     /// Removes response regions that were already moving immediately before
     /// an action. The remaining components are plausible action-caused
     /// changes rather than ambient animation elsewhere in the UI.
