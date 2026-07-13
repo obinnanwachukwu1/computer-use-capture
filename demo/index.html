@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Agent Recorder Capture Target</title>
+    <style>
+      :root { --ink:#171712; --muted:#6b685e; --line:#dedbd1; --paper:#f7f5ef; --card:#fffefa; --lime:#d8ff70; --violet:#7657ff; }
+      * { box-sizing:border-box; }
+      html { background:var(--paper); color:var(--ink); font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display",sans-serif; }
+      body { margin:0; min-height:1780px; }
+      button,input { font:inherit; }
+      button { color:inherit; }
+      .shell { display:grid; grid-template-columns:224px 1fr; min-height:100vh; }
+      aside { position:fixed; inset:0 auto 0 0; width:224px; padding:26px 20px; border-right:1px solid var(--line); background:#efede6; z-index:4; }
+      .brand { display:flex; align-items:center; gap:10px; font-size:17px; font-weight:750; letter-spacing:-.3px; margin:0 8px 34px; }
+      .mark { width:28px; height:28px; border-radius:9px; background:var(--ink); display:grid; place-items:center; color:var(--lime); font-size:14px; }
+      nav { display:grid; gap:5px; }
+      nav button { border:0; background:transparent; border-radius:9px; text-align:left; padding:10px 12px; color:#706d63; cursor:pointer; }
+      nav button.active { background:#fff; color:var(--ink); box-shadow:0 1px 4px #1817120d; }
+      .workspace { margin-left:224px; width:calc(100vw - 224px); }
+      header { height:76px; padding:0 34px; display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid var(--line); background:rgba(247,245,239,.94); backdrop-filter:blur(14px); position:sticky; top:0; z-index:3; }
+      header h1 { font-size:18px; margin:0; letter-spacing:-.3px; }
+      .avatar { width:34px; height:34px; border-radius:50%; display:grid; place-items:center; background:#292923; color:white; font-size:12px; font-weight:700; }
+      main { max-width:1060px; margin:0 auto; padding:44px 42px 140px; }
+      .hero { display:flex; justify-content:space-between; align-items:end; gap:28px; margin-bottom:28px; }
+      .eyebrow { text-transform:uppercase; letter-spacing:1.8px; font-size:11px; font-weight:750; color:#858176; margin-bottom:10px; }
+      h2 { margin:0; font-size:44px; line-height:1; letter-spacing:-2px; }
+      .hero p { color:var(--muted); max-width:540px; line-height:1.55; margin:14px 0 0; }
+      .primary { border:0; border-radius:11px; padding:12px 17px; background:var(--ink); color:white; font-weight:680; cursor:pointer; box-shadow:0 8px 24px #1717121c; }
+      .primary:hover { transform:translateY(-1px); }
+      .stats { display:grid; grid-template-columns:repeat(3,1fr); gap:14px; margin:24px 0; }
+      .stat { border:1px solid var(--line); background:var(--card); border-radius:15px; padding:19px; }
+      .stat span { color:var(--muted); font-size:12px; }
+      .stat strong { display:block; font-size:29px; letter-spacing:-1.2px; margin-top:12px; }
+      .stat small { color:#4f7b2b; font-weight:700; }
+      .panel { border:1px solid var(--line); background:var(--card); border-radius:18px; overflow:hidden; box-shadow:0 12px 45px #2e2b2210; }
+      .panel-head { padding:19px 22px; display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid var(--line); }
+      .panel-head h3 { margin:0; font-size:15px; }
+      .status { padding:6px 9px; border-radius:99px; background:#e9f7dc; color:#42701e; font-size:11px; font-weight:750; }
+      .composer { display:none; padding:25px 22px 23px; grid-template-columns:1.35fr .8fr; gap:22px; border-bottom:1px solid var(--line); background:#faf8f2; }
+      .composer.open { display:grid; }
+      label { display:block; font-size:12px; color:var(--muted); margin-bottom:8px; }
+      input[type="text"] { width:100%; border:1px solid #cbc7bb; border-radius:10px; padding:12px 13px; outline:none; background:white; }
+      input[type="text"]:focus { border-color:var(--violet); box-shadow:0 0 0 3px #7657ff1c; }
+      .range-line { display:flex; justify-content:space-between; align-items:center; }
+      input[type="range"] { width:100%; accent-color:var(--violet); margin:13px 0 5px; }
+      .segments { display:flex; gap:7px; margin-top:14px; }
+      .segment { border:1px solid var(--line); background:white; padding:8px 10px; border-radius:8px; font-size:12px; cursor:pointer; }
+      .segment.active { background:var(--ink); color:white; border-color:var(--ink); }
+      .composer-actions { grid-column:1/-1; display:flex; justify-content:flex-end; }
+      .launch { border:0; background:var(--violet); color:white; border-radius:10px; padding:11px 15px; font-weight:700; cursor:pointer; }
+      table { width:100%; border-collapse:collapse; }
+      th,td { padding:16px 22px; text-align:left; border-bottom:1px solid #ebe8df; font-size:13px; }
+      th { color:#858176; font-size:11px; text-transform:uppercase; letter-spacing:.8px; }
+      tr:last-child td { border-bottom:0; }
+      .campaign { display:flex; align-items:center; gap:11px; font-weight:650; }
+      .campaign i { width:9px; height:9px; border-radius:50%; background:var(--lime); border:1px solid #8bad31; }
+      .spacer { height:310px; display:flex; align-items:center; justify-content:center; color:#aaa69a; font-size:12px; letter-spacing:1.4px; text-transform:uppercase; }
+      .insights { scroll-margin-top:110px; }
+      .section-title { display:flex; align-items:end; justify-content:space-between; margin-bottom:20px; }
+      .section-title h2 { font-size:34px; }
+      .filters { display:flex; gap:7px; }
+      .filter { border:1px solid var(--line); background:var(--card); border-radius:9px; padding:8px 11px; font-size:12px; cursor:pointer; }
+      .filter.active { background:var(--ink); color:white; }
+      .chart { height:300px; padding:28px 28px 24px; display:flex; align-items:end; gap:16px; position:relative; }
+      .chart::before { content:""; position:absolute; inset:28px; background:repeating-linear-gradient(to bottom,transparent 0,transparent 55px,#e9e5db 56px); pointer-events:none; }
+      .bar { flex:1; min-width:30px; height:var(--h); border-radius:8px 8px 3px 3px; background:var(--violet); z-index:1; transition:height .45s cubic-bezier(.2,.8,.2,1),background .3s; }
+      .bar:nth-child(3n) { background:var(--lime); }
+      .callout { margin-top:16px; display:flex; justify-content:space-between; align-items:center; padding:22px 24px; border-radius:16px; background:var(--ink); color:white; }
+      .callout strong { font-size:20px; }
+      .callout span { color:#b8b5aa; font-size:13px; }
+      .toast { position:fixed; right:28px; bottom:28px; padding:14px 17px; border-radius:11px; background:var(--ink); color:white; font-size:13px; transform:translateY(80px); opacity:0; transition:.35s cubic-bezier(.2,.9,.2,1); z-index:10; }
+      .toast.show { transform:none; opacity:1; }
+    </style>
+  </head>
+  <body>
+    <div class="shell">
+      <aside>
+        <div class="brand"><span class="mark">N</span>Northstar</div>
+        <nav aria-label="Workspace">
+          <button class="active">Overview</button>
+          <button>Campaigns</button>
+          <button>Audience</button>
+          <button>Automations</button>
+          <button>Settings</button>
+        </nav>
+      </aside>
+      <div class="workspace">
+        <header><h1>Growth workspace</h1><div class="avatar">ON</div></header>
+        <main>
+          <section class="hero">
+            <div><div class="eyebrow">Tuesday, July 12</div><h2>Good afternoon, Obi.</h2><p>Build, launch, and understand lifecycle campaigns from one focused workspace.</p></div>
+            <button class="primary" id="newCampaign">＋ New campaign</button>
+          </section>
+          <section class="stats">
+            <article class="stat"><span>Active audience</span><strong>24,890</strong><small>↑ 12.4%</small></article>
+            <article class="stat"><span>Conversion rate</span><strong>8.7%</strong><small>↑ 2.1%</small></article>
+            <article class="stat"><span>Revenue influenced</span><strong>$48.2k</strong><small>↑ 18.9%</small></article>
+          </section>
+          <section class="panel">
+            <div class="panel-head"><h3>Campaigns</h3><span class="status" id="workspaceStatus">3 running</span></div>
+            <div class="composer" id="composer">
+              <div><label for="campaignName">Campaign name</label><input id="campaignName" type="text" placeholder="e.g. Summer product launch" /></div>
+              <div><div class="range-line"><label for="budget">Daily budget</label><strong id="budgetValue">$240</strong></div><input id="budget" type="range" min="100" max="600" value="240" step="20" /><div class="segments"><button class="segment active">All users</button><button class="segment">New leads</button></div></div>
+              <div class="composer-actions"><button class="launch" id="launchPreview">Launch preview →</button></div>
+            </div>
+            <table>
+              <thead><tr><th>Name</th><th>Audience</th><th>Conversion</th><th>Status</th></tr></thead>
+              <tbody id="campaignRows">
+                <tr><td><span class="campaign"><i></i>Onboarding refresh</span></td><td>4,280</td><td>12.8%</td><td>Running</td></tr>
+                <tr><td><span class="campaign"><i></i>Feature adoption</span></td><td>8,910</td><td>9.4%</td><td>Running</td></tr>
+                <tr><td><span class="campaign"><i></i>Win-back sequence</span></td><td>2,460</td><td>6.1%</td><td>Running</td></tr>
+              </tbody>
+            </table>
+          </section>
+
+          <div class="spacer">Live performance · updated just now</div>
+
+          <section class="insights" id="insights">
+            <div class="section-title"><div><div class="eyebrow">Performance</div><h2>Conversion momentum</h2></div><div class="filters"><button class="filter active" data-range="week">7 days</button><button class="filter" data-range="month">30 days</button></div></div>
+            <section class="panel"><div class="chart" id="chart"><div class="bar" style="--h:42%"></div><div class="bar" style="--h:55%"></div><div class="bar" style="--h:48%"></div><div class="bar" style="--h:67%"></div><div class="bar" style="--h:72%"></div><div class="bar" style="--h:64%"></div><div class="bar" style="--h:88%"></div></div></section>
+            <div class="callout"><div><strong>Your strongest week this quarter.</strong><br /><span>Automations influenced 38% of new conversions.</span></div><span>View report →</span></div>
+          </section>
+        </main>
+      </div>
+    </div>
+    <div class="toast" id="toast">Preview launched successfully</div>
+    <script>
+      const composer = document.querySelector('#composer');
+      const nameInput = document.querySelector('#campaignName');
+      const budget = document.querySelector('#budget');
+      const budgetValue = document.querySelector('#budgetValue');
+      document.querySelector('#newCampaign').addEventListener('click', () => {
+        composer.classList.add('open');
+        setTimeout(() => nameInput.focus(), 180);
+      });
+      budget.addEventListener('input', () => budgetValue.textContent = `$${budget.value}`);
+      document.querySelectorAll('.segment').forEach(button => button.addEventListener('click', () => {
+        document.querySelectorAll('.segment').forEach(item => item.classList.remove('active'));
+        button.classList.add('active');
+      }));
+      document.querySelector('#launchPreview').addEventListener('click', () => {
+        const title = nameInput.value.trim() || 'Untitled campaign';
+        const row = document.createElement('tr');
+        row.innerHTML = `<td><span class="campaign"><i></i>${title}</span></td><td>Preview</td><td>—</td><td>Ready</td>`;
+        document.querySelector('#campaignRows').prepend(row);
+        document.querySelector('#workspaceStatus').textContent = '4 campaigns';
+        composer.classList.remove('open');
+        const toast = document.querySelector('#toast');
+        toast.classList.add('show');
+        setTimeout(() => toast.classList.remove('show'), 1800);
+      });
+      document.querySelectorAll('.filter').forEach(button => button.addEventListener('click', () => {
+        document.querySelectorAll('.filter').forEach(item => item.classList.remove('active'));
+        button.classList.add('active');
+        const month = button.dataset.range === 'month';
+        document.querySelectorAll('.bar').forEach((bar, index) => {
+          const values = month ? [58,72,66,82,77,91,84] : [42,55,48,67,72,64,88];
+          bar.style.setProperty('--h', `${values[index]}%`);
+        });
+      }));
+    </script>
+  </body>
+</html>

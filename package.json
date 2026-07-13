@@ -1,0 +1,17 @@
+{
+  "name": "agentrecorder-spike",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "reprocess": "node scripts/reprocess-timeline.mjs",
+    "test": "node --test",
+    "demo": "python3 -m http.server 4173 --directory demo",
+    "compose": "node scripts/compose-recording.mjs",
+    "record": "node scripts/record-session.mjs",
+    "audit:accessibility": "node scripts/audit-accessibility-vocabulary.mjs"
+  },
+  "dependencies": {
+    "acorn": "^8.17.0"
+  }
+}

@@ -1,0 +1,27 @@
+# macOS metadata
+.DS_Store
+
+# Swift build products and local package state
+.build/
+.swiftpm/
+Package.resolved
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+
+# Node dependencies and tool caches
+node_modules/
+.npm/
+*.log
+
+# Recorder inputs, rendered videos, frame dumps, and generated assets
+artifacts/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+
+# Editor-local state
+.vscode/
+.idea/
+*~

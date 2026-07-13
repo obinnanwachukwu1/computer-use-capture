@@ -1,0 +1,66 @@
+{
+  "scenarios": [
+    {
+      "name": "modal-contained-work",
+      "duration": 18,
+      "events": [
+        {"action":"click","time":2,"coordinates":{"xNorm":0.70,"yNorm":0.30}},
+        {"action":"type_text","time":6},
+        {"action":"click","time":10,"coordinates":{"xNorm":0.60,"yNorm":0.50}},
+        {"action":"click","time":14,"coordinates":{"xNorm":0.70,"yNorm":0.60}}
+      ],
+      "motion": [{"time":2.75,"x":0.20,"y":0.20,"width":0.60,"height":0.60,"changedFraction":0.20,"kind":"appearance"}],
+      "expectedEpisodes":1,"expectedEpisodeActions":4,"expectedShots":1
+    },
+    {
+      "name": "popover-contained-work",
+      "duration": 14,
+      "events": [
+        {"action":"click","time":2,"coordinates":{"xNorm":0.75,"yNorm":0.30}},
+        {"action":"click","time":6,"coordinates":{"xNorm":0.70,"yNorm":0.40}},
+        {"action":"click","time":10,"coordinates":{"xNorm":0.80,"yNorm":0.45}}
+      ],
+      "motion": [{"time":2.75,"x":0.55,"y":0.20,"width":0.35,"height":0.35,"changedFraction":0.10,"kind":"appearance"}],
+      "expectedEpisodes":1,"expectedEpisodeActions":3,"expectedShots":1
+    },
+    {
+      "name": "side-panel-contained-work",
+      "duration": 15,
+      "events": [
+        {"action":"click","time":2,"coordinates":{"xNorm":0.82,"yNorm":0.18}},
+        {"action":"click","time":7,"coordinates":{"xNorm":0.78,"yNorm":0.45}},
+        {"action":"click","time":11,"coordinates":{"xNorm":0.84,"yNorm":0.70}}
+      ],
+      "motion": [{"time":2.75,"x":0.65,"y":0.05,"width":0.30,"height":0.85,"changedFraction":0.24,"kind":"appearance"}],
+      "expectedEpisodes":1,"expectedEpisodeActions":3,"expectedShots":1
+    },
+    {
+      "name": "chart-update-with-departure",
+      "duration": 14,
+      "events": [
+        {"action":"click","time":2,"coordinates":{"xNorm":0.82,"yNorm":0.22}},
+        {"action":"click","time":8,"coordinates":{"xNorm":0.12,"yNorm":0.82}}
+      ],
+      "motion": [{"time":2.75,"x":0.15,"y":0.18,"width":0.72,"height":0.52,"changedFraction":0.18,"kind":"transformation"}],
+      "expectedEpisodes":0,"expectedEpisodeActions":0,"expectedShots":1
+    },
+    {
+      "name": "scroll-motion-does-not-frame",
+      "duration": 10,
+      "events": [{"action":"scroll","time":4}],
+      "motion": [{"time":4.75,"x":0.00,"y":0.00,"width":1.00,"height":1.00,"changedFraction":0.80,"kind":"translation"}],
+      "expectedEpisodes":0,"expectedEpisodeActions":0,"expectedShots":0
+    },
+    {
+      "name": "reveal-followed-by-unrelated-actions",
+      "duration": 18,
+      "events": [
+        {"action":"click","time":2,"coordinates":{"xNorm":0.75,"yNorm":0.25}},
+        {"action":"click","time":8,"coordinates":{"xNorm":0.08,"yNorm":0.88}},
+        {"action":"click","time":13,"coordinates":{"xNorm":0.92,"yNorm":0.88}}
+      ],
+      "motion": [{"time":2.75,"x":0.52,"y":0.12,"width":0.40,"height":0.42,"changedFraction":0.13,"kind":"appearance"}],
+      "expectedEpisodes":0,"expectedEpisodeActions":0,"expectedShots":3
+    }
+  ]
+}

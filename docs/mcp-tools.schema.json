@@ -1,0 +1,1259 @@
+{
+  "$comment": "Source-of-truth contract for the Agent Recorder MCP server. ONLY the objects under `tools` are MCP wire payloads (returned verbatim by `tools/list`). Every other top-level section (contract, identifiers, stateMachines, errorModel, provenance, concurrency, artifacts) is authoring metadata for the server implementation and is NOT part of the MCP wire protocol.",
+  "contract": {
+    "name": "agent-recorder",
+    "contractVersion": "1.0.0",
+    "mcpProtocolRevision": "2025-11-25",
+    "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
+    "asyncModel": "Long-running work (rendering) is returned as a render job id and polled with recorder_get. Tool calls never block on unbounded work. The MCP 2025-11-25 experimental tasks utility is intentionally not required; it may be adopted additively later.",
+    "wireBehavior": [
+      "Every tool defines outputSchema; successful results are returned in structuredContent conforming to it, with a human-readable text block as fallback content.",
+      "All failures (including input validation) are returned as tool execution errors: result.isError = true with structuredContent conforming to errorModel.errorSchema, so the calling model can self-correct.",
+      "Computer Use is never proxied, wrapped, or modified. Between recorder_start and recorder_stop the agent uses its existing Computer Use tools unchanged."
+    ]
+  },
+  "identifiers": {
+    "recordingId": "rec_<ulid> — stable for the lifetime of the project store entry.",
+    "renderId": "ren_<ulid> — one per enqueued render; never reused.",
+    "actionId": "act_<seq> — stable per recording; derived from rollout call identity (event timestamp + call index within invocation), NOT from array position, so it survives timeline reprocessing."
+  },
+  "stateMachines": {
+    "recording": {
+      "states": [
+        "starting",
+        "recording",
+        "stopping",
+        "stopped",
+        "failed",
+        "discarded"
+      ],
+      "transitions": [
+        "starting -> recording (recorder_start returns only after first captured frame is committed)",
+        "starting -> failed (permission, target, or storage error; returned synchronously by recorder_start)",
+        "recording -> stopping (recorder_stop, or maxDurationSeconds auto-stop)",
+        "stopping -> stopped (capture finalized, rollout settled, facts reconstructed)",
+        "stopping -> failed (capture wrote no frames or reconstruction crashed; capture artifacts retained when possible)",
+        "stopped|failed -> discarded (recorder_discard)"
+      ],
+      "autoStop": "Reaching maxDurationSeconds finalizes capture and reconstructs facts but never auto-enqueues a render."
+    },
+    "render": {
+      "states": [
+        "queued",
+        "analyzing",
+        "rendering",
+        "completed",
+        "failed",
+        "canceled"
+      ],
+      "transitions": [
+        "queued -> analyzing (motion/timing prepass over the source video)",
+        "analyzing -> rendering (frame composition and encode)",
+        "analyzing|rendering -> canceled (recorder_cancel; partial output deleted)",
+        "analyzing|rendering -> failed (structured error retained on the job)",
+        "rendering -> completed (output atomically renamed into the project store)"
+      ]
+    }
+  },
+  "errorModel": {
+    "transport": "Tool execution error: result.isError = true; structuredContent matches errorSchema below.",
+    "errorSchema": {
+      "type": "object",
+      "required": [
+        "code",
+        "message",
+        "retryable"
+      ],
+      "properties": {
+        "code": {
+          "type": "string",
+          "enum": [
+            "permission_missing",
+            "target_window_not_found",
+            "active_recording_exists",
+            "not_found",
+            "invalid_state",
+            "render_in_progress",
+            "reconstruction_failed",
+            "render_failed",
+            "storage_unavailable",
+            "introspection_ambiguous",
+            "invalid_argument"
+          ]
+        },
+        "message": {
+          "type": "string"
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "data": {
+          "type": "object",
+          "description": "Code-specific detail, e.g. {permission: 'screen_recording'|'accessibility'}, {activeRecordingId}, {runningRenderId}, {sessionCandidates: [...]}.",
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "provenance": {
+    "reconstructionValues": [
+      "direct",
+      "ax-identity",
+      "ax-focus",
+      "ax-structural",
+      "unresolved"
+    ],
+    "renderPolicy": "Actions whose target is 'unresolved' are never rendered with a cursor. 'visual-inferred' pointer fallbacks and 'ax-structural' matches below the server's confidence floor are framing-only by default: the camera may use them, the synthetic cursor and click spring may not. cursor.allowInferredTargets=true in recorder_edit opts in explicitly, and render results always report counts either way.",
+    "surfacing": "Per-action provenance, confidence, and unresolvedReason appear in recorder_stop and recorder_get outputs; render results report factual/inferred/omitted cursor counts."
+  },
+  "concurrency": {
+    "recordings": "At most one active recording per server (v1). recorder_start while one is active fails with active_recording_exists unless the idempotencyKey matches, in which case the existing recording is returned.",
+    "renders": "At most one render (queued or running) per recording. recorder_edit or recorder_stop(render:'auto') while one exists fails with render_in_progress carrying the running id."
+  },
+  "artifacts": {
+    "store": "All artifacts live under a recorder-owned project directory keyed by recordingId. No tool accepts a filesystem path as input. Outputs are returned as read-only file:// URIs with sizes.",
+    "retention": "Artifacts persist until recorder_discard. The accessibility sidecar may be stored value-redacted when the server is configured for redaction; timelines record adapter fingerprints for replay diagnostics."
+  },
+  "tools": [
+    {
+      "name": "recorder_start",
+      "title": "Start recording",
+      "description": "Start capturing the target app's window with ScreenCaptureKit. Returns only once capture is actually committing frames, so you can begin using your normal Computer Use tools immediately after this returns. The recorder is fully out of band: do not report actions to it, and do not change how you use Computer Use. Call recorder_stop when the task's on-screen work is done. Fails fast with permission_missing if Screen Recording or Accessibility permission is not granted (check recorder_capabilities first).",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
+      },
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "app": {
+            "type": "string",
+            "description": "Bundle identifier of the capture target. Must appear in recorder_capabilities.targets.",
+            "default": "com.apple.Safari"
+          },
+          "maxDurationSeconds": {
+            "type": "integer",
+            "minimum": 10,
+            "maximum": 7200,
+            "default": 1800,
+            "description": "Hard cap; capture auto-stops and reconstructs facts at this bound (no render is auto-enqueued on auto-stop)."
+          },
+          "label": {
+            "type": "string",
+            "maxLength": 120,
+            "description": "Optional human-readable label stored with the recording."
+          },
+          "idempotencyKey": {
+            "type": "string",
+            "maxLength": 64,
+            "description": "If a recording started with the same key is still active, that recording is returned instead of an error."
+          }
+        },
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "required": [
+          "recordingId",
+          "state",
+          "startedAt"
+        ],
+        "properties": {
+          "recordingId": {
+            "type": "string",
+            "pattern": "^rec_[0-9A-Za-z]{10,}$"
+          },
+          "state": {
+            "type": "string",
+            "const": "recording"
+          },
+          "startedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "capture": {
+            "type": "object",
+            "required": [
+              "width",
+              "height"
+            ],
+            "properties": {
+              "width": {
+                "type": "integer"
+              },
+              "height": {
+                "type": "integer"
+              },
+              "pixelsPerPoint": {
+                "type": "number"
+              },
+              "codec": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          },
+          "introspection": {
+            "type": "object",
+            "description": "Whether action reconstruction will be available. 'degraded'/'unavailable' still records video; the timeline may be cursorless.",
+            "required": [
+              "codexSession"
+            ],
+            "properties": {
+              "codexSession": {
+                "type": "string",
+                "enum": [
+                  "attached",
+                  "degraded",
+                  "unavailable"
+                ]
+              },
+              "detail": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "type",
+                "message"
+              ],
+              "properties": {
+                "type": {
+                  "type": "string"
+                },
+                "message": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "recorder_stop",
+      "title": "Stop recording",
+      "description": "Stop capture, wait for the action log to settle, and reconstruct the factual action timeline (bounded work, returns in seconds). By default also enqueues the default product-demo render as a background job; poll it with recorder_get using the returned render.renderId. Actions whose on-screen target could not be verified are reported as unresolved rather than guessed. Idempotent: calling stop again on a stopped recording returns the same result and never enqueues another render.",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "recordingId"
+        ],
+        "properties": {
+          "recordingId": {
+            "type": "string",
+            "pattern": "^rec_[0-9A-Za-z]{10,}$"
+          },
+          "render": {
+            "type": "string",
+            "enum": [
+              "auto",
+              "none"
+            ],
+            "default": "auto",
+            "description": "'auto' enqueues the default render immediately; 'none' stops and reconstructs only (render later via recorder_edit)."
+          }
+        },
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "required": [
+          "recordingId",
+          "state",
+          "durationSeconds",
+          "provenanceSummary"
+        ],
+        "properties": {
+          "recordingId": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string",
+            "const": "stopped"
+          },
+          "durationSeconds": {
+            "type": "number"
+          },
+          "reconstruction": {
+            "type": "string",
+            "enum": [
+              "settled",
+              "truncated"
+            ],
+            "description": "'truncated' means the action log was still being written at the settle deadline; late actions may be missing."
+          },
+          "actions": {
+            "type": "array",
+            "description": "Factual action summary in capture order.",
+            "items": {
+              "type": "object",
+              "required": [
+                "actionId",
+                "kind",
+                "atMs",
+                "provenance"
+              ],
+              "properties": {
+                "actionId": {
+                  "type": "string",
+                  "pattern": "^act_[0-9]+$"
+                },
+                "kind": {
+                  "type": "string",
+                  "enum": [
+                    "click",
+                    "drag",
+                    "scroll",
+                    "type_text",
+                    "set_value",
+                    "select_text",
+                    "press_key",
+                    "perform_secondary_action",
+                    "unknown"
+                  ]
+                },
+                "atMs": {
+                  "type": "integer",
+                  "description": "Estimated source-video time of the action."
+                },
+                "provenance": {
+                  "type": "string",
+                  "enum": [
+                    "direct",
+                    "ax-identity",
+                    "ax-focus",
+                    "ax-structural",
+                    "unresolved"
+                  ]
+                },
+                "confidence": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "unresolvedReason": {
+                  "type": "string"
+                },
+                "target": {
+                  "type": "object",
+                  "properties": {
+                    "role": {
+                      "type": "string"
+                    },
+                    "title": {
+                      "type": "string"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "provenanceSummary": {
+            "type": "object",
+            "required": [
+              "direct",
+              "axIdentity",
+              "axFocus",
+              "axStructural",
+              "unresolved"
+            ],
+            "properties": {
+              "direct": {
+                "type": "integer"
+              },
+              "axIdentity": {
+                "type": "integer"
+              },
+              "axFocus": {
+                "type": "integer"
+              },
+              "axStructural": {
+                "type": "integer"
+              },
+              "unresolved": {
+                "type": "integer"
+              }
+            },
+            "additionalProperties": false
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "type",
+                "message"
+              ],
+              "properties": {
+                "type": {
+                  "type": "string"
+                },
+                "message": {
+                  "type": "string"
+                },
+                "atMs": {
+                  "type": "integer"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "render": {
+            "description": "Present when render='auto': the enqueued default render job.",
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "renderId",
+                  "state"
+                ],
+                "properties": {
+                  "renderId": {
+                    "type": "string",
+                    "pattern": "^ren_[0-9A-Za-z]{10,}$"
+                  },
+                  "state": {
+                    "type": "string",
+                    "const": "queued"
+                  },
+                  "preset": {
+                    "type": "string"
+                  }
+                },
+                "additionalProperties": false
+              }
+            ]
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "recorder_edit",
+      "title": "Edit and re-render",
+      "description": "Declaratively adjust the finished recording and enqueue a new render with the updated intent. Intents are high level (waiting reduction, zoom emphasis, cursor styling, per-action emphasis or holds); there is no frame or timeline manipulation. An empty intents object re-renders with the current settings. Returns a render job id to poll with recorder_get. Fails with render_in_progress if a render for this recording is already queued or running (cancel it first or wait).",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
+      },
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "recordingId"
+        ],
+        "properties": {
+          "recordingId": {
+            "type": "string",
+            "pattern": "^rec_[0-9A-Za-z]{10,}$"
+          },
+          "intents": {
+            "type": "object",
+            "properties": {
+              "waiting": {
+                "type": "object",
+                "description": "How visually static agent waiting is treated.",
+                "properties": {
+                  "mode": {
+                    "type": "string",
+                    "enum": [
+                      "reduce",
+                      "keep"
+                    ],
+                    "default": "reduce"
+                  },
+                  "retainMs": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 2000,
+                    "default": 100,
+                    "description": "Still time retained around each cut when mode='reduce'."
+                  }
+                },
+                "additionalProperties": false
+              },
+              "zoom": {
+                "type": "object",
+                "properties": {
+                  "strength": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1.5,
+                    "default": 1,
+                    "description": "0 disables camera zoom entirely; 1 is the default semantic framing; values above 1 emphasize."
+                  }
+                },
+                "additionalProperties": false
+              },
+              "cursor": {
+                "type": "object",
+                "properties": {
+                  "scale": {
+                    "type": "number",
+                    "minimum": 1,
+                    "maximum": 4,
+                    "default": 3
+                  },
+                  "path": {
+                    "type": "string",
+                    "enum": [
+                      "natural",
+                      "straight"
+                    ],
+                    "default": "natural"
+                  },
+                  "tiltStrength": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1.5,
+                    "default": 1
+                  },
+                  "allowInferredTargets": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "When true, actions whose target was heuristically inferred (not factual) may render a cursor. Default false: inferred targets influence framing only."
+                  }
+                },
+                "additionalProperties": false
+              },
+              "motionBlur": {
+                "type": "string",
+                "enum": [
+                  "none",
+                  "standard",
+                  "strong"
+                ],
+                "default": "standard"
+              },
+              "actions": {
+                "type": "array",
+                "description": "Per-action overrides, keyed by the stable actionId from recorder_stop/recorder_get.",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "actionId"
+                  ],
+                  "properties": {
+                    "actionId": {
+                      "type": "string",
+                      "pattern": "^act_[0-9]+$"
+                    },
+                    "emphasis": {
+                      "type": "string",
+                      "enum": [
+                        "none",
+                        "reduced",
+                        "standard",
+                        "strong"
+                      ],
+                      "description": "Camera emphasis for this action; 'none' removes its zoom."
+                    },
+                    "holdMs": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 5000,
+                      "description": "Extra real-time pause retained after this action (protects it from waiting reduction)."
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "required": [
+          "recordingId",
+          "renderId",
+          "state"
+        ],
+        "properties": {
+          "recordingId": {
+            "type": "string"
+          },
+          "renderId": {
+            "type": "string",
+            "pattern": "^ren_[0-9A-Za-z]{10,}$"
+          },
+          "state": {
+            "type": "string",
+            "const": "queued"
+          },
+          "effectiveIntents": {
+            "type": "object",
+            "description": "The full intent set this render will use after merging with the recording's current settings.",
+            "additionalProperties": true
+          },
+          "notes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Non-fatal adjustments, e.g. an actionId override that referenced an unresolved action and was limited to framing."
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "recorder_get",
+      "title": "Get recording or render status",
+      "description": "Fetch the current state of a recording (rec_...) or a render job (ren_...). Use this to poll a render enqueued by recorder_stop or recorder_edit; poll every few seconds until state is 'completed', 'failed', or 'canceled'. Recording results include per-action provenance and artifact URIs; render results include progress, the output video URI, and how many pointer actions were rendered factually versus inferred or omitted.",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^(rec|ren)_[0-9A-Za-z]{10,}$",
+            "description": "A recordingId or renderId; the prefix selects which status is returned."
+          },
+          "include": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "actions",
+                "warnings"
+              ]
+            },
+            "description": "Optional verbose sections for recording status (omitted by default to keep results small)."
+          }
+        },
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "kind",
+              "recordingId",
+              "state"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "recording"
+              },
+              "recordingId": {
+                "type": "string"
+              },
+              "state": {
+                "type": "string",
+                "enum": [
+                  "starting",
+                  "recording",
+                  "stopping",
+                  "stopped",
+                  "failed",
+                  "discarded"
+                ]
+              },
+              "label": {
+                "type": "string"
+              },
+              "startedAt": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "stoppedAt": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "durationSeconds": {
+                "type": "number"
+              },
+              "provenanceSummary": {
+                "type": "object",
+                "properties": {
+                  "direct": {
+                    "type": "integer"
+                  },
+                  "axIdentity": {
+                    "type": "integer"
+                  },
+                  "axFocus": {
+                    "type": "integer"
+                  },
+                  "axStructural": {
+                    "type": "integer"
+                  },
+                  "unresolved": {
+                    "type": "integer"
+                  }
+                },
+                "additionalProperties": false
+              },
+              "actions": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "actionId",
+                    "kind",
+                    "atMs",
+                    "provenance"
+                  ],
+                  "properties": {
+                    "actionId": {
+                      "type": "string"
+                    },
+                    "kind": {
+                      "type": "string"
+                    },
+                    "atMs": {
+                      "type": "integer"
+                    },
+                    "provenance": {
+                      "type": "string",
+                      "enum": [
+                        "direct",
+                        "ax-identity",
+                        "ax-focus",
+                        "ax-structural",
+                        "unresolved"
+                      ]
+                    },
+                    "confidence": {
+                      "type": "number"
+                    },
+                    "unresolvedReason": {
+                      "type": "string"
+                    },
+                    "target": {
+                      "type": "object",
+                      "properties": {
+                        "role": {
+                          "type": "string"
+                        },
+                        "title": {
+                          "type": "string"
+                        }
+                      },
+                      "additionalProperties": false
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              },
+              "warnings": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "type",
+                    "message"
+                  ],
+                  "properties": {
+                    "type": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "atMs": {
+                      "type": "integer"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              },
+              "renders": {
+                "type": "array",
+                "description": "Summaries of all renders for this recording, newest first.",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "renderId",
+                    "state"
+                  ],
+                  "properties": {
+                    "renderId": {
+                      "type": "string"
+                    },
+                    "state": {
+                      "type": "string",
+                      "enum": [
+                        "queued",
+                        "analyzing",
+                        "rendering",
+                        "completed",
+                        "failed",
+                        "canceled"
+                      ]
+                    },
+                    "createdAt": {
+                      "type": "string",
+                      "format": "date-time"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              },
+              "artifacts": {
+                "type": "object",
+                "properties": {
+                  "sourceVideo": {
+                    "type": "object",
+                    "properties": {
+                      "uri": {
+                        "type": "string",
+                        "format": "uri"
+                      },
+                      "bytes": {
+                        "type": "integer"
+                      }
+                    },
+                    "additionalProperties": false
+                  },
+                  "timeline": {
+                    "type": "object",
+                    "properties": {
+                      "uri": {
+                        "type": "string",
+                        "format": "uri"
+                      }
+                    },
+                    "additionalProperties": false
+                  }
+                },
+                "additionalProperties": false
+              },
+              "error": {
+                "type": "object",
+                "properties": {
+                  "code": {
+                    "type": "string"
+                  },
+                  "message": {
+                    "type": "string"
+                  }
+                },
+                "additionalProperties": false
+              }
+            },
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind",
+              "renderId",
+              "recordingId",
+              "state"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "render"
+              },
+              "renderId": {
+                "type": "string"
+              },
+              "recordingId": {
+                "type": "string"
+              },
+              "state": {
+                "type": "string",
+                "enum": [
+                  "queued",
+                  "analyzing",
+                  "rendering",
+                  "completed",
+                  "failed",
+                  "canceled"
+                ]
+              },
+              "progress": {
+                "type": "object",
+                "properties": {
+                  "phase": {
+                    "type": "string",
+                    "enum": [
+                      "queued",
+                      "analyzing",
+                      "rendering"
+                    ]
+                  },
+                  "percent": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 100
+                  },
+                  "etaSeconds": {
+                    "type": "integer"
+                  }
+                },
+                "additionalProperties": false
+              },
+              "startedAt": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "finishedAt": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "artifact": {
+                "type": "object",
+                "description": "Present when state='completed'.",
+                "properties": {
+                  "uri": {
+                    "type": "string",
+                    "format": "uri"
+                  },
+                  "bytes": {
+                    "type": "integer"
+                  },
+                  "width": {
+                    "type": "integer"
+                  },
+                  "height": {
+                    "type": "integer"
+                  },
+                  "fps": {
+                    "type": "integer"
+                  },
+                  "durationSeconds": {
+                    "type": "number"
+                  }
+                },
+                "additionalProperties": false
+              },
+              "pointerRendering": {
+                "type": "object",
+                "description": "Epistemic summary of the rendered cursor: how many pointer actions were shown at factual targets, shown at inferred targets (only if allowInferredTargets), or omitted because their target stayed unresolved.",
+                "properties": {
+                  "factual": {
+                    "type": "integer"
+                  },
+                  "inferredRendered": {
+                    "type": "integer"
+                  },
+                  "omittedUnresolved": {
+                    "type": "integer"
+                  }
+                },
+                "additionalProperties": false
+              },
+              "error": {
+                "type": "object",
+                "properties": {
+                  "code": {
+                    "type": "string"
+                  },
+                  "message": {
+                    "type": "string"
+                  }
+                },
+                "additionalProperties": false
+              }
+            },
+            "additionalProperties": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "recorder_cancel",
+      "title": "Cancel a render",
+      "description": "Cancel a queued or running render job. The recording and its factual timeline are untouched; partial render output is deleted. Idempotent: canceling a job that already reached a final state returns that final state.",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "renderId"
+        ],
+        "properties": {
+          "renderId": {
+            "type": "string",
+            "pattern": "^ren_[0-9A-Za-z]{10,}$"
+          }
+        },
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "required": [
+          "renderId",
+          "state"
+        ],
+        "properties": {
+          "renderId": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "canceled",
+              "completed",
+              "failed"
+            ],
+            "description": "'completed'/'failed' indicate the job finished before cancellation took effect."
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "recorder_discard",
+      "title": "Discard recording",
+      "description": "Permanently delete a recording and all of its artifacts (source video, timeline, accessibility sidecar, rendered videos, reports). Cancels any in-flight render for it first. This cannot be undone. Idempotent: discarding an already-discarded recording succeeds.",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "recordingId"
+        ],
+        "properties": {
+          "recordingId": {
+            "type": "string",
+            "pattern": "^rec_[0-9A-Za-z]{10,}$"
+          }
+        },
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "required": [
+          "recordingId",
+          "state"
+        ],
+        "properties": {
+          "recordingId": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string",
+            "const": "discarded"
+          },
+          "freedBytes": {
+            "type": "integer"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "recorder_capabilities",
+      "title": "Recorder capabilities",
+      "description": "Report whether recording can work right now and what it supports: macOS Screen Recording and Accessibility permission status, supported capture targets, action-introspection adapter health (degraded adapters still record video but may produce a cursorless timeline), presets, limits, defaults, and the contract version. Call this before recorder_start when you are unsure the environment is ready.",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "required": [
+          "contractVersion",
+          "permissions",
+          "targets",
+          "adapters",
+          "limits"
+        ],
+        "properties": {
+          "contractVersion": {
+            "type": "string"
+          },
+          "platform": {
+            "type": "string"
+          },
+          "permissions": {
+            "type": "object",
+            "required": [
+              "screenRecording",
+              "accessibility"
+            ],
+            "properties": {
+              "screenRecording": {
+                "type": "string",
+                "enum": [
+                  "granted",
+                  "denied",
+                  "unknown"
+                ]
+              },
+              "accessibility": {
+                "type": "string",
+                "enum": [
+                  "granted",
+                  "denied",
+                  "unknown"
+                ]
+              }
+            },
+            "additionalProperties": false
+          },
+          "targets": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "app",
+                "available"
+              ],
+              "properties": {
+                "app": {
+                  "type": "string",
+                  "description": "Bundle identifier."
+                },
+                "available": {
+                  "type": "boolean",
+                  "description": "Running with an eligible on-screen window right now."
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "adapters": {
+            "type": "object",
+            "description": "Health of the read-only introspection seams. 'degraded'/'unavailable' means capture still works but action reconstruction may be partial or absent.",
+            "properties": {
+              "codexRollout": {
+                "type": "object",
+                "properties": {
+                  "status": {
+                    "type": "string",
+                    "enum": [
+                      "ok",
+                      "degraded",
+                      "unavailable"
+                    ]
+                  },
+                  "formatFingerprint": {
+                    "type": "string"
+                  },
+                  "detail": {
+                    "type": "string"
+                  }
+                },
+                "additionalProperties": false
+              },
+              "screenshotCache": {
+                "type": "object",
+                "properties": {
+                  "status": {
+                    "type": "string",
+                    "enum": [
+                      "ok",
+                      "degraded",
+                      "unavailable"
+                    ]
+                  },
+                  "detail": {
+                    "type": "string"
+                  }
+                },
+                "additionalProperties": false
+              }
+            },
+            "additionalProperties": false
+          },
+          "presets": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "name"
+              ],
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "default": {
+                  "type": "boolean"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "limits": {
+            "type": "object",
+            "properties": {
+              "maxDurationSeconds": {
+                "type": "integer"
+              },
+              "maxConcurrentRecordings": {
+                "type": "integer"
+              },
+              "maxConcurrentRendersPerRecording": {
+                "type": "integer"
+              }
+            },
+            "additionalProperties": false
+          },
+          "defaults": {
+            "type": "object",
+            "description": "Effective default intents applied when recorder_stop auto-renders.",
+            "additionalProperties": true
+          },
+          "activeRecordingId": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The currently active recording, if any."
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  ]
+}

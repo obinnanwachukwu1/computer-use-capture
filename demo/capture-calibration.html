@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Signal Bench — Capture Calibration</title>
+  <style>
+    :root {
+      --bg: #0b0d10; --surface: #111419; --raised: #171b21; --line: #282d35;
+      --line-soft: #1d2229; --ink: #f1f3f5; --muted: #8c949f; --dim: #5f6874;
+      --amber: #ffc657; --cyan: #65d8ed; --green: #7adf9b; --coral: #ff806b;
+      --blue: #7699ff; --radius: 12px;
+    }
+    * { box-sizing: border-box; }
+    html { background: var(--bg); color: var(--ink); font-family: "Avenir Next", Avenir, sans-serif; font-synthesis: none; }
+    body { margin: 0; min-width: 1040px; background:
+      radial-gradient(circle at 72% -10%, rgba(101,216,237,.08), transparent 30%), var(--bg); }
+    button, input { font: inherit; }
+    button { color: inherit; }
+    .app { display: grid; grid-template-columns: 208px minmax(0, 1fr); min-height: 100vh; }
+    aside { position: fixed; inset: 0 auto 0 0; width: 208px; padding: 20px 14px; border-right: 1px solid var(--line); background: rgba(11,13,16,.94); backdrop-filter: blur(18px); z-index: 5; }
+    .wordmark { display: flex; align-items: center; gap: 10px; padding: 0 8px 24px; font-size: 13px; font-weight: 700; letter-spacing: .02em; }
+    .logo { width: 25px; height: 25px; display: grid; place-items: center; border: 1px solid #3d444f; border-radius: 7px; background: linear-gradient(145deg,#242a32,#101318); color: var(--cyan); font: 700 11px ui-monospace, monospace; box-shadow: inset 0 1px #ffffff0d; }
+    .nav-label { margin: 18px 10px 7px; color: var(--dim); font-size: 9px; font-weight: 700; letter-spacing: .15em; text-transform: uppercase; }
+    nav { display: grid; gap: 2px; }
+    nav button { display: flex; align-items: center; gap: 9px; width: 100%; border: 0; border-radius: 7px; padding: 8px 10px; color: #9ca4ae; background: transparent; text-align: left; font-size: 11px; cursor: pointer; }
+    nav button::before { content: ""; width: 6px; height: 6px; border: 1px solid currentColor; border-radius: 2px; opacity: .65; }
+    nav button.active { color: var(--ink); background: #1b2027; box-shadow: inset 0 0 0 1px #2a3039; }
+    .capture-card { position: absolute; inset: auto 14px 18px; padding: 12px; border: 1px solid var(--line); border-radius: 9px; background: #101318; }
+    .capture-card span { display: block; color: var(--dim); font-size: 9px; text-transform: uppercase; letter-spacing: .12em; }
+    .capture-card strong { display: block; margin: 7px 0 3px; font: 600 11px ui-monospace, monospace; }
+    .capture-card small { color: var(--green); font: 9px ui-monospace, monospace; }
+    .workspace { grid-column: 2; min-width: 0; }
+    header { height: 58px; padding: 0 24px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--line); background: rgba(11,13,16,.82); backdrop-filter: blur(18px); position: sticky; top: 0; z-index: 4; }
+    .crumb { color: var(--muted); font-size: 10px; } .crumb b { color: var(--ink); font-weight: 600; }
+    .header-actions { display: flex; align-items: center; gap: 8px; }
+    .live { display: flex; align-items: center; gap: 7px; color: var(--green); font: 9px ui-monospace, monospace; }
+    .live i { width: 6px; height: 6px; border-radius: 50%; background: currentColor; box-shadow: 0 0 0 4px #7adf9b12; animation: pulse 1.8s ease-in-out infinite; }
+    .quiet, .primary { border: 1px solid var(--line); border-radius: 7px; padding: 7px 10px; background: #14181e; font-size: 10px; cursor: pointer; transition: .18s ease; }
+    .quiet:hover { border-color: #4c5664; background: #1a1f26; }
+    .primary { border-color: #dba53f; background: var(--amber); color: #17130a; font-weight: 700; box-shadow: 0 5px 20px #ffc6571a; }
+    .primary:hover { transform: translateY(-1px); filter: brightness(1.06); }
+    main { max-width: 1220px; margin: 0 auto; padding: 24px 26px 100px; }
+    .title-row { display: flex; justify-content: space-between; align-items: end; margin-bottom: 18px; }
+    .kicker { color: var(--cyan); font: 700 9px ui-monospace, monospace; letter-spacing: .16em; text-transform: uppercase; }
+    h1 { margin: 7px 0 3px; font-size: 27px; line-height: 1.1; letter-spacing: -.04em; }
+    .subtitle { color: var(--muted); font-size: 10px; }
+    .range { display: flex; gap: 2px; padding: 3px; border: 1px solid var(--line); border-radius: 8px; background: #0e1115; }
+    .range button { border: 0; padding: 6px 9px; border-radius: 5px; background: transparent; color: var(--muted); font-size: 9px; cursor: pointer; }
+    .range button.active { background: #252b33; color: var(--ink); }
+    .metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 9px; }
+    .metric { min-height: 92px; padding: 13px 14px; border: 1px solid var(--line); border-radius: 10px; background: linear-gradient(155deg,#15191f,#101318); box-shadow: inset 0 1px #ffffff06; }
+    .metric-label { display: flex; justify-content: space-between; color: var(--muted); font-size: 9px; }
+    .metric strong { display: block; margin: 12px 0 5px; font-size: 22px; letter-spacing: -.04em; }
+    .delta { font: 9px ui-monospace, monospace; color: var(--green); } .delta.down { color: var(--coral); }
+    .grid { display: grid; grid-template-columns: minmax(0,1.6fr) minmax(300px,.75fr); gap: 10px; margin-top: 10px; }
+    .panel { border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); overflow: hidden; box-shadow: 0 18px 60px #00000028; }
+    .panel-head { min-height: 45px; padding: 0 14px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--line); }
+    .panel-title { font-size: 10px; font-weight: 650; } .panel-title small { margin-left: 6px; color: var(--dim); font-weight: 500; }
+    .legend { display: flex; gap: 12px; color: var(--muted); font-size: 8px; }
+    .legend span::before { content: ""; display: inline-block; width: 6px; height: 6px; margin-right: 5px; border-radius: 2px; background: var(--cyan); }
+    .legend span:last-child::before { background: var(--amber); }
+    .plot { position: relative; height: 252px; padding: 18px 18px 24px 38px; background-image: linear-gradient(#1d2229 1px,transparent 1px),linear-gradient(90deg,#1d2229 1px,transparent 1px); background-size: 100% 46px, 74px 100%; }
+    .plot svg { width: 100%; height: 100%; overflow: visible; }
+    .plot-labels { position: absolute; inset: 13px auto 22px 10px; display: flex; flex-direction: column; justify-content: space-between; color: #626b77; font: 8px ui-monospace, monospace; }
+    .area { opacity: .17; } .line { fill: none; stroke-width: 1.5; vector-effect: non-scaling-stroke; stroke-linecap: round; stroke-linejoin: round; }
+    .focus-dot { fill: var(--bg); stroke: var(--cyan); stroke-width: 2; filter: drop-shadow(0 0 5px #65d8ed66); }
+    .inspector { padding: 14px; }
+    .health { display: grid; grid-template-columns: 54px 1fr; gap: 13px; align-items: center; padding-bottom: 14px; border-bottom: 1px solid var(--line-soft); }
+    .ring { width: 54px; height: 54px; border-radius: 50%; display: grid; place-items: center; background: conic-gradient(var(--green) 0 93%,#282e36 93%); position: relative; }
+    .ring::after { content:""; position:absolute; inset:5px; border-radius:50%; background:var(--surface); }
+    .ring b { z-index:1; font:700 12px ui-monospace,monospace; }
+    .health h3 { margin: 0 0 3px; font-size: 11px; } .health p { margin:0; color:var(--muted); font-size:9px; line-height:1.5; }
+    .kv { display: grid; gap: 0; margin-top: 9px; }
+    .kv div { display:flex; justify-content:space-between; padding:8px 0; border-bottom:1px solid var(--line-soft); font:9px ui-monospace,monospace; }
+    .kv span { color:var(--muted); } .kv b { font-weight:500; }
+    .hairline-test { margin: 12px 0 0; height: 44px; border: 1px solid #343b45; background: repeating-linear-gradient(90deg,#222831 0 1px,transparent 1px 4px),linear-gradient(90deg,#101318,#252b34); }
+    .lower { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:10px; }
+    .code { font: 9px/1.72 ui-monospace, SFMono-Regular, Menlo, monospace; padding: 14px 16px 17px; white-space: pre; overflow: hidden; color:#c8cdd4; tab-size:2; }
+    .ln { display:inline-block; width:22px; color:#4e5661; user-select:none; }.kw{color:#c792ea}.fn{color:#82aaff}.str{color:#c3e88d}.num{color:#f78c6c}.cm{color:#596370}.prop{color:#65d8ed}
+    table { width:100%; border-collapse:collapse; table-layout:fixed; }
+    th, td { height:34px; padding:0 12px; border-bottom:1px solid var(--line-soft); text-align:left; font-size:9px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    th { color:var(--dim); font-size:8px; letter-spacing:.1em; text-transform:uppercase; font-weight:650; }
+    td.mono { font-family:ui-monospace,monospace; color:#b8c0ca; }.badge{display:inline-flex;padding:3px 6px;border:1px solid #27563a;border-radius:99px;color:var(--green);background:#13231a;font-size:8px}.badge.warn{border-color:#624b20;color:var(--amber);background:#251e12}
+    .drawer { max-height:0; overflow:hidden; background:#14181e; transition:max-height .48s cubic-bezier(.22,.8,.22,1); }
+    .drawer.open { max-height:230px; }
+    .drawer-inner { display:grid; grid-template-columns:1fr 1fr; gap:12px; padding:16px; border-top:1px solid var(--line); }
+    label { display:block; margin-bottom:6px; color:var(--muted); font-size:9px; }
+    input { width:100%; height:34px; padding:0 10px; color:var(--ink); border:1px solid #363e49; border-radius:7px; outline:none; background:#0d1014; font-size:10px; }
+    input:focus { border-color:var(--cyan); box-shadow:0 0 0 3px #65d8ed17; }
+    .drawer-actions { grid-column:1/-1; display:flex; justify-content:flex-end; gap:7px; }
+    .specimens { margin-top: 72px; scroll-margin-top: 80px; }
+    .section-heading { display:flex; justify-content:space-between; align-items:end; padding-bottom:12px; border-bottom:1px solid var(--line); }
+    .section-heading h2 { margin:0; font-size:18px; letter-spacing:-.03em; }.section-heading p{margin:0;color:var(--muted);font-size:9px}
+    .spec-grid { display:grid; grid-template-columns:1.1fr .9fr .9fr; gap:10px; margin-top:10px; }
+    .spec { min-height:190px; padding:17px; border:1px solid var(--line); border-radius:10px; background:#101318; }
+    .spec h3{margin:0 0 16px;font-size:10px}.type-row{display:flex;align-items:baseline;justify-content:space-between;border-bottom:1px solid var(--line-soft);padding:7px 0}.type-row span{color:var(--muted);font-size:8px}.type-row b{font-weight:500}.t8{font-size:8px}.t9{font-size:9px}.t10{font-size:10px}.t11{font-size:11px}.t12{font-size:12px}
+    .chroma { height:130px; border-radius:7px; background:linear-gradient(110deg,#ff4f67 0 14%,#ffbd4a 14% 28%,#78df9a 28% 42%,#55d6ed 42% 56%,#5c82ff 56% 70%,#c776ef 70% 84%,#ff4f67 84%); position:relative; overflow:hidden; }
+    .chroma::after{content:"";position:absolute;inset:0;background:repeating-linear-gradient(0deg,transparent 0 2px,#0003 2px 3px)}
+    .micro-grid { height:130px; border:1px solid #303741; background-color:#f5f3eb; background-image:linear-gradient(#bec4ca 1px,transparent 1px),linear-gradient(90deg,#bec4ca 1px,transparent 1px),linear-gradient(#5c657022 1px,transparent 1px),linear-gradient(90deg,#5c657022 1px,transparent 1px);background-size:20px 20px,20px 20px,4px 4px,4px 4px; }
+    .toast { position:fixed; right:20px; bottom:20px; padding:11px 13px; border:1px solid #3c4550; border-radius:8px; background:#1a2027; box-shadow:0 15px 50px #0008; font-size:9px; transform:translateY(20px); opacity:0; transition:.3s ease; z-index:8; }.toast.show{transform:none;opacity:1}
+    @keyframes pulse { 50% { opacity:.45; transform:scale(.82); } }
+    @media (prefers-reduced-motion: reduce) { *,*::before,*::after { animation-duration:.001ms!important; transition-duration:.001ms!important; } }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside>
+      <div class="wordmark"><span class="logo">SB</span>Signal Bench</div>
+      <div class="nav-label">Observe</div>
+      <nav><button class="active">Live overview</button><button>Traces</button><button>Services</button><button>Deployments</button></nav>
+      <div class="nav-label">Configure</div>
+      <nav><button>Rules</button><button>Destinations</button><button>Team access</button></nav>
+      <div class="capture-card"><span>Capture target</span><strong>1440 × 1050</strong><small>● deterministic</small></div>
+    </aside>
+    <div class="workspace">
+      <header>
+        <div class="crumb">Projects / Atlas / <b>Production</b></div>
+        <div class="header-actions"><span class="live"><i></i>STREAMING</span><button class="quiet" id="scrollSpecimens">Test patterns</button><button class="primary" id="openDrawer">New monitor</button></div>
+      </header>
+      <main>
+        <div class="title-row">
+          <div><div class="kicker">System telemetry / us-east-1</div><h1>Production signals</h1><div class="subtitle">Fine-detail capture target · updated <span id="clock">just now</span></div></div>
+          <div class="range" aria-label="Time range"><button data-range="1h">1H</button><button class="active" data-range="24h">24H</button><button data-range="7d">7D</button></div>
+        </div>
+        <section class="metrics">
+          <article class="metric"><div class="metric-label"><span>Requests</span><span>RPS</span></div><strong>18,492</strong><span class="delta">↑ 8.42%</span></article>
+          <article class="metric"><div class="metric-label"><span>p95 latency</span><span>MS</span></div><strong>124.8</strong><span class="delta down">↑ 12.03 ms</span></article>
+          <article class="metric"><div class="metric-label"><span>Error rate</span><span>%</span></div><strong>0.034</strong><span class="delta">↓ 0.012%</span></article>
+          <article class="metric"><div class="metric-label"><span>Data processed</span><span>GB</span></div><strong>842.6</strong><span class="delta">↑ 5.17%</span></article>
+        </section>
+        <section class="grid">
+          <article class="panel">
+            <div class="panel-head"><div class="panel-title">Request throughput <small>events / second</small></div><div class="legend"><span>Current</span><span>Baseline</span></div></div>
+            <div class="plot"><div class="plot-labels"><span>24k</span><span>18k</span><span>12k</span><span>6k</span><span>0</span></div>
+              <svg viewBox="0 0 720 205" preserveAspectRatio="none" aria-label="Request throughput chart">
+                <defs><linearGradient id="area" x1="0" y1="0" x2="0" y2="1"><stop stop-color="#65d8ed"/><stop offset="1" stop-color="#65d8ed" stop-opacity="0"/></linearGradient></defs>
+                <path class="area" fill="url(#area)" d="M0 174 C58 155 72 158 112 130 S184 118 228 126 S310 83 355 97 S421 75 462 86 S532 44 578 68 S652 38 720 45 L720 205 L0 205Z"/>
+                <path class="line" stroke="#ffc657" opacity=".6" d="M0 150 C80 142 125 151 184 132 S300 129 365 112 S490 109 550 88 S650 91 720 72"/>
+                <path class="line" stroke="#65d8ed" d="M0 174 C58 155 72 158 112 130 S184 118 228 126 S310 83 355 97 S421 75 462 86 S532 44 578 68 S652 38 720 45"/>
+                <circle class="focus-dot" cx="578" cy="68" r="4"/>
+              </svg>
+            </div>
+          </article>
+          <article class="panel">
+            <div class="panel-head"><div class="panel-title">Capture diagnostics</div><span class="badge">NOMINAL</span></div>
+            <div class="inspector"><div class="health"><div class="ring"><b>93</b></div><div><h3>Frame integrity</h3><p>Thin edges and chroma transitions are within tolerance.</p></div></div>
+              <div class="kv"><div><span>Frame pacing</span><b>60.00 fps</b></div><div><span>Source buffer</span><b>BGRA 8-bit</b></div><div><span>Content scale</span><b>1.000×</b></div><div><span>Dropped frames</span><b>0 / 4,812</b></div></div>
+              <div class="hairline-test" title="One-pixel alternating lines"></div>
+            </div>
+          </article>
+        </section>
+        <section class="lower">
+          <article class="panel"><div class="panel-head"><div class="panel-title">Transform pipeline <small>capture.swift</small></div><button class="quiet">Copy</button></div><div class="code"><span class="ln">01</span><span class="kw">let</span> stream = <span class="fn">SCStream</span>(filter: filter,
+<span class="ln">02</span>  configuration: .<span class="prop">best</span>)
+<span class="ln">03</span>
+<span class="ln">04</span><span class="cm">// Preserve native surface detail.</span>
+<span class="ln">05</span><span class="kw">let</span> scale = filter.<span class="prop">pointPixelScale</span>
+<span class="ln">06</span><span class="kw">let</span> frame = <span class="fn">Frame</span>(
+<span class="ln">07</span>  width: <span class="num">1440</span>, height: <span class="num">1050</span>,
+<span class="ln">08</span>  codec: <span class="str">"hevc"</span>
+<span class="ln">09</span>)</div></article>
+          <article class="panel"><div class="panel-head"><div class="panel-title">Recent spans</div><button class="quiet" id="refreshRows">Refresh</button></div>
+            <table><thead><tr><th style="width:34%">Operation</th><th>Duration</th><th>Region</th><th>Status</th></tr></thead><tbody id="rows">
+              <tr><td class="mono">POST /v1/compose</td><td class="mono">184.21 ms</td><td>iad1</td><td><span class="badge">OK</span></td></tr>
+              <tr><td class="mono">GET /timeline</td><td class="mono">42.08 ms</td><td>ewr1</td><td><span class="badge">OK</span></td></tr>
+              <tr><td class="mono">decode.frame</td><td class="mono">8.67 ms</td><td>local</td><td><span class="badge warn">WARN</span></td></tr>
+              <tr><td class="mono">metal.render</td><td class="mono">3.14 ms</td><td>gpu0</td><td><span class="badge">OK</span></td></tr>
+              <tr><td class="mono">writer.append</td><td class="mono">1.92 ms</td><td>local</td><td><span class="badge">OK</span></td></tr>
+            </tbody></table>
+          </article>
+        </section>
+        <section class="panel drawer" id="drawer"><div class="drawer-inner"><div><label for="monitorName">Monitor name</label><input id="monitorName" placeholder="e.g. Checkout latency" /></div><div><label for="threshold">Alert threshold</label><input id="threshold" value="p95 > 240ms" /></div><div class="drawer-actions"><button class="quiet" id="cancelDrawer">Cancel</button><button class="primary" id="saveMonitor">Create monitor</button></div></div></section>
+
+        <section class="specimens" id="specimens"><div class="section-heading"><div><div class="kicker">Optical stress tests</div><h2>Fine-detail specimens</h2></div><p>Use at 100% playback scale</p></div>
+          <div class="spec-grid">
+            <article class="spec"><h3>Native text rasterization</h3><div class="type-row"><span>8 px / regular</span><b class="t8">Sphinx of black quartz, judge my vow. 0123456789</b></div><div class="type-row"><span>9 px / medium</span><b class="t9">Sphinx of black quartz, judge my vow. 0123456789</b></div><div class="type-row"><span>10 px / regular</span><b class="t10">Sphinx of black quartz, judge my vow. 0123456789</b></div><div class="type-row"><span>11 px / semibold</span><b class="t11">Sphinx of black quartz, judge my vow. 0123456789</b></div><div class="type-row"><span>12 px / regular</span><b class="t12">Sphinx of black quartz, judge my vow. 0123456789</b></div></article>
+            <article class="spec"><h3>Chroma boundaries / scan lines</h3><div class="chroma"></div></article>
+            <article class="spec"><h3>1 px / 4 px geometry</h3><div class="micro-grid"></div></article>
+          </div>
+        </section>
+      </main>
+    </div>
+  </div>
+  <div class="toast" id="toast">Monitor created · capture event emitted</div>
+  <script>
+    const drawer = document.querySelector('#drawer');
+    const monitorName = document.querySelector('#monitorName');
+    const toast = document.querySelector('#toast');
+    document.querySelector('#openDrawer').addEventListener('click', () => {
+      drawer.classList.add('open');
+      setTimeout(() => monitorName.focus(), 220);
+    });
+    document.querySelector('#cancelDrawer').addEventListener('click', () => drawer.classList.remove('open'));
+    document.querySelector('#saveMonitor').addEventListener('click', () => {
+      drawer.classList.remove('open'); toast.classList.add('show');
+      setTimeout(() => toast.classList.remove('show'), 1800);
+    });
+    document.querySelector('#scrollSpecimens').addEventListener('click', () => document.querySelector('#specimens').scrollIntoView({behavior:'smooth'}));
+    document.querySelectorAll('.range button').forEach(button => button.addEventListener('click', () => {
+      document.querySelectorAll('.range button').forEach(item => item.classList.remove('active'));
+      button.classList.add('active');
+      document.querySelector('.plot').animate([{filter:'brightness(1)'},{filter:'brightness(1.22)'},{filter:'brightness(1)'}],{duration:520,easing:'ease-out'});
+    }));
+    document.querySelector('#refreshRows').addEventListener('click', () => {
+      const rows = document.querySelector('#rows');
+      rows.animate([{opacity:.35,transform:'translateY(3px)'},{opacity:1,transform:'none'}],{duration:420,easing:'ease-out'});
+      document.querySelector('#clock').textContent = '0 seconds ago';
+    });
+  </script>
+</body>
+</html>
