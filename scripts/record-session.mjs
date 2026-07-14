@@ -77,6 +77,7 @@ let captureWidth;
 let captureHeight;
 let captureScale;
 let captureCodec;
+let captureMode;
 let captureReady = false;
 let stopRequested = false;
 const expectedParentPID = Number(process.env.AGENTRECORDER_PARENT_PID);
@@ -96,8 +97,10 @@ readline.createInterface({ input: child.stdout, crlfDelay: Infinity }).on("line"
     captureHeight = size ? Number(size[2]) : undefined;
     const scale = line.match(/scale=([\d.]+)/);
     const codec = line.match(/codec=([^\s]+)/);
+    const mode = line.match(/mode=([^\s]+)/);
     captureScale = scale ? Number(scale[1]) : undefined;
     captureCodec = codec?.[1];
+    captureMode = mode?.[1];
   }
   if (line.startsWith("CAPTURE_FRAME") && !captureStartedAt) {
     captureStartedAt = line.match(/wallTime=([^\s]+)/)?.[1] ?? new Date().toISOString();
@@ -215,7 +218,8 @@ const timeline = {
     width: captureWidth,
     height: captureHeight,
     pointPixelScale: captureScale,
-    codec: captureCodec
+    codec: captureCodec,
+    mode: captureMode
   },
   introspection: {
     adapter: "codex-rollout-jsonl",

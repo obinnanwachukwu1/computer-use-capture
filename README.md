@@ -6,7 +6,7 @@ This macOS-only proof records a declared application window with ScreenCaptureKi
 
 The agent only starts and stops recording. The recorder does not wrap, proxy, replace, or patch `sky`. Normal calls such as `sky.click({ app, x, y })` continue through Computer Use directly.
 
-Capture defaults to an application-only ScreenCaptureKit filter cropped to the selected app window. It excludes overlapping windows from other applications while retaining target-app windows and popovers inside the crop. Set `AGENTRECORDER_CAPTURE_MODE=window` for strict single-window capture; macOS intentionally omits child and popup windows in that mode.
+Safari defaults to an application-only ScreenCaptureKit filter cropped to its selected window so Safari-owned popovers remain visible. Other macOS apps default to strict single-window capture, which prevents hidden or off-screen app-owned modal windows from corrupting a document recording. `AGENTRECORDER_CAPTURE_MODE=application|window` explicitly overrides this policy; strict window mode intentionally omits child and popup windows.
 
 The current introspection adapter reads two Codex implementation details:
 
