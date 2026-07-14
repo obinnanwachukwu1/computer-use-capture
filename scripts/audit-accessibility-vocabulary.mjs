@@ -7,6 +7,12 @@ import { parseAccessibilityElements } from "../lib/codex-events.mjs";
 const root = path.resolve(process.argv[2] ?? path.join(process.env.HOME, ".codex", "sessions"));
 const sdk = macOSSDKVocabulary();
 const roleCounts = new Map();
+const qualifierCounts = new Map();
+const rolePrefixCollisions = new Map();
+const STATE_QUALIFIERS = new Set([
+  "anonymous", "boolean", "collapsed", "disabled", "expanded", "float",
+  "integer", "selectable", "selected", "settable", "string"
+]);
 const unknownPrefixes = new Map();
 const matchedFiles = new Set();
 let snapshots = 0;
@@ -36,6 +42,17 @@ for await (const matchedLine of lines) {
     for (const parsed of parseAccessibilityElements(text).values()) {
       elements += 1;
       roleCounts.set(parsed.role, (roleCounts.get(parsed.role) ?? 0) + 1);
+      for (const qualifier of parsed.qualifiers ?? []) {
+        qualifierCounts.set(qualifier, (qualifierCounts.get(qualifier) ?? 0) + 1);
+      }
+      const qualifiedMatch = parsed.rawDescriptor.match(/^(.+?)\s+\(([^)]+)\)(?:\s|$)/);
+      const qualifiedPrefix = qualifiedMatch?.[1]?.toLowerCase();
+      const stateQualifier = qualifiedMatch?.[2]?.split(",")
+        .map(value => value.trim()).filter(Boolean)
+        .every(value => STATE_QUALIFIERS.has(value));
+      if (stateQualifier && parsed.roleKnown && qualifiedPrefix?.startsWith(`${parsed.role} `)) {
+        rolePrefixCollisions.set(qualifiedPrefix, (rolePrefixCollisions.get(qualifiedPrefix) ?? 0) + 1);
+      }
       if (!parsed.roleKnown) {
         const prefix = parsed.rawDescriptor.split(/\s+/).slice(0, 4).join(" ");
         unknownPrefixes.set(prefix, (unknownPrefixes.get(prefix) ?? 0) + 1);
@@ -53,6 +70,8 @@ process.stdout.write(`${JSON.stringify({
   snapshots,
   elements,
   roles: Object.fromEntries(sortCounts(roleCounts)),
+  qualifiers: Object.fromEntries(sortCounts(qualifierCounts)),
+  rolePrefixCollisions: Object.fromEntries(sortCounts(rolePrefixCollisions)),
   unknownPrefixes: Object.fromEntries(sortCounts(unknownPrefixes).slice(0, 100))
 }, null, 2)}\n`);
 

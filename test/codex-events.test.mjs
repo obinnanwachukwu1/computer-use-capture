@@ -134,6 +134,18 @@ The following is a diff from the previous accessibility tree.
   `);
   assert.equal(signature.get(44).label, "function bfs(graph, start)");
   assert.equal(signature.get(44).qualifiers, undefined);
+
+  const nativeText = parseAccessibilityElements(`
+    45 text entry area (settable, string) First Text View
+    46 text entry area Description: Formula Bar. A,1, ID: XLFormulaEditor
+    47 list box (settable, string) Selected account
+  `);
+  assert.equal(nativeText.get(45).role, "text entry area");
+  assert.equal(nativeText.get(45).label, "First Text View");
+  assert.deepEqual(nativeText.get(45).qualifiers, ["settable", "string"]);
+  assert.equal(nativeText.get(46).role, "text entry area");
+  assert.equal(nativeText.get(46).description, "Formula Bar. A,1");
+  assert.equal(nativeText.get(47).role, "list box");
 });
 
 test("resolves native geometry by identity, post-action focus, and structural anchors", () => {
@@ -229,6 +241,72 @@ test("resolves native geometry by identity, post-action focus, and structural an
   // The match is valid even though Computer Use serialized the subrole while
   // native AX reports AXWindow as the primary role.
   assert.equal(subroleIdentity.targetResolution.provenance, "ax-identity");
+
+  const localizedRoleIdentity = resolveAccessibilityTarget({
+    event: {
+      ...base,
+      accessibilityTarget: {
+        role: "text entry area", label: "First Text View", roleKnown: true
+      }
+    },
+    observations: [{
+      observedAt: "2026-07-13T14:09:55.600Z", windowBounds,
+      elements: [{
+        index: 4, role: "AXTextArea", roleDescription: "text entry area",
+        identifier: "First Text View",
+        // Native editors commonly fill nearly the entire document window.
+        bounds: { x: 120, y: 100, width: 900, height: 700 }
+      }]
+    }],
+    captureStartedAt: "2026-07-13T14:00:00.000Z", captureWidth: 1000, captureHeight: 800
+  });
+  assert.equal(localizedRoleIdentity.targetResolution.provenance, "ax-identity");
+  assert.equal(localizedRoleIdentity.semanticTarget.nativeElementIndex, 4);
+
+  const visibleIdentity = resolveAccessibilityTarget({
+    event: { ...base, accessibilityTarget: { role: "button", label: "Create monitor" } },
+    observations: [
+      {
+        observedAt: "2026-07-13T14:09:55.450Z", windowBounds,
+        elements: [{
+          index: 70, role: "AXButton", title: "Create monitor",
+          bounds: { x: 1099, y: 849, width: 1, height: 1 }
+        }]
+      },
+      {
+        observedAt: "2026-07-13T14:09:54.900Z", windowBounds,
+        elements: [{
+          index: 70, role: "AXButton", title: "Create monitor",
+          bounds: { x: 900, y: 650, width: 120, height: 36 }
+        }]
+      }
+    ],
+    captureStartedAt: "2026-07-13T14:00:00.000Z", captureWidth: 1000, captureHeight: 800
+  });
+  assert.equal(visibleIdentity.semanticTarget.bounds.heightNorm, 0.045);
+
+  const actionLocalFocus = resolveAccessibilityTarget({
+    event: {
+      ...base,
+      action: "type_text",
+      args: { app: "Chrome" },
+      timestamp: "2026-07-13T14:09:55.500Z"
+    },
+    observations: [
+      {
+        observedAt: "2026-07-13T14:09:55.650Z", windowBounds, focused: true,
+        role: "AXTextField", title: "Monitor name",
+        bounds: { x: 300, y: 500, width: 300, height: 36 }, elements: []
+      },
+      {
+        observedAt: "2026-07-13T14:09:56.250Z", windowBounds, focused: true,
+        role: "AXButton", title: "Create monitor",
+        bounds: { x: 800, y: 650, width: 120, height: 36 }, elements: []
+      }
+    ],
+    captureStartedAt: "2026-07-13T14:00:00.000Z", captureWidth: 1000, captureHeight: 800
+  });
+  assert.equal(actionLocalFocus.semanticTarget.title, "Monitor name");
 
   const focused = resolveAccessibilityTarget({
     event: { ...base, accessibilityTarget: { role: "button", label: "Play trace" } },

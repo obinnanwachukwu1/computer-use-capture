@@ -4,7 +4,9 @@ This recorder separates finite accessibility structure from unbounded app conten
 
 The installed macOS SDK exposes 58 AX roles and 37 AX subroles in `AXRoleConstants.h`. AppKit exposes 61 role names and 33 subrole names, including web-facing forms such as link, web area, page, and list marker. These role and subrole identifiers are finite for a given SDK. Titles, descriptions, help text, values, identifiers, URLs, and custom role descriptions are supplied by applications and websites and are not finite vocabularies.
 
-The checked-in Computer Use parser combines the SDK role sets with serializer-specific web phrases. It uses longest-first role parsing, accepts raw canonical forms such as `AXListMarker`, retains qualifiers such as `selected`, `disabled`, and `settable`, and parses Description, Value, Help, ID, URL, and Secondary Actions independently. Every element also retains its complete `rawDescriptor`. Unknown roles remain matchable by identity fields and are never reduced to a guessed first word.
+The checked-in Computer Use parser combines the SDK role sets, localized native role descriptions such as `text entry area`, and serializer-specific web phrases. It uses longest-first role parsing, accepts raw canonical forms such as `AXListMarker`, retains qualifiers such as `selected`, `disabled`, and `settable`, and parses Description, Value, Help, ID, URL, and Secondary Actions independently. Every element also retains its complete `rawDescriptor`. Unknown roles remain matchable by identity fields instead of being assigned a guessed native role.
+
+The audit also reports qualifier counts and `rolePrefixCollisions`: descriptors where a recognized short role is followed by more words before a serializer state qualifier. This catches silent vocabulary gaps such as parsing `text entry area (settable, string)` as the shorter `text` role.
 
 On July 13, 2026, `npm run audit:accessibility` scanned the local Codex session corpus and found:
 
