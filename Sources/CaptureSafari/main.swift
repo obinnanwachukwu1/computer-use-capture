@@ -120,7 +120,9 @@ final class MovieWriter: NSObject, SCStreamOutput, @unchecked Sendable {
     private let input: AVAssetWriterInput
     private let lock = NSLock()
     private var firstPresentationTime: CMTime?
+    private var lastPresentationTime: CMTime?
     private var frameCount = 0
+    private var droppedNonMonotonicFrameCount = 0
     private var appendError: Error?
 
     init(outputURL: URL, width: Int, height: Int, codec: CaptureCodec) throws {
@@ -165,6 +167,17 @@ final class MovieWriter: NSObject, SCStreamOutput, @unchecked Sendable {
         guard input.isReadyForMoreMediaData else { return }
 
         let presentationTime = sampleBuffer.presentationTimeStamp
+        guard presentationTime.isValid, presentationTime.isNumeric else { return }
+        if let lastPresentationTime,
+           CMTimeCompare(presentationTime, lastPresentationTime) <= 0
+        {
+            // ScreenCaptureKit may emit multiple complete window frames with the
+            // same timestamp while native-app child windows and popovers change.
+            // AVAssetWriter can accept those samples but produce a stream with
+            // duplicate DTS values that AVAssetReader later refuses to decode.
+            droppedNonMonotonicFrameCount += 1
+            return
+        }
         var firstFrameMessage: String?
         if firstPresentationTime == nil {
             firstPresentationTime = presentationTime
@@ -187,6 +200,7 @@ final class MovieWriter: NSObject, SCStreamOutput, @unchecked Sendable {
         }
 
         if input.append(sampleBuffer) {
+            lastPresentationTime = presentationTime
             frameCount += 1
             if let firstFrameMessage { writeStandardOutput(firstFrameMessage) }
         } else {
@@ -194,10 +208,10 @@ final class MovieWriter: NSObject, SCStreamOutput, @unchecked Sendable {
         }
     }
 
-    func finish() async throws -> Int {
-        let result: (count: Int, error: Error?) = lock.withLock {
+    func finish() async throws -> (frameCount: Int, droppedNonMonotonicFrameCount: Int) {
+        let result: (count: Int, dropped: Int, error: Error?) = lock.withLock {
             input.markAsFinished()
-            return (frameCount, appendError)
+            return (frameCount, droppedNonMonotonicFrameCount, appendError)
         }
         if let error = result.error {
             writer.cancelWriting()
@@ -212,7 +226,7 @@ final class MovieWriter: NSObject, SCStreamOutput, @unchecked Sendable {
         if let error = writer.error {
             throw error
         }
-        return result.count
+        return (result.count, result.dropped)
     }
 
     private func isCompleteFrame(_ sampleBuffer: CMSampleBuffer) -> Bool {
@@ -313,9 +327,11 @@ struct CaptureApp {
             )
             let stopReason = await waitForStopOrTimeout(seconds: options.duration)
             try await stream.stopCapture()
-            let frameCount = try await movieWriter.finish()
+            let result = try await movieWriter.finish()
             writeStandardOutput(
-                "CAPTURE_COMPLETE reason=\(stopReason.rawValue) frames=\(frameCount) output=\(options.outputURL.path)\n"
+                "CAPTURE_COMPLETE reason=\(stopReason.rawValue) frames=\(result.frameCount) " +
+                    "droppedNonMonotonicFrames=\(result.droppedNonMonotonicFrameCount) " +
+                    "output=\(options.outputURL.path)\n"
             )
         } catch {
             FileHandle.standardError.write(Data("capture-app: \(error.localizedDescription)\n".utf8))

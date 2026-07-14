@@ -68,9 +68,10 @@ enum MotionAnalyzer {
         var responseFrames: [Int: [ResponseFrame]] = [:]
         var nextProgressTime = 10.0
 
-        while let sample = output.copyNextSampleBuffer() {
+        while autoreleasepool(invoking: {
+            guard let sample = output.copyNextSampleBuffer() else { return false }
             let time = CMSampleBufferGetPresentationTimeStamp(sample).seconds
-            guard let buffer = CMSampleBufferGetImageBuffer(sample) else { continue }
+            guard let buffer = CMSampleBufferGetImageBuffer(sample) else { return true }
             let source = CIImage(cvPixelBuffer: buffer)
 
             for probe in timingProbes where
@@ -92,7 +93,7 @@ enum MotionAnalyzer {
                 localPrevious[probe.actionID] = pixels
             }
 
-            if time + 0.0001 < nextSampleTime { continue }
+            if time + 0.0001 < nextSampleTime { return true }
             nextSampleTime = time + sampleInterval
             let scaled = source.transformed(by: CGAffineTransform(
                 scaleX: CGFloat(analysisWidth) / source.extent.width,
@@ -145,7 +146,8 @@ enum MotionAnalyzer {
                 if !components.isEmpty { motionTimes.append(time) }
             }
             previous = pixels
-        }
+            return true
+        }) {}
         guard reader.status == .completed else {
             throw Failure(reader.error?.localizedDescription ?? "motion analysis failed")
         }
