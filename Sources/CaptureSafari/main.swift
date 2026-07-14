@@ -8,6 +8,7 @@ import ScreenCaptureKit
 struct CaptureOptions {
     let outputURL: URL
     let duration: TimeInterval
+    let bundleIdentifier: String
     let framesPerSecond: Int32
     let mode: CaptureMode
     let codec: CaptureCodec
@@ -15,13 +16,17 @@ struct CaptureOptions {
     static func parse() throws -> CaptureOptions {
         let arguments = CommandLine.arguments
         guard arguments.count >= 2 else {
-            throw CaptureError.usage("Usage: capture-safari <output.mov> [duration-seconds]")
+            throw CaptureError.usage("Usage: capture-app <output.mov> [duration-seconds] [bundle-id]")
         }
 
         let outputURL = URL(fileURLWithPath: arguments[1]).standardizedFileURL
         let duration = arguments.count >= 3 ? TimeInterval(arguments[2]) ?? 6 : 6
         guard duration > 0 else {
             throw CaptureError.usage("Duration must be greater than zero")
+        }
+        let bundleIdentifier = arguments.count >= 4 ? arguments[3] : "com.apple.Safari"
+        guard bundleIdentifier.contains(".") else {
+            throw CaptureError.usage("The target app must be a macOS bundle identifier")
         }
 
         let modeName = ProcessInfo.processInfo.environment["AGENTRECORDER_CAPTURE_MODE"] ?? "application"
@@ -40,6 +45,7 @@ struct CaptureOptions {
         return CaptureOptions(
             outputURL: outputURL,
             duration: duration,
+            bundleIdentifier: bundleIdentifier,
             framesPerSecond: 60,
             mode: mode,
             codec: codec
@@ -90,8 +96,8 @@ enum CaptureCodec: String {
 
 enum CaptureError: LocalizedError {
     case usage(String)
-    case safariWindowNotFound
-    case safariWindowAmbiguous(Int)
+    case targetWindowNotFound(String)
+    case targetWindowAmbiguous(String, Int)
     case writerSetup(String)
     case noFrames
 
@@ -99,10 +105,10 @@ enum CaptureError: LocalizedError {
         switch self {
         case .usage(let message), .writerSetup(let message):
             return message
-        case .safariWindowNotFound:
-            return "No onscreen Safari window was found"
-        case .safariWindowAmbiguous(let count):
-            return "Expected one eligible onscreen Safari window, found \(count)"
+        case .targetWindowNotFound(let bundleIdentifier):
+            return "No eligible onscreen window was found for \(bundleIdentifier)"
+        case .targetWindowAmbiguous(let bundleIdentifier, let count):
+            return "Expected one eligible onscreen window for \(bundleIdentifier), found \(count)"
         case .noFrames:
             return "ScreenCaptureKit did not deliver any complete frames"
         }
@@ -225,7 +231,7 @@ final class MovieWriter: NSObject, SCStreamOutput, @unchecked Sendable {
 }
 
 @main
-struct CaptureSafari {
+struct CaptureApp {
     static func main() async {
         do {
             _ = NSApplication.shared
@@ -234,23 +240,23 @@ struct CaptureSafari {
                 false,
                 onScreenWindowsOnly: true
             )
-            let safariWindows = content.windows
-                .filter({ $0.owningApplication?.bundleIdentifier == "com.apple.Safari" })
+            let targetWindows = content.windows
+                .filter({ $0.owningApplication?.bundleIdentifier == options.bundleIdentifier })
                 .filter({ $0.frame.width >= 320 && $0.frame.height >= 240 })
-            guard !safariWindows.isEmpty else {
-                throw CaptureError.safariWindowNotFound
+            guard !targetWindows.isEmpty else {
+                throw CaptureError.targetWindowNotFound(options.bundleIdentifier)
             }
-            guard safariWindows.count == 1 else {
-                throw CaptureError.safariWindowAmbiguous(safariWindows.count)
+            guard targetWindows.count == 1 else {
+                throw CaptureError.targetWindowAmbiguous(options.bundleIdentifier, targetWindows.count)
             }
-            let safariWindow = safariWindows[0]
-            guard let safariApplication = safariWindow.owningApplication else {
-                throw CaptureError.writerSetup("Safari window has no owning application")
+            let targetWindow = targetWindows[0]
+            guard let targetApplication = targetWindow.owningApplication else {
+                throw CaptureError.writerSetup("Target window has no owning application")
             }
 
-            let windowCenter = CGPoint(x: safariWindow.frame.midX, y: safariWindow.frame.midY)
+            let windowCenter = CGPoint(x: targetWindow.frame.midX, y: targetWindow.frame.midY)
             guard let display = content.displays.first(where: { $0.frame.contains(windowCenter) }) else {
-                throw CaptureError.writerSetup("Could not resolve the display containing Safari")
+                throw CaptureError.writerSetup("Could not resolve the display containing the target window")
             }
 
             let filter: SCContentFilter
@@ -258,15 +264,15 @@ struct CaptureSafari {
             case .application:
                 filter = SCContentFilter(
                     display: display,
-                    including: [safariApplication],
+                    including: [targetApplication],
                     exceptingWindows: []
                 )
             case .window:
-                filter = SCContentFilter(desktopIndependentWindow: safariWindow)
+                filter = SCContentFilter(desktopIndependentWindow: targetWindow)
             }
             let pointPixelScale = CGFloat(filter.pointPixelScale)
-            let width = max(2, Int(ceil(safariWindow.frame.width * pointPixelScale))) & ~1
-            let height = max(2, Int(ceil(safariWindow.frame.height * pointPixelScale))) & ~1
+            let width = max(2, Int(ceil(targetWindow.frame.width * pointPixelScale))) & ~1
+            let height = max(2, Int(ceil(targetWindow.frame.height * pointPixelScale))) & ~1
             let configuration = SCStreamConfiguration()
             configuration.width = width
             configuration.height = height
@@ -283,10 +289,10 @@ struct CaptureSafari {
             configuration.preservesAspectRatio = true
             if options.mode == .application {
                 configuration.sourceRect = CGRect(
-                    x: safariWindow.frame.minX - display.frame.minX,
-                    y: safariWindow.frame.minY - display.frame.minY,
-                    width: safariWindow.frame.width,
-                    height: safariWindow.frame.height
+                    x: targetWindow.frame.minX - display.frame.minX,
+                    y: targetWindow.frame.minY - display.frame.minY,
+                    width: targetWindow.frame.width,
+                    height: targetWindow.frame.height
                 )
             }
             let movieWriter = try MovieWriter(
@@ -301,7 +307,7 @@ struct CaptureSafari {
 
             try await stream.startCapture()
             writeStandardOutput(
-                "CAPTURE_READY window=\(safariWindow.title ?? "Untitled") " +
+                "CAPTURE_READY app=\(options.bundleIdentifier) window=\(targetWindow.title ?? "Untitled") " +
                     "size=\(width)x\(height) scale=\(pointPixelScale) " +
                     "mode=\(options.mode.rawValue) codec=\(options.codec.rawValue)\n"
             )
@@ -312,7 +318,7 @@ struct CaptureSafari {
                 "CAPTURE_COMPLETE reason=\(stopReason.rawValue) frames=\(frameCount) output=\(options.outputURL.path)\n"
             )
         } catch {
-            FileHandle.standardError.write(Data("capture-safari: \(error.localizedDescription)\n".utf8))
+            FileHandle.standardError.write(Data("capture-app: \(error.localizedDescription)\n".utf8))
             Foundation.exit(1)
         }
     }

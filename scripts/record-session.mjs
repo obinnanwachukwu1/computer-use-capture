@@ -13,6 +13,8 @@ import { redactAccessibilityObservation, redactEventForPersistence } from "../li
 const repoRoot = path.resolve(import.meta.dirname, "..");
 const outputBase = path.resolve(process.argv[2] ?? "artifacts/recording");
 const maximumDuration = Number(process.argv[3] ?? 1800);
+const targetApp = process.argv[4] ?? "com.apple.Safari";
+const targetAppName = targetApp.split(".").at(-1);
 if (!Number.isFinite(maximumDuration) || maximumDuration <= 0) {
   throw new Error("Maximum duration must be a positive number of seconds");
 }
@@ -43,7 +45,7 @@ accessibilityStream.on("error", error => {
 });
 const semanticObserver = spawn(
   path.join(repoRoot, ".build/release/inspect-focused-element"),
-  ["com.apple.Safari", "--watch"],
+  [targetApp, "--watch"],
   { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"] }
 );
 readline.createInterface({ input: semanticObserver.stdout, crlfDelay: Infinity }).on("line", line => {
@@ -64,8 +66,8 @@ semanticObserver.once("error", error => {
   requestStop();
 });
 const child = spawn(
-  path.join(repoRoot, ".build/release/capture-safari"),
-  [videoPath, String(maximumDuration)],
+  path.join(repoRoot, ".build/release/capture-app"),
+  [videoPath, String(maximumDuration), targetApp],
   { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"] }
 );
 
@@ -130,7 +132,7 @@ const exitCode = await new Promise((resolve, reject) => {
 await stopSemanticObserver();
 await closeAccessibilityStream();
 if (exitCode !== 0) {
-  throw new Error(`capture-safari exited with code ${exitCode}`);
+  throw new Error(`capture-app exited with code ${exitCode}`);
 }
 if (!captureReady || !captureStartedAt) throw new Error("Capture process never committed a first frame");
 captureEndedAt ??= new Date().toISOString();
@@ -172,7 +174,7 @@ const reconstruction = {
   settleWaitMs: Math.max(0, ...settleResults.map(result => result.waitedMs))
 };
 const screenshotSpaces = await findScreenshotCoordinateSpaces({
-  appName: "Safari",
+  appName: targetAppName,
   referenceTimes: extracted.events.map(event => Date.parse(event.timestamp))
 });
 const mappedEvents = extracted.events
@@ -206,6 +208,7 @@ const warnings = [
 const timeline = {
   version: 3,
   capture: {
+    app: targetApp,
     video: videoPath,
     startedAt: captureStartedAt,
     endedAt: captureEndedAt,

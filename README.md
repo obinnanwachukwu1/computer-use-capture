@@ -1,12 +1,12 @@
 # Agent Recorder
 
-This macOS-only proof records a Safari window with ScreenCaptureKit while Codex uses the original Computer Use tool unchanged. It reconstructs Computer Use actions afterward from the current Codex task's read-only event stream, maps screenshot coordinates into capture coordinates, and renders a synthetic cursor plus spring-driven camera motion with a native Metal/Core Image compositor.
+This macOS-only proof records a declared application window with ScreenCaptureKit while Codex uses the original Computer Use tool unchanged. It reconstructs Computer Use actions afterward from the current Codex task's read-only event stream, maps screenshot coordinates into capture coordinates, and renders a synthetic cursor plus spring-driven camera motion with a native Metal/Core Image compositor.
 
 ## Boundary
 
 The agent only starts and stops recording. The recorder does not wrap, proxy, replace, or patch `sky`. Normal calls such as `sky.click({ app, x, y })` continue through Computer Use directly.
 
-Capture defaults to an application-only ScreenCaptureKit filter cropped to the selected Safari window. It excludes unrelated windows that overlap Safari while retaining Safari-owned windows and popovers inside the crop. Set `AGENTRECORDER_CAPTURE_MODE=window` for strict single-window capture; macOS intentionally omits child and popup windows in that mode.
+Capture defaults to an application-only ScreenCaptureKit filter cropped to the selected app window. It excludes overlapping windows from other applications while retaining target-app windows and popovers inside the crop. Set `AGENTRECORDER_CAPTURE_MODE=window` for strict single-window capture; macOS intentionally omits child and popup windows in that mode.
 
 The current introspection adapter reads two Codex implementation details:
 
@@ -57,7 +57,7 @@ npm run mcp
 
 The intended agent flow is deliberately small:
 
-1. `recorder_capabilities` builds/locates the native preflight helper, checks Screen Recording and Accessibility, requires exactly one eligible Safari window, and probes the observed Codex/screenshot adapter shapes.
+1. `recorder_capabilities` builds/locates the native preflight helper, checks Screen Recording and Accessibility, reports visible application targets, and probes the observed Codex adapter shape. `recorder_start` requires exactly one eligible window for its declared bundle identifier and checks that app's screenshot evidence.
 2. `recorder_start` returns only after the first video frame is committed. The agent then uses Computer Use normally; the recorder receives no per-action calls.
 3. `recorder_stop` finalizes capture, waits for the Codex event log to settle, reconstructs factual actions, and normally enqueues the default render.
 4. `recorder_get` polls the render. `recorder_edit` applies high-level intents and enqueues another render; `recorder_cancel` cancels a render; `recorder_discard` permanently removes the recording and every artifact.
@@ -139,11 +139,11 @@ Use `--keep-waiting` (or `AGENTRECORDER_REDUCE_WAITING=0`) when a faithful, uncu
 
 ## Current limitations
 
-- Safari is the only capture target and screenshot adapter name currently wired in.
+- A target must have exactly one eligible on-screen window at recording start. The bundle identifier is carried through preflight, ScreenCaptureKit, Accessibility observation, screenshot-coordinate lookup, and timeline persistence.
 - Video time is anchored to the first committed ScreenCaptureKit frame. Action timestamps are still estimated within each Computer Use tool-call duration because the event stream does not expose the exact injection instant; target-local visual timing refines clicks when evidence exists.
 - Coordinate clicks and drags use their logged coordinates. Element-index actions use passive role/title/value matching against recorder-side AX snapshots; ambiguous or missing matches fail open without inventing a cursor target.
 - A moved or resized target window invalidates direct coordinates for the affected span rather than silently remapping them. The v1 capture does not follow the window mid-recording.
-- System-owned foreground surfaces such as open/save or permission panels are not present in Safari-only capture. The recorder marks those spans and suppresses authoritative pointer reconstruction instead of depicting a click on inert Safari content.
+- System-owned foreground surfaces such as open/save or permission panels are not present in application-only capture. The recorder marks those spans and suppresses authoritative pointer reconstruction instead of depicting a click on inert target-app content.
 - Camera, cursor, and neighboring source-video frames are temporally sampled together. Optical-flow interpolation is not yet used, so extremely fast source-only animation can still reveal ordinary cross-frame blending.
 - The task JSONL and screenshot cache are private Codex implementation seams. Runtime probes, fingerprints, ambiguity handling, and fail-closed coordinate validation isolate their failure, but compatibility still needs continuous corpus coverage as Codex evolves.
 - Capture and composition are video-only. Audio must not be added until waiting cuts and speed changes have a track-aware keep/stretch policy.
