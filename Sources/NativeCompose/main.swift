@@ -616,8 +616,11 @@ private func buildCameraMoves(composition: NativeComposition, base: CameraState)
                 // Computer Use may scroll an offscreen semantic target into
                 // view before activation. Establish the relocated viewport
                 // first, show the factual click in that wide context, and
-                // only then focus the new region.
-                let focusStart = max(delayedEnd, actionOutput + 0.08 + action.relocationSettleDelay)
+                // only then focus the new region. Pointer travel is now
+                // causally fenced behind relocation settlement, so the AX
+                // post-action snapshot delay must not be applied a second
+                // time here; doing so would miss the action's visual response.
+                let focusStart = max(delayedEnd, actionOutput + 0.08)
                 appendMove(
                     label: "action-\(action.id)-relocation-focus",
                     start: focusStart,

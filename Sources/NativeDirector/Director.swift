@@ -428,8 +428,8 @@ public struct NativeComposition: Sendable {
         let desiredScale = stableWideResponse?.scale
             ?? Self.actionScale(action, size: size, recipe: recipe)
         let isWideResponse = action.attention?.behavior == .wideResponse
-        let horizontalCoverage: CGFloat = isWideResponse ? 0.94 : 0.85
-        let verticalCoverage: CGFloat = isWideResponse ? 0.86 : 0.78
+        let horizontalCoverage: CGFloat = stableWideResponse != nil ? 0.98 : isWideResponse ? 0.94 : 0.85
+        let verticalCoverage: CGFloat = stableWideResponse != nil ? 0.90 : isWideResponse ? 0.86 : 0.78
         let fitX = framingBounds.width > 0 ? size.width * horizontalCoverage / framingBounds.width : .greatestFiniteMagnitude
         let fitY = framingBounds.height > 0 ? size.height * verticalCoverage / framingBounds.height : .greatestFiniteMagnitude
         let scale = max(1, min(desiredScale, min(fitX, fitY)))
@@ -475,7 +475,19 @@ public struct NativeComposition: Sendable {
             bounds = bounds.union(candidate.bounds)
         }
         guard upper > lower else { return nil }
-        return (bounds, shot.scale)
+        // A persistent subject can fill more of the canvas than a transient
+        // response because the following action confirms that the same region
+        // remains relevant. Preserve the global zoom-strength control and any
+        // reduced per-action emphasis while using the available frame.
+        let rawTightScale = clamp(
+            min(size.width * 0.98 / max(1, bounds.width), size.height * 0.90 / max(1, bounds.height)),
+            1.12, 1.48
+        )
+        let minimumEmphasis = shot.actions[lower...upper].map {
+            $0.emphasis == "reduced" ? 0.6 : $0.emphasis == "strong" ? 1.25 : 1
+        }.min() ?? 1
+        let tightScale = 1 + (rawTightScale - 1) * CGFloat(recipe.zoomStrength * minimumEmphasis)
+        return (bounds, max(shot.scale, tightScale))
     }
 
     public func pointerTrip(forActionID actionID: Int) -> PointerTrip? {

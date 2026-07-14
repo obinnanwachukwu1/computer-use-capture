@@ -123,7 +123,7 @@ private func composition(
     #expect(abs(first.x - second.x) < 0.001)
     #expect(abs(first.y - second.y) < 0.001)
     #expect(abs(first.logScale - second.logScale) < 0.000_001)
-    #expect(exp(first.logScale) > 1.15)
+    #expect(exp(first.logScale) > directed.shots[0].scale + 0.02)
 }
 
 @Test func tinyCaretMotionPreservesPointerFraming() throws {
