@@ -140,6 +140,7 @@ Use `--keep-waiting` (or `AGENTRECORDER_REDUCE_WAITING=0`) when a faithful, uncu
 ## Current limitations
 
 - A target must have exactly one eligible on-screen window at recording start. The bundle identifier is carried through preflight, ScreenCaptureKit, Accessibility observation, screenshot-coordinate lookup, and timeline persistence.
+- Accessibility sampling backs off adaptively when a native app exposes a slow, very large AX tree, preventing the recorder from continuously contending with Computer Use for the same accessibility server.
 - Video time is anchored to the first committed ScreenCaptureKit frame. Action timestamps are still estimated within each Computer Use tool-call duration because the event stream does not expose the exact injection instant; target-local visual timing refines clicks when evidence exists.
 - Coordinate clicks and drags use their logged coordinates. Element-index actions use passive role/title/value matching against recorder-side AX snapshots; ambiguous or missing matches fail open without inventing a cursor target.
 - A moved or resized target window invalidates direct coordinates for the affected span rather than silently remapping them. The v1 capture does not follow the window mid-recording.

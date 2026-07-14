@@ -76,9 +76,12 @@ if watchesChanges {
 
     var previousSignature: String?
     var lastFallbackSnapshot = Date.distantPast
+    var snapshotInterval: TimeInterval = 1.5
     while !stopState.isStopped {
         _ = CFRunLoopRunInMode(.defaultMode, 0.2, true)
-        guard changeState.consumeDirty() || Date().timeIntervalSince(lastFallbackSnapshot) >= 1.5 else { continue }
+        let timeSinceSnapshot = Date().timeIntervalSince(lastFallbackSnapshot)
+        guard timeSinceSnapshot >= snapshotInterval else { continue }
+        _ = changeState.consumeDirty()
         let walkStarted = ContinuousClock.now
         var output = accessibilitySnapshot(
             appElement: appElement,
@@ -88,6 +91,14 @@ if watchesChanges {
         output["notificationRegistrations"] = notificationRegistrations
         output["samplingMode"] = notificationRegistrations > 0 ? "notifications-with-fallback" : "fallback-only"
         let walkDuration = walkStarted.duration(to: .now)
+        let walkSeconds = Double(walkDuration.components.seconds)
+            + Double(walkDuration.components.attoseconds) / 1e18
+        // Large native documents can expose thousands of AX nodes. Avoid
+        // immediately starting another full walk after a slow snapshot: doing
+        // so competes with both the target app and Computer Use for the same AX
+        // server. Fast browser trees retain the original 1.5-second cadence;
+        // slower apps back off proportionally, capped at five seconds.
+        snapshotInterval = min(5.0, max(1.5, walkSeconds * 3.0))
         let signatureData = try JSONSerialization.data(withJSONObject: output, options: [.sortedKeys])
         let signature = String(decoding: signatureData, as: UTF8.self)
         if signature != previousSignature {
