@@ -1,5 +1,5 @@
 {
-  "name": "agent-recorder",
+  "name": "computer-use-capture",
   "private": true,
   "version": "0.1.0",
   "type": "module",
@@ -10,8 +10,11 @@
     "compose": "node scripts/compose-recording.mjs",
     "record": "node scripts/record-session.mjs",
     "audit:accessibility": "node scripts/audit-accessibility-vocabulary.mjs",
+    "audit:alignment": "node scripts/validate-alignment.mjs",
+    "compare:v4": "node scripts/compare-camera-plans.mjs --planners v3,v4",
     "golden:update": "node scripts/golden-director-plans.mjs update",
     "test:golden": "node scripts/golden-director-plans.mjs verify",
+    "benchmark:pipeline": "node scripts/benchmark-pipeline.mjs",
     "mcp": "node scripts/mcp-server.mjs"
   },
   "dependencies": {

@@ -22,7 +22,7 @@ const service = new RecorderService({ repoRoot });
 await service.initialize();
 
 const server = new Server(
-  { name: "agent-recorder", version: contract.contract.contractVersion },
+  { name: "computer-use-capture", version: contract.contract.contractVersion },
   { capabilities: { tools: { listChanged: false } } }
 );
 
@@ -107,4 +107,4 @@ process.stdin.once("end", shutdown);
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
-console.error(`Agent Recorder MCP server ready (contract ${contract.contract.contractVersion})`);
+console.error(`Computer Use Capture MCP server ready (contract ${contract.contract.contractVersion})`);

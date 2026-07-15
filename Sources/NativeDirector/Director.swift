@@ -39,6 +39,7 @@ public struct Timeline: Codable, Sendable {
             }
             public let bounds: Bounds?
             public let role: String?
+            public let title: String?
             public let viewportRelocation: ViewportRelocation?
         }
         public struct TargetResolution: Codable, Sendable {
@@ -75,7 +76,10 @@ public struct Timeline: Codable, Sendable {
         public let cursorScale: Double?
         public let director: Recipe?
     }
-    public struct Capture: Codable, Sendable { public let startedAt: String? }
+    public struct Capture: Codable, Sendable {
+        public let startedAt: String?
+        public let frameProvenance: String?
+    }
     public let events: [Event]
     public let composition: CompositionOptions?
     public let capture: Capture?
@@ -120,6 +124,8 @@ public enum EvidenceSource: String, Sendable, Equatable {
     case dragPath
     case accessibility
     case visualResponse
+    case visualFocus
+    case contextTransition
 }
 
 public struct AttentionEvidence: Sendable {
@@ -130,18 +136,43 @@ public struct AttentionEvidence: Sendable {
     public let framingWeight: Double
     public let persistence: Double
     public let causalActionID: Int
+
+    public let focusTransition: MotionFocusTransition?
+
+    public init(
+        source: EvidenceSource,
+        timeRange: ClosedRange<Double>,
+        bounds: CGRect,
+        confidence: Double,
+        framingWeight: Double,
+        persistence: Double,
+        causalActionID: Int,
+        focusTransition: MotionFocusTransition? = nil
+    ) {
+        self.source = source
+        self.timeRange = timeRange
+        self.bounds = bounds
+        self.confidence = confidence
+        self.framingWeight = framingWeight
+        self.persistence = persistence
+        self.causalActionID = causalActionID
+        self.focusTransition = focusTransition
+    }
 }
 
 public enum CameraBehavior: String, Sendable, Equatable {
     case point
     case region
     case wideResponse
+    case overview
 }
 
 public enum VisualMotionKind: String, Sendable, Equatable, Codable {
     case appearance
     case translation
     case transformation
+    case focus
+    case contextTransition
 }
 
 public struct AttentionDecision: Sendable {
@@ -151,20 +182,34 @@ public struct AttentionDecision: Sendable {
     public let evidence: [AttentionEvidence]
 }
 
-public struct VisualMotionObservation: Sendable {
+public struct VisualMotionObservation: Sendable, Codable {
+    public let startTime: Double
     public let time: Double
     public let normalizedBounds: CGRect
     public let changedFraction: Double
     public let magnitude: Double
     public let kind: VisualMotionKind
+    public let focusTransition: MotionFocusTransition?
 
-    public init(time: Double, normalizedBounds: CGRect, changedFraction: Double, magnitude: Double, kind: VisualMotionKind = .transformation) {
+    public init(
+        time: Double,
+        normalizedBounds: CGRect,
+        changedFraction: Double,
+        magnitude: Double,
+        kind: VisualMotionKind = .transformation,
+        focusTransition: MotionFocusTransition? = nil,
+        startTime: Double? = nil
+    ) {
+        self.startTime = min(startTime ?? time, time)
         self.time = time
         self.normalizedBounds = normalizedBounds
         self.changedFraction = changedFraction
         self.magnitude = magnitude
         self.kind = kind
+        self.focusTransition = focusTransition
     }
+
+    public var timeRange: ClosedRange<Double> { startTime...time }
 }
 
 public struct Shot: Sendable {
@@ -210,7 +255,12 @@ private struct PointerTravelInterval: Sendable {
     let curve: CGFloat
 }
 
-public struct CameraState: Sendable {
+private struct FactualPointerInterval: Sendable {
+    let interval: PointerTravelInterval
+    let action: DirectedAction
+}
+
+public struct CameraState: Sendable, Equatable {
     public var x: CGFloat
     public var y: CGFloat
     public var logScale: CGFloat
@@ -240,6 +290,73 @@ public func projectPointThroughCamera(_ point: CGPoint, camera: CameraState, out
         x: outputSize.width / 2 + (point.x - camera.x) * scale,
         y: outputSize.height / 2 + (point.y - camera.y) * scale
     )
+}
+
+public struct SmoothedVisibilityCorrection: Sendable {
+    public let states: [CameraState]
+    public let ranges: [ClosedRange<Int>]
+}
+
+/// Eases only the minimum factual-visibility delta into an already planned
+/// camera trajectory. This preserves a held zoom during nearby-control pans;
+/// widening to a neutral/base camera is never inferred by this safety pass.
+public func smoothedVisibilityCorrections(
+    unconstrained: [CameraState],
+    adjusted: [CameraState],
+    samplesPerSecond: Double,
+    shoulderSeconds: Double = 0.35
+) -> SmoothedVisibilityCorrection {
+    precondition(unconstrained.count == adjusted.count)
+    guard !unconstrained.isEmpty else { return SmoothedVisibilityCorrection(states: [], ranges: []) }
+    let changed = unconstrained.indices.filter { index in
+        abs(adjusted[index].x - unconstrained[index].x) > 0.0001
+            || abs(adjusted[index].y - unconstrained[index].y) > 0.0001
+            || abs(adjusted[index].logScale - unconstrained[index].logScale) > 0.0001
+    }
+    guard let first = changed.first else {
+        return SmoothedVisibilityCorrection(states: unconstrained, ranges: [])
+    }
+    var ranges: [ClosedRange<Int>] = []
+    var start = first
+    var previous = first
+    for index in changed.dropFirst() {
+        if index > previous + 1 {
+            ranges.append(start...previous)
+            start = index
+        }
+        previous = index
+    }
+    ranges.append(start...previous)
+
+    var result = unconstrained
+    let shoulder = max(1, Int(samplesPerSecond * shoulderSeconds))
+    for range in ranges {
+        let expandedStart = max(0, range.lowerBound - shoulder)
+        let expandedEnd = min(result.count - 1, range.upperBound + shoulder)
+        for index in expandedStart...expandedEnd {
+            let strength: CGFloat
+            if range.contains(index) { strength = 1 }
+            else if index < range.lowerBound {
+                strength = CGFloat(cinematicMotionProgress(
+                    Double(index - expandedStart) / Double(max(1, range.lowerBound - expandedStart))
+                ))
+            } else {
+                strength = CGFloat(cinematicMotionProgress(
+                    Double(expandedEnd - index) / Double(max(1, expandedEnd - range.upperBound))
+                ))
+            }
+            let referenceIndex = min(range.upperBound, max(range.lowerBound, index))
+            let correctionX = adjusted[referenceIndex].x - unconstrained[referenceIndex].x
+            let correctionY = adjusted[referenceIndex].y - unconstrained[referenceIndex].y
+            let correctionScale = adjusted[referenceIndex].logScale - unconstrained[referenceIndex].logScale
+            result[index] = CameraState(
+                x: unconstrained[index].x + correctionX * strength,
+                y: unconstrained[index].y + correctionY * strength,
+                logScale: unconstrained[index].logScale + correctionScale * strength
+            )
+        }
+    }
+    return SmoothedVisibilityCorrection(states: result, ranges: ranges)
 }
 
 public func aspectFittedContentRect(canvas: CGSize, sourceAspect: CGFloat, scale: CGFloat) -> CGRect {
@@ -280,6 +397,8 @@ public struct NativeComposition: Sendable {
     public let reducesWaiting: Bool
     public let interactionPhases: [Int: InteractionPhases]
     private let pointerTravel: [PointerTravelInterval]
+    private let factualPointerTravel: [FactualPointerInterval]
+    private let factualTypingActions: [DirectedAction]
 
     public init(
         timeline: Timeline,
@@ -291,6 +410,8 @@ public struct NativeComposition: Sendable {
         motionRanges: [ClosedRange<Double>] = [],
         motionObservations: [VisualMotionObservation] = [],
         interactionPhases: [Int: InteractionPhases] = [:],
+        verifiedIdleRanges: [ClosedRange<Double>]? = nil,
+        provenIdleActionIDs: Set<Int> = [],
         cursorPathOverride: CursorPathStyle? = nil,
         cursorTiltStrengthOverride: Double? = nil
     ) {
@@ -323,16 +444,26 @@ public struct NativeComposition: Sendable {
                   occlusionRanges.contains(where: { $0.contains(time) }) else { return nil }
             return entry.offset
         })
-        let normalizedActions = timeline.events.enumerated().compactMap { entry in
-            Self.normalize(
+        // Computer Use log order is factual. Per-action visual timing may
+        // refine activation within a tool call, but independent refinements
+        // must never cross and reverse two actions from that call.
+        var previousActivation = -Double.infinity
+        let normalizedActions = timeline.events.enumerated().compactMap { entry -> DirectedAction? in
+            let proposed = interactionPhases[entry.offset]?.activation ?? entry.element.time
+            let orderedActivation = proposed.map {
+                previousActivation.isFinite ? max($0, previousActivation + 0.001) : $0
+            }
+            guard let normalized = Self.normalize(
                 entry.element, id: entry.offset, size: size, contentRect: contentRect,
                 allowInferredTargets: allowInferredTargets,
-                activationTime: interactionPhases[entry.offset]?.activation,
+                activationTime: orderedActivation,
                 evidenceOccluded: occlusionRanges.contains { range in
                     range.contains(entry.element.time ?? -.infinity)
                 }
-            )
-        }.sorted { $0.time < $1.time }
+            ) else { return nil }
+            previousActivation = normalized.time
+            return normalized
+        }
         let attentionActions = Self.inferAttention(
             actions: normalizedActions,
             observations: motionObservations.filter { observation in
@@ -362,7 +493,9 @@ public struct NativeComposition: Sendable {
             reduceWaiting: reduceWaiting,
             waitingTime: max(0, waitingTime),
             motionRanges: motionRanges,
-            interactionStarts: interactionStarts
+            interactionStarts: interactionStarts,
+            verifiedIdleRanges: verifiedIdleRanges,
+            provenIdleActionIDs: provenIdleActionIDs
         )
         let episodeActions = Self.inferAttentionEpisodes(actions: directedActions, retime: builtRetime, size: size)
         actions = episodeActions
@@ -376,7 +509,76 @@ public struct NativeComposition: Sendable {
         )
         anchors = builtAnchors
         pointerTravel = builtPointerTravel
+        let actionsByID = Dictionary(uniqueKeysWithValues: episodeActions.map { ($0.id, $0) })
+        factualPointerTravel = builtPointerTravel.compactMap { interval in
+            guard let action = actionsByID[interval.actionID], action.rendersCursor else { return nil }
+            return FactualPointerInterval(interval: interval, action: action)
+        }
+        factualTypingActions = episodeActions.filter {
+            typingActions.contains($0.kind) && $0.semanticBounds != nil
+        }
         outputDuration = retime.reduce(0) { $0 + $1.outputDuration }
+    }
+
+    /// Renderer adapter for a globally resolved production plan. It rebuilds
+    /// pointer choreography from the selected timing facts, but deliberately
+    /// does not invoke local attention, episode, shot, or retiming inference.
+    public func replacingWithGlobalPlan(
+        actions resolvedActions: [DirectedAction],
+        retime resolvedRetime: [RetimeSegment],
+        interactionPhases resolvedPhases: [Int: InteractionPhases]
+    ) -> NativeComposition {
+        let resolvedAnchors = Self.buildAnchors(resolvedActions, phases: resolvedPhases)
+        let resolvedTravel = Self.buildPointerTravel(
+            anchors: resolvedAnchors, size: size, style: recipe.cursorPath
+        )
+        return NativeComposition(
+            size: size,
+            actions: resolvedActions,
+            shots: [],
+            anchors: resolvedAnchors,
+            retime: resolvedRetime,
+            outputDuration: resolvedRetime.reduce(0) { $0 + $1.outputDuration },
+            cursorScale: cursorScale,
+            recipe: recipe,
+            reducesWaiting: reducesWaiting,
+            interactionPhases: resolvedPhases,
+            pointerTravel: resolvedTravel
+        )
+    }
+
+    private init(
+        size: CGSize,
+        actions: [DirectedAction],
+        shots: [Shot],
+        anchors: [PointerAnchor],
+        retime: [RetimeSegment],
+        outputDuration: Double,
+        cursorScale: CGFloat,
+        recipe: DirectorRecipe,
+        reducesWaiting: Bool,
+        interactionPhases: [Int: InteractionPhases],
+        pointerTravel: [PointerTravelInterval]
+    ) {
+        self.size = size
+        self.actions = actions
+        self.shots = shots
+        self.anchors = anchors
+        self.retime = retime
+        self.outputDuration = outputDuration
+        self.cursorScale = cursorScale
+        self.recipe = recipe
+        self.reducesWaiting = reducesWaiting
+        self.interactionPhases = interactionPhases
+        self.pointerTravel = pointerTravel
+        let actionsByID = Dictionary(uniqueKeysWithValues: actions.map { ($0.id, $0) })
+        factualPointerTravel = pointerTravel.compactMap { interval in
+            guard let action = actionsByID[interval.actionID], action.rendersCursor else { return nil }
+            return FactualPointerInterval(interval: interval, action: action)
+        }
+        factualTypingActions = actions.filter {
+            typingActions.contains($0.kind) && $0.semanticBounds != nil
+        }
     }
 
     public func sourceTime(atOutputTime outputTime: Double) -> Double {
@@ -402,14 +604,30 @@ public struct NativeComposition: Sendable {
     }
 
     private func rawSourceTime(atOutputTime outputTime: Double) -> Double {
-        guard let segment = retime.last(where: { outputTime >= $0.outputStart }) else { return 0 }
+        guard !retime.isEmpty, outputTime >= retime[0].outputStart else { return 0 }
+        var lower = 0
+        var upper = retime.count
+        while lower < upper {
+            let middle = (lower + upper) / 2
+            if retime[middle].outputStart <= outputTime { lower = middle + 1 }
+            else { upper = middle }
+        }
+        let segment = retime[max(0, lower - 1)]
         return min(segment.sourceEnd, segment.sourceStart + (outputTime - segment.outputStart) * segment.rate)
     }
 
     private func crossesEditorialCut(from start: Double, to end: Double) -> Bool {
         guard retime.count > 1 else { return false }
-        for index in 1..<retime.count {
+        var lower = 1
+        var upper = retime.count
+        while lower < upper {
+            let middle = (lower + upper) / 2
+            if retime[middle].outputStart < start { lower = middle + 1 }
+            else { upper = middle }
+        }
+        for index in lower..<retime.count {
             let boundary = retime[index].outputStart
+            if boundary > end { break }
             if boundary >= start, boundary <= end,
                abs(retime[index - 1].sourceEnd - retime[index].sourceStart) > 0.001 {
                 return true
@@ -499,6 +717,30 @@ public struct NativeComposition: Sendable {
         }
     }
 
+    /// Source-time intervals whose continuity is part of the factual pointer
+    /// record. Retiming must preserve the complete trip, not merely a generic
+    /// shoulder before the activation, or an editorial cut can turn a smooth
+    /// approach into an apparent cursor teleport.
+    public func protectedPointerTravelRanges(
+        sourceDuration: Double,
+        padding: Double = 0.05
+    ) -> [ClosedRange<Double>] {
+        pointerTravel.compactMap { interval in
+            let start = max(0, interval.start - max(0, padding))
+            let end = min(sourceDuration, interval.end + max(0, padding))
+            return end > start ? start...end : nil
+        }
+    }
+
+    /// Source-time onset of the factual visibility contract for a semantic
+    /// input target. Camera planning and rendering must share this boundary;
+    /// otherwise a plan may settle after the renderer has already begun
+    /// protecting the control.
+    static func semanticVisibilityStart(for action: DirectedAction) -> Double? {
+        guard typingActions.contains(action.kind), action.semanticBounds != nil else { return nil }
+        return max(0, action.time - 0.45)
+    }
+
     public func cameraPose(containing bounds: CGRect, maximumScale: CGFloat) -> CameraState {
         let safeSize = CGSize(width: size.width * 0.85, height: size.height * 0.78)
         let fitX = bounds.width > 0 ? safeSize.width / bounds.width : .greatestFiniteMagnitude
@@ -523,20 +765,26 @@ public struct NativeComposition: Sendable {
     /// actual Computer Use coordinate.
     public func enforcingFactualActionVisibility(
         _ camera: CameraState,
-        at sourceTime: Double
+        at sourceTime: Double,
+        inset: CGFloat = 50
     ) -> CameraState {
         factualVisibilityAdjusted(
-            camera, required: factualActiveBounds(at: sourceTime)
+            camera, required: factualActiveBounds(at: sourceTime), inset: inset
         )
     }
 
     private func factualVisibilityAdjusted(
         _ camera: CameraState,
-        required: CGRect
+        required: CGRect,
+        inset: CGFloat
     ) -> CameraState {
         guard !required.isNull, !required.isEmpty else { return camera }
 
-        let preferredSafeFrame = CGRect(x: 50, y: 50, width: size.width - 100, height: size.height - 100)
+        let preferredSafeFrame = CGRect(
+            x: inset, y: inset,
+            width: size.width - inset * 2,
+            height: size.height - inset * 2
+        )
         var scale = exp(camera.logScale)
         let fittingScaleX = required.width > 0
             ? preferredSafeFrame.width / required.width
@@ -651,22 +899,26 @@ public struct NativeComposition: Sendable {
 
     private func factualActiveBounds(at time: Double) -> CGRect {
         var required = CGRect.null
-        for interval in pointerTravel {
-            guard let action = actions.first(where: { $0.id == interval.actionID }),
-                  action.rendersCursor else { continue }
+        for factual in factualPointerTravel {
+            let interval = factual.interval
+            let action = factual.action
             let confirmationEnd = action.kind == "drag"
                 ? action.time + action.duration / 2 + 0.25
                 : action.time + 0.32
             guard time >= interval.start, time <= confirmationEnd else { continue }
-            let point = cursorPoint(at: time)
+            let point = travel(
+                interval.from, interval.to, time,
+                interval.start, interval.end, interval.curve
+            )
             required = required.union(CGRect(x: point.x, y: point.y, width: 1, height: 1))
             if time >= interval.end - 0.12, let target = action.point {
                 required = required.union(CGRect(x: target.x, y: target.y, width: 1, height: 1))
             }
         }
-        for action in actions where typingActions.contains(action.kind) {
+        for action in factualTypingActions {
             guard let bounds = action.semanticBounds else { continue }
-            guard time >= action.time - 0.45, time <= Self.actionHoldEnd(action) else { continue }
+            guard let start = Self.semanticVisibilityStart(for: action),
+                  time >= start, time <= Self.actionHoldEnd(action) else { continue }
             required = required.union(bounds)
         }
         return required
@@ -818,22 +1070,25 @@ public struct NativeComposition: Sendable {
                         height: observation.normalizedBounds.height * contentRect.height
                     ).intersection(CGRect(origin: .zero, size: size))
                     let areaFraction = mapped.area / (size.width * size.height)
-                    // Timing remains sensitive to tiny changes, but only a
-                    // substantial response is allowed to direct the camera.
-                    guard !mapped.isNull, observation.changedFraction >= 0.0015,
-                          areaFraction >= 0.008 else { continue }
-                    // Existing content that merely changed position explains
-                    // the transition but is not the subject of the reveal.
-                    guard observation.kind != .translation else { continue }
+                    // Timing and waiting reduction remain sensitive to tiny
+                    // changes, but only substantial non-viewport responses
+                    // are allowed to direct the camera.
+                    guard !mapped.isNull, SpatialMotion.isFramingEligible(observation) else { continue }
                     let confidence = clamp(0.58 + observation.changedFraction * 18 + observation.magnitude * 0.8, 0.58, 0.96)
+                    let source: EvidenceSource = switch observation.kind {
+                    case .focus: .visualFocus
+                    case .contextTransition: .contextTransition
+                    default: .visualResponse
+                    }
                     evidence.append(AttentionEvidence(
-                        source: .visualResponse,
-                        timeRange: observation.time...observation.time,
+                        source: source,
+                        timeRange: observation.timeRange,
                         bounds: mapped.insetBy(dx: -16, dy: -16),
                         confidence: confidence,
                         framingWeight: clamp(areaFraction * 5 + observation.changedFraction * 16, 0.3, 1.1),
                         persistence: clamp(areaFraction * 3, 0.25, 1),
-                        causalActionID: action.id
+                        causalActionID: action.id,
+                        focusTransition: observation.focusTransition
                     ))
                 }
             }
@@ -842,9 +1097,12 @@ public struct NativeComposition: Sendable {
             let framing = evidence.filter { $0.framingWeight >= 0.25 }
             let bounds = (framing.isEmpty ? evidence : framing).dropFirst().reduce(first.bounds) { $0.union($1.bounds) }
                 .insetBy(dx: -20, dy: -20).intersection(CGRect(origin: .zero, size: size))
-            let visualArea = evidence.filter { $0.source == .visualResponse }.reduce(CGRect.null) { $0.union($1.bounds) }.area
+            let visualArea = evidence.filter {
+                $0.source == .visualResponse || $0.source == .visualFocus || $0.source == .contextTransition
+            }.reduce(CGRect.null) { $0.union($1.bounds) }.area
             let behavior: CameraBehavior
-            if visualArea / (size.width * size.height) >= 0.06 { behavior = .wideResponse }
+            if evidence.contains(where: { $0.source == .contextTransition }) { behavior = .overview }
+            else if visualArea / (size.width * size.height) >= 0.06 { behavior = .wideResponse }
             else if evidence.contains(where: { $0.source == .accessibility || $0.source == .dragPath }) { behavior = .region }
             else { behavior = .point }
             let confidence = evidence.map(\.confidence).max() ?? 0
@@ -873,7 +1131,8 @@ public struct NativeComposition: Sendable {
         contentRect: CGRect
     ) -> CGPoint? {
         let candidates = observations.compactMap { observation -> (point: CGPoint, score: Double)? in
-            guard observation.kind != .translation,
+            guard observation.kind != .translation, observation.kind != .focus,
+                  observation.kind != .contextTransition,
                   observation.changedFraction >= 0.0015 else { return nil }
             let mapped = CGRect(
                 x: contentRect.minX + observation.normalizedBounds.minX * contentRect.width,
@@ -899,13 +1158,24 @@ public struct NativeComposition: Sendable {
             guard result[openerIndex].episodeID == nil,
                   result[openerIndex].attention?.behavior == .wideResponse,
                   let reveal = result[openerIndex].attention?.bounds else { continue }
+            let trackedFocus = result[openerIndex].attention?.evidence.contains {
+                $0.source == .visualFocus && $0.focusTransition == .gained
+            } == true
             let openerOutput = outputTime(for: result[openerIndex].time, retime: retime)
             var contained: [Int] = []
             var locationless: [Int] = []
             for index in result.indices where index > openerIndex {
                 let action = result[index]
                 let editedGap = outputTime(for: action.time, retime: retime) - openerOutput
-                if editedGap > 14 || action.kind == "scroll" { break }
+                if editedGap > 14 { break }
+                let nextFocusTransition = action.attention?.evidence.first {
+                    $0.source == .visualFocus
+                }?.focusTransition
+                if trackedFocus, nextFocusTransition == .gained { break }
+                if action.kind == "scroll" {
+                    if trackedFocus { locationless.append(index); continue }
+                    break
+                }
                 if let point = rawActionFocus(action) {
                     if reveal.insetBy(dx: -24, dy: -24).contains(point) { contained.append(index) }
                     else if !contained.isEmpty { break }
@@ -913,13 +1183,21 @@ public struct NativeComposition: Sendable {
                     locationless.append(index)
                 }
             }
-            // One coincidental point is insufficient. Episodes require a
-            // sequence of work demonstrably contained by the revealed region.
-            guard contained.count >= 2 else { continue }
+            // Generic reveals still require a sequence. A tracked foreground
+            // has stronger evidence: a later focus-bearing action inside the
+            // same region confirms the lifecycle around intervening scrolls.
+            let hasVisualFocusConfirmation = contained.contains { index in
+                result[index].attention?.evidence.contains {
+                    $0.source == .visualFocus && $0.focusTransition == .released
+                } == true
+            }
+            guard contained.count >= 2 || (trackedFocus && hasVisualFocusConfirmation) else { continue }
             let lastContained = contained.last!
             let inherited = locationless.filter { $0 < lastContained }
             let members = [openerIndex] + inherited + contained
-            let workingBounds = reveal.insetBy(dx: reveal.width * 0.07, dy: reveal.height * 0.08)
+            let workingBounds = trackedFocus
+                ? reveal
+                : reveal.insetBy(dx: reveal.width * 0.07, dy: reveal.height * 0.08)
             let episodeID = nextEpisodeID; nextEpisodeID += 1
             for index in members {
                 let action = result[index]
@@ -990,7 +1268,16 @@ public struct NativeComposition: Sendable {
             let samePlace = clusterFits && (viewportOverlap >= 0.4 || distance <= 0.24)
             let sameEpisode = previousAction?.episodeID != nil && previousAction?.episodeID == action.episodeID
             let joinsInEditedTime = sameEpisode || gap <= 1.6 || (samePlace && gap <= 3.8)
-            let requiresBoundary = previousAction != nil && action.requiresEstablishingTransition
+            // A foreground lifecycle is a semantic boundary even when the
+            // next dialog or sheet occupies nearly the same rectangle. If we
+            // merge distinct gained -> released episodes by spatial overlap,
+            // the close/open transition disappears and the second foreground
+            // never receives an establishing camera move.
+            let startsNewForegroundLifecycle = previousAction?.episodeID != nil
+                && action.episodeID != nil
+                && previousAction?.episodeID != action.episodeID
+            let requiresBoundary = previousAction != nil
+                && (action.requiresEstablishingTransition || startsNewForegroundLifecycle)
             if !requiresBoundary && !shots.isEmpty && joinsInEditedTime && (samePlace || gap <= 0.75 || semantic) {
                 shots[shots.count - 1].actions.append(action)
                 shots[shots.count - 1].focusEnd = actionHoldEnd(action)
@@ -1010,18 +1297,35 @@ public struct NativeComposition: Sendable {
     }
 
     private static func outputTime(for sourceTime: Double, retime: [RetimeSegment]) -> Double {
-        if let segment = retime.first(where: { sourceTime >= $0.sourceStart && sourceTime <= $0.sourceEnd }) {
-            return segment.outputStart + (sourceTime - segment.sourceStart) / segment.rate
+        guard !retime.isEmpty else { return 0 }
+        var lower = 0
+        var upper = retime.count
+        while lower < upper {
+            let middle = (lower + upper) / 2
+            if retime[middle].sourceStart <= sourceTime { lower = middle + 1 }
+            else { upper = middle }
         }
-        if let next = retime.first(where: { $0.sourceStart > sourceTime }) { return next.outputStart }
-        return retime.last.map { $0.outputStart + $0.outputDuration } ?? 0
+        if lower > 0 {
+            let segment = retime[lower - 1]
+            if sourceTime >= segment.sourceStart, sourceTime <= segment.sourceEnd {
+                return segment.outputStart + (sourceTime - segment.sourceStart) / segment.rate
+            }
+        }
+        if lower < retime.count {
+            return retime[lower].outputStart
+        }
+        return retime.last!.outputStart + retime.last!.outputDuration
     }
 
-    private static func actionHoldEnd(_ action: DirectedAction) -> Double {
+    public static func holdEnd(for action: DirectedAction) -> Double {
         if typingActions.contains(action.kind) { return action.time + action.duration / 2 + 0.55 + action.holdExtension }
         if action.kind == "drag" { return action.time + action.duration / 2 + 0.35 + action.holdExtension }
         if action.kind == "click" { return action.time + 0.55 + action.holdExtension }
         return action.time + 0.35 + action.holdExtension
+    }
+
+    private static func actionHoldEnd(_ action: DirectedAction) -> Double {
+        holdEnd(for: action)
     }
 
     fileprivate static func actionScale(_ action: DirectedAction, size: CGSize, recipe: DirectorRecipe) -> CGFloat {
@@ -1042,12 +1346,18 @@ public struct NativeComposition: Sendable {
                 // include context and padding.
                 let coverage = attention.bounds.area / (size.width * size.height)
                 scale = coverage >= 0.72 ? 1 : clamp(min(size.width * 0.94 / max(1, attention.bounds.width), size.height * 0.86 / max(1, attention.bounds.height)), 1.12, 1.48)
+            case .overview:
+                // Distributed scene replacement is causal context, not a
+                // subject to crop. Preserve the base viewport until a later
+                // action establishes a local foreground surface.
+                scale = 1
             }
         }
         if scale == nil, typingActions.contains(action.kind) {
             if let bounds = action.semanticBounds { scale = clamp((size.width * 0.62) / bounds.width, 1.25, 1.62) }
             else { scale = action.point == nil ? 1 : 1.5 }
-        } else if action.kind == "scroll" { scale = 1 }
+        }
+        if scale == nil, action.kind == "scroll" { scale = 1 }
         if scale == nil, action.kind == "drag", let from = action.from, let to = action.to {
             let span = hypot(to.x - from.x, to.y - from.y) / hypot(size.width, size.height)
             scale = lerp(1.48, 1.24, clamp(span / 0.55, 0, 1))
@@ -1068,7 +1378,7 @@ public struct NativeComposition: Sendable {
                 ? actions[index - 1].time + actions[index - 1].duration / 2
                 : nil
             let relocationEnd = action.requiresEstablishingTransition
-                ? phase?.preActivationActivityEnd.map { $0 + 0.05 }
+                ? phase?.prePointerActivityEnd.map { $0 + 0.05 }
                 : nil
             let notBefore = [precedingScrollEnd, relocationEnd].compactMap { $0 }.max()
             if action.kind == "drag", let from = action.from, let to = action.to {
@@ -1077,11 +1387,12 @@ public struct NativeComposition: Sendable {
             } else if let point = action.point {
                 result.append(PointerAnchor(
                     actionID: action.id,
-                    // Target-local activity before activation is the viewport
-                    // arriving, not cursor hover, when Computer Use relocated
-                    // an offscreen semantic target. The pointer belongs to the
-                    // established frame and therefore lands at activation.
+                    // A relocation and a hover are distinct causal phases.
+                    // Once the earlier relocation cluster has settled, an
+                    // observed hover is factual pointer-arrival evidence and
+                    // must not be reclassified as more viewport movement.
                     time: action.requiresEstablishingTransition
+                            && phase?.pointerArrivalSource != "target-visual-hover"
                         ? phase?.activation ?? action.time
                         : phase?.pointerArrival ?? action.time,
                     point: point,
@@ -1148,10 +1459,12 @@ public struct NativeComposition: Sendable {
         reduceWaiting: Bool,
         waitingTime: Double,
         motionRanges: [ClosedRange<Double>],
-        interactionStarts: [Int: Double]
+        interactionStarts: [Int: Double],
+        verifiedIdleRanges: [ClosedRange<Double>]?,
+        provenIdleActionIDs: Set<Int>
     ) -> [RetimeSegment] {
         guard duration > 0 else { return [] }
-        var ranges = actions.map {
+        var ranges = actions.filter { !provenIdleActionIDs.contains($0.id) }.map {
             let approachStart = interactionStarts[$0.id].map { $0 - 0.05 } ?? ($0.time - 0.78)
             return (
                 max(0, min($0.time - 0.78, approachStart)),
@@ -1179,6 +1492,32 @@ public struct NativeComposition: Sendable {
             guard end > start else { return }
             guard reduceWaiting else {
                 raw.append((start, end, rate))
+                return
+            }
+            if let verifiedIdleRanges {
+                let idle = verifiedIdleRanges.filter {
+                    $0.upperBound > start && $0.lowerBound < end
+                }
+                let relevantMotion = motionRanges.filter {
+                    $0.upperBound > start && $0.lowerBound < end
+                }
+                let boundaries = Set(
+                    [start, end]
+                        + idle.flatMap { [max(start, $0.lowerBound), min(end, $0.upperBound)] }
+                        + relevantMotion.flatMap { [max(start, $0.lowerBound), min(end, $0.upperBound)] }
+                ).sorted()
+                for pair in zip(boundaries, boundaries.dropFirst()) where pair.1 > pair.0 {
+                    let midpoint = (pair.0 + pair.1) / 2
+                    if idle.contains(where: { $0.contains(midpoint) }) {
+                        appendStaticGap(pair.0, pair.1)
+                    } else if relevantMotion.contains(where: { $0.contains(midpoint) }) {
+                        raw.append((pair.0, pair.1, rate))
+                    } else {
+                        // Capture provenance is enabled, but this interval was
+                        // not proved idle. Preserve it at 1x.
+                        raw.append((pair.0, pair.1, 1))
+                    }
+                }
                 return
             }
             var cursor = start

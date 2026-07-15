@@ -1,6 +1,6 @@
-# Agent Recorder
+# Computer Use Capture
 
-This macOS-only proof records a declared application window with ScreenCaptureKit while Codex uses the original Computer Use tool unchanged. It reconstructs Computer Use actions afterward from the current Codex task's read-only event stream, maps screenshot coordinates into capture coordinates, and renders a synthetic cursor plus spring-driven camera motion with a native Metal/Core Image compositor.
+This macOS-only proof records a declared application window with ScreenCaptureKit while Codex uses the original Computer Use tool unchanged. It tails Computer Use actions from the current Codex task's read-only event stream during capture, maps screenshot coordinates into capture coordinates, and renders a synthetic cursor plus spring-driven camera motion with a native Metal/Core Image compositor.
 
 ## Boundary
 
@@ -15,9 +15,11 @@ The current introspection adapter reads two Codex implementation details:
 
 Both dependencies are isolated under `lib/`. Unknown future `sky` actions are retained as `unknown`; missing introspection produces a cursorless timeline rather than failing capture. This makes capture the stable core and Codex introspection a replaceable, fail-open adapter.
 
+The rollout log is a live event source, not the sole source of truth. A stateful incremental tailer consumes complete appended JSONL records while recording and preserves earlier JavaScript bindings and full/diff Computer Use Accessibility snapshots. The recorder-side macOS AX watcher and source frames independently supply geometry and visual timing. Stop waits for the writer to become quiescent, drains the same accumulator, and falls back to a full-file reconstruction with an explicit warning if live tailing fails. State omitted from a Computer Use result cannot be recovered by either path.
+
 Element-index actions do not move the real macOS pointer and do not contain x/y coordinates. The adapter therefore joins each index to the preceding Computer Use accessibility text, then passively matches its role/title/value to a low-rate native AX geometry snapshot recorded alongside the video. It never samples the OS cursor and never changes how Computer Use performs the action.
 
-The coordinate resolver retains complete Computer Use accessibility state while merging diff and sliced outputs, understands the combined macOS/AppKit role vocabulary, and records neighboring named elements as structural anchors. Change-driven native snapshots are treated as state intervals: the latest tree before an action remains valid until a newer tree is observed, so a control does not become "stale" merely because the agent thought for several seconds. Native resolution tries identity, post-action focus, and anchor-aligned tree position in that order. Every result records provenance (`direct`, `ax-identity`, `ax-focus`, `ax-structural`, or `unresolved`) and native AX snapshots are persisted beside the capture for replayable diagnostics. Element-index coordinates are never borrowed from motion or another action; unresolved targets remain explicit instead of producing a plausible but false cursor location.
+The coordinate resolver retains complete Computer Use accessibility state while merging diff and sliced outputs, understands the combined macOS/AppKit role vocabulary, and records neighboring named elements as structural anchors. Change-driven native snapshots are treated as state intervals: the latest tree before an action remains valid until a newer tree is observed, so a control does not become "stale" merely because the agent thought for several seconds. Native resolution tries identity, post-action focus, and anchor-aligned tree position in that order. Ordered reconstruction also treats an explicit Computer Use action on a text control as focus ownership for following keyboard actions until another explicit focus-changing action; this prevents a lagging AX focus bit from contradicting the agent's click. Every result records provenance (`direct`, `ax-identity`, `ax-focus`, `ax-structural`, or `unresolved`) and native AX snapshots are persisted beside the capture for replayable diagnostics. Element-index coordinates are never borrowed from motion or another pointer action; unresolved targets remain explicit instead of producing a plausible but false cursor location.
 
 The automatic product-demo preset renders the native macOS cursor at `3x`. The processor accepts `cursorScale` as an override without changing its native hotspot. Pointer actions are rendered only when their target provenance clears the factual-confidence policy; inferred targets may steer framing but are cursorless unless an edit explicitly opts in.
 
@@ -59,10 +61,10 @@ The intended agent flow is deliberately small:
 
 1. `recorder_capabilities` builds/locates the native preflight helper, checks Screen Recording and Accessibility, reports visible application targets, and probes the observed Codex adapter shape. `recorder_start` requires exactly one eligible window for its declared bundle identifier and checks that app's screenshot evidence.
 2. `recorder_start` returns only after the first video frame is committed. The agent then uses Computer Use normally; the recorder receives no per-action calls.
-3. `recorder_stop` finalizes capture, waits for the Codex event log to settle, reconstructs factual actions, and normally enqueues the default render.
+3. `recorder_stop` finalizes capture, waits for the Codex event log to settle, drains the live factual-action reconstruction, and normally enqueues the default render.
 4. `recorder_get` polls the render. `recorder_edit` applies high-level intents and enqueues another render; `recorder_cancel` cancels a render; `recorder_discard` permanently removes the recording and every artifact.
 
-The server allows one active recording and one active render per recording. IDs—not caller-supplied paths—address everything. Projects live under `~/Library/Application Support/AgentRecorder/projects` by default, with a manifest, source video, value-redacted Accessibility sidecar, timeline, logs, and render artifacts. Files persist until `recorder_discard`; the raw AX stream is private temporary state and is removed after reconstruction or process exit. A store lock prevents two MCP daemons from mutating the same project store.
+The server allows one active recording and one active render per recording. IDs—not caller-supplied paths—address everything. Projects live under `~/Library/Application Support/AgentRecorder/projects` by default, with a manifest, source video, capture-truth ledger, value-redacted Accessibility sidecar, timeline, logs, and render artifacts. Files persist until `recorder_discard`; the raw AX stream is private temporary state and is removed after reconstruction or process exit. A store lock prevents two MCP daemons from mutating the same project store.
 
 The default edit intent reduces visually static waiting to 100 ms, uses semantic zoom strength `1`, a native `3x` natural-path cursor, standard motion blur, and never renders inferred cursor targets. Edits reference stable `act_<digest>` IDs and can change waiting, zoom strength, cursor path/scale/tilt, motion blur, per-action emphasis, and per-action holds without exposing renderer internals.
 
@@ -75,7 +77,7 @@ npm install
 npm run record -- artifacts/my-recording 300
 ```
 
-Wait for `RECORDING_READY`, use Computer Use normally, then send a newline to stop. The command writes a `.mov` and `.timeline.json`.
+Wait for `RECORDING_READY`, use Computer Use normally, then send a newline to stop. The command writes a `.mov`, `.capture.json`, and `.timeline.json`.
 
 Capture requests ScreenCaptureKit's `.best` resolution and sizes the stream from the selected filter's actual `pointPixelScale`, avoiding a logical-resolution surface enlarged into a Retina-sized buffer. The default source codec is hardware HEVC at a high screen-content bitrate. `AGENTRECORDER_CAPTURE_CODEC=h264` is available for compatibility; `prores422lt` and `prores4444` provide progressively larger editing masters when chroma fidelity is more important than disk usage. The recorder logs the first frame's buffer size, scale factor, and content scale so accidental upscaling is visible rather than inferred later.
 
@@ -95,6 +97,10 @@ The default cursor motion uses restrained, edge-aware cubic paths with a slower 
 
 Pointer and camera behavior share one action choreography: the cursor departs first, the camera follows, the pointer arrives before the click spring, the camera settles after the action, and the shot holds briefly before a nearly symmetric exit. The cursor uses minimum-jerk endpoint easing; the camera uses an emphasized curve that covers distance earlier and reserves more of a fast move for visible deceleration. Nearby actions remain in one continuous shot. The time warp smooths transitions between protected 1x action ranges and accelerated dead time, and every shutter sample interpolates the correct neighboring source-video frames so page motion and camera motion retain the same cadence.
 
+V3 is the default clip-wide production planner, not another local camera repair pass. It preserves alternative interaction timings, causal attributions, foreground lifecycles, and attention regions in an immutable graph, then jointly selects timing, activation framing, response framing, and the camera trajectory across the entire clip. It has no shot or episode reset states; factual cursor visibility and Computer Use event ordering are hard constraints, while movement and editorial taste remain costs. The same selected action times feed a single global retime partition. Long keyboard-only intervals use an explicit pointer-reveal transition when the synthetic cursor's factual departure lies outside the held shot. Each run writes a `.production-plan.json` decision and search trace beside the camera audit. The architecture, current boundary, and replacement gates are in [`docs/production-planner-v3.md`](docs/production-planner-v3.md).
+
+Experimental V4 changes the planning vocabulary rather than adding another V3 cost term. `SubjectGraph` first infers persistent surfaces, factual targets, scene transitions, and localized responses without prescribing camera behavior. `ShotSchedule` then prices emphasis once per subject span and emits explicit overview, framing, orientation, and response beats. The renderer consumes continuous camera tracks for factual visibility instead of injecting per-frame repair poses. V4 remains behind `--camera-planner v4`; every run writes a `.v4-plan.json`, and `npm run compare:v4` compares it against V3 before any default promotion. See [`docs/camera-planner-v4.md`](docs/camera-planner-v4.md).
+
 Click timing is phase-based rather than a fixed telemetry offset. The rollout adapter preserves the complete Computer Use tool-call envelope and its original estimate. During the native prepass, full-rate target-local frame differences are clustered into optional hover/arrival, activation, and later response phases. Cursor travel may finish at the earlier arrival phase while the click spring and action choreography use measured activation. If the target has no detectable visual state, a final standalone `sky.click` falls back to semantic tool completion; calls followed by more Computer Use work retain the original estimate. Director diagnostics report the raw estimate, tool bounds, measured phases, threshold, and selected source for every refined action.
 
 Shot grouping uses edited output time rather than raw agent time. Nearby controls are clustered when their projected camera viewports overlap and all targets fit inside one stable zoom envelope. Strongly overlapping targets can bridge up to 3.8 seconds in the edited video; the camera stays zoomed and pans between them instead of returning to 1x. A cluster-fit constraint prevents chains of individually nearby actions from gradually drifting across the screen.
@@ -111,6 +117,47 @@ swift run -c release native-compose \
 
 The exported file defaults to standard 60fps. `--samples 8` evaluates camera and cursor motion at 480 temporal samples per second and integrates those samples into the 60 output frames, retaining fast-camera blur without marking the movie as high-frame-rate slow motion. `--shutter` controls how much of each frame interval contributes to motion blur. `npm run compose` exposes the same settings as `AGENTRECORDER_FPS`, `AGENTRECORDER_MOTION_SAMPLES`, and `AGENTRECORDER_SHUTTER`.
 
+### Profile and benchmark the pipeline
+
+Add `--profile` to a normal composition to write an in-process phase report
+next to the output, or provide an explicit JSON path:
+
+```bash
+npm run compose -- artifacts/recording --profile
+npm run compose -- artifacts/recording --profile /tmp/recording.profile.json
+```
+
+The report separates source setup, motion analysis, capture-truth loading,
+composition/camera planning, camera sampling, decode/composite/encode, and
+writer finalization. It also records source/output duration, dimensions,
+frame counts, action counts, planner version, temporal-sample settings, and
+whether immutable motion evidence came from cache.
+
+Motion analysis is cached beside the source using a SHA-256 digest of the full
+movie plus the exact timing/target inputs consumed by the detector. Camera,
+waiting, emphasis, and blur edits reuse that evidence; source pixels, action
+timing, semantic target geometry, detector revision, or relocation evidence
+invalidate it. Debug motion-field runs bypass the cache because they require
+additional diagnostic data. `--no-analysis-cache` is available for cold-path
+validation without deleting a valid cache.
+
+For repeatable measurements, build once and run isolated plan-only and full
+export trials with macOS process CPU and peak-memory accounting:
+
+```bash
+npm run benchmark:pipeline -- \
+  /path/to/source.mov /path/to/source.timeline.json \
+  --mode both --trials 3 --planner v3 --samples 8 \
+  --analysis-cache warm
+```
+
+Results are written under `.benchmarks/` by default, including every phase
+profile and an aggregate `summary.json`. Rendered videos are deleted after
+measurement unless `--keep-outputs` is supplied. Use `--mode plan` when
+iterating on the director and `--mode render` for compositor/encoder changes.
+`--analysis-cache warm` measures repeated edits, `cold` removes the cache
+before every trial, and `off` bypasses it without deleting the persisted entry.
+
 ## Director diagnostics and scenario contracts
 
 Use the native diagnostic overlay when a framing decision needs explanation:
@@ -121,9 +168,23 @@ npm run compose -- artifacts/my-recording --director-debug
 
 The output video includes cyan final-attention bounds, red appearance components, blue translated components, yellow pointer evidence, green Accessibility evidence, and magenta visual-response evidence. A sibling `*.director.json` report records every action, source/output time, evidence weight, attention behavior and bounds, episode membership, camera center/scale, shot membership, and classified motion component. `--plan-only --director-debug` writes the same report without rendering video.
 
+The raw motion stream remains deliberately sensitive for waiting reduction and is retained in the JSON report. Camera framing uses a stricter candidate gate: micro-deltas, caret/glyph noise, and coherent viewport translation cannot direct the shot. Pointer actions use one activation-relative response comparison; the older wide snapshot is only a recall fallback when a distinct later response exists, no material activation-relative component survived, and the fallback covers at least 6% of the viewport. This prevents duplicate response boxes while preserving large animated chart changes.
+
 Generalization contracts live in `Fixtures/DirectorScenarios/scenarios.json`. They cover contained modal work, popovers, side panels, chart updates followed by departure, scroll motion, and reveals followed by unrelated actions. `swift test` validates episode membership and shot behavior for every scenario alongside the lower-level motion and camera tests.
 
+Detector development is isolated from camera taste in [`docs/motion-field.md`](docs/motion-field.md). `swift run motion-debug before.png after.png /tmp/example` writes a detector-only overlay and JSON report. Composition tracks focus in interaction order: a dim/blur foreground persists across later actions and backdrop animation until a release or page replacement. `--director-debug` records intermediate field intervals, active-focus geometry, and lifecycle transitions. Backdrop residual motion stays observable but cannot steer framing; factual pointer and Accessibility evidence can still expand the focus decision.
+
 Real captures can be promoted into privacy-local golden plans without committing video or task data to Git. `AGENTRECORDER_STORE=... npm run golden:update -- rec_...` snapshots the stable director decisions inside that recording's project; `npm run test:golden -- rec_...` reruns the native motion prepass and plan, then fails if action provenance, attention bounds, timing source, camera pose, shot grouping, motion classification, or edited duration changes. The implementation was verified against a live two-click Computer Use capture in addition to the synthetic suite.
+
+Every native plan also writes a sibling `*.camera-audit.json`. It samples the exact camera and cursor trajectory used by the renderer and records factual target projection, cursor-hotspot error, visibility, direction reversals, path efficiency, line deviation, and hidden scale excursions. Validate a real Chrome or native-app capture with:
+
+```bash
+npm run audit:alignment -- artifacts/my-recording.directed.camera-audit.json
+```
+
+The audit fails when a factual click/drag is off-screen, the synthetic hotspot misses the reconstructed target, a camera move reverses direction, a nominal pan contains a zoom pulse, or visual timing falls outside the Computer Use tool/response envelope. Preferred safety-inset misses are warnings; factual visibility is mandatory.
+
+For V2, the audit additionally fails if no hard-constraint-feasible plan exists or if the renderer applies even one emergency visibility correction. This makes the correction path a last-resort safety mechanism rather than a hidden second camera planner.
 
 ### Agent waiting time
 
@@ -133,7 +194,9 @@ The director removes visually static agent waiting by default while preserving i
 npm run compose -- artifacts/my-recording --waiting-time 100
 ```
 
-`--waiting-time` is milliseconds retained per visually static gap, split between the last still moment before the cut and the first still moment after it. Interaction, typing, drag, scroll, and camera ranges remain at 1x. The timeline identifies candidate waiting regions, then a native prepass compares downscaled decoded frames: sustained still runs are cut, while visually moving waiting ranges are retained and smoothly accelerated at the recipe's dead-time rate. Localized and periodic changes are bridged into motion ranges, so a blinking caret, UI animation, or other real motion prevents a hard cut without forcing the entire wait to remain at 1x. The equivalent environment variables are `AGENTRECORDER_REDUCE_WAITING=1` and `AGENTRECORDER_WAITING_TIME_MS=100`.
+`--waiting-time` is milliseconds retained per proven-idle gap, split between the last still moment before the cut and the first still moment after it. New recordings persist a capture-truth ledger directly from ScreenCaptureKit. It records WindowServer frame status, display time, damage rectangles, writer acceptance, and an exhaustive comparison of every active raw BGRA byte before encoding. Only consecutive, on-cadence frames that are exactly identical prove idleness. Any changed pixel, dropped frame, callback gap, missing metadata, blank/suspended capture, clock ambiguity, or unavailable sidecar preserves the interval. The downscaled motion model remains editorial evidence for framing and optional acceleration; it cannot authorize deletion. A scroll loses its generic action hold only when its complete causal interval until the next factual action is proven idle. The Computer Use action remains in the timeline regardless. See [`docs/capture-truth.md`](docs/capture-truth.md).
+
+The equivalent environment variables are `AGENTRECORDER_REDUCE_WAITING=1` and `AGENTRECORDER_WAITING_TIME_MS=100`.
 
 Use `--keep-waiting` (or `AGENTRECORDER_REDUCE_WAITING=0`) when a faithful, uncut timeline is needed. The legacy `--reduce-waiting` flag remains accepted for existing scripts.
 
@@ -141,7 +204,7 @@ Use `--keep-waiting` (or `AGENTRECORDER_REDUCE_WAITING=0`) when a faithful, uncu
 
 - A target must have exactly one eligible on-screen window at recording start. The bundle identifier is carried through preflight, ScreenCaptureKit, Accessibility observation, screenshot-coordinate lookup, and timeline persistence.
 - Accessibility sampling backs off adaptively when a native app exposes a slow, very large AX tree, preventing the recorder from continuously contending with Computer Use for the same accessibility server.
-- Video time is anchored to the first committed ScreenCaptureKit frame. Action timestamps are still estimated within each Computer Use tool-call duration because the event stream does not expose the exact injection instant; target-local visual timing refines clicks when evidence exists.
+- Video time is anchored to the first committed ScreenCaptureKit frame using WindowServer `displayTime`, correcting callback scheduling delay. Action timestamps are still estimated within each Computer Use tool-call duration because the event stream does not expose the exact injection instant; target-local visual timing refines clicks when evidence exists.
 - Coordinate clicks and drags use their logged coordinates. Element-index actions use passive role/title/value matching against recorder-side AX snapshots; ambiguous or missing matches fail open without inventing a cursor target.
 - A moved or resized target window invalidates direct coordinates for the affected span rather than silently remapping them. The v1 capture does not follow the window mid-recording.
 - System-owned foreground surfaces such as open/save or permission panels are not present in application-only capture. The recorder marks those spans and suppresses authoritative pointer reconstruction instead of depicting a click on inert target-app content.

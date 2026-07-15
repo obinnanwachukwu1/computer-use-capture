@@ -1,6 +1,7 @@
 import AVFoundation
 import AppKit
 import CoreMedia
+import CaptureTruth
 import Darwin
 import Foundation
 import ScreenCaptureKit
@@ -118,14 +119,31 @@ enum CaptureError: LocalizedError {
 final class MovieWriter: NSObject, SCStreamOutput, @unchecked Sendable {
     private let writer: AVAssetWriter
     private let input: AVAssetWriterInput
+    private let provenanceURL: URL
+    private let expectedFrameInterval: Double
     private let lock = NSLock()
     private var firstPresentationTime: CMTime?
     private var lastPresentationTime: CMTime?
     private var frameCount = 0
     private var droppedNonMonotonicFrameCount = 0
+    private var droppedBackpressureFrameCount = 0
+    private var appendFailedFrameCount = 0
+    private var invalidMetadataSampleCount = 0
+    private var preRollSampleCount = 0
+    private var provenanceSamples: [CapturedFrameSample] = []
+    private var previousFramePixels: [UInt8]?
     private var appendError: Error?
 
-    init(outputURL: URL, width: Int, height: Int, codec: CaptureCodec) throws {
+    init(
+        outputURL: URL,
+        provenanceURL: URL,
+        width: Int,
+        height: Int,
+        codec: CaptureCodec,
+        framesPerSecond: Int32
+    ) throws {
+        self.provenanceURL = provenanceURL
+        expectedFrameInterval = 1 / Double(framesPerSecond)
         try? FileManager.default.removeItem(at: outputURL)
         try FileManager.default.createDirectory(
             at: outputURL.deletingLastPathComponent(),
@@ -159,59 +177,116 @@ final class MovieWriter: NSObject, SCStreamOutput, @unchecked Sendable {
         of outputType: SCStreamOutputType
     ) {
         guard outputType == .screen, sampleBuffer.isValid else { return }
-        guard isCompleteFrame(sampleBuffer) else { return }
+        guard let metadata = frameMetadata(sampleBuffer) else {
+            lock.withLock { invalidMetadataSampleCount += 1 }
+            return
+        }
+        let presentationTime = sampleBuffer.presentationTimeStamp
+        guard presentationTime.isValid, presentationTime.isNumeric else {
+            lock.withLock { invalidMetadataSampleCount += 1 }
+            return
+        }
 
         lock.lock()
         defer { lock.unlock() }
         guard appendError == nil else { return }
-        guard input.isReadyForMoreMediaData else { return }
-
-        let presentationTime = sampleBuffer.presentationTimeStamp
-        guard presentationTime.isValid, presentationTime.isNumeric else { return }
-        if let lastPresentationTime,
-           CMTimeCompare(presentationTime, lastPresentationTime) <= 0
-        {
-            // ScreenCaptureKit may emit multiple complete window frames with the
-            // same timestamp while native-app child windows and popovers change.
-            // AVAssetWriter can accept those samples but produce a stream with
-            // duplicate DTS values that AVAssetReader later refuses to decode.
-            droppedNonMonotonicFrameCount += 1
+        if firstPresentationTime == nil, metadata.status != .complete {
+            preRollSampleCount += 1
+            return
+        }
+        if firstPresentationTime == nil, !input.isReadyForMoreMediaData {
+            // Capture time zero is the first committed frame, never a frame
+            // that backpressure prevented from entering the source movie.
+            droppedBackpressureFrameCount += 1
             return
         }
         var firstFrameMessage: String?
         if firstPresentationTime == nil {
             firstPresentationTime = presentationTime
-            let attachments = CMSampleBufferGetSampleAttachmentsArray(
-                sampleBuffer, createIfNecessary: false
-            ) as? [[SCStreamFrameInfo: Any]]
-            let info = attachments?.first
-            let scaleFactor = (info?[.scaleFactor] as? NSNumber)?.doubleValue ?? .nan
-            let contentScale = (info?[.contentScale] as? NSNumber)?.doubleValue ?? .nan
             let bufferWidth = CMSampleBufferGetImageBuffer(sampleBuffer).map(CVPixelBufferGetWidth) ?? 0
             let bufferHeight = CMSampleBufferGetImageBuffer(sampleBuffer).map(CVPixelBufferGetHeight) ?? 0
             let formatter = ISO8601DateFormatter()
             formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            let wallTime = formatter.string(from: Date())
+            let callbackHostTime = mach_absolute_time()
+            let displayDelay = metadata.displayTime.map {
+                hostTimeSeconds(callbackHostTime &- min(callbackHostTime, $0))
+            } ?? 0
+            // Anchor the action log to when WindowServer displayed the first
+            // frame, not to when this callback happened to run.
+            let wallTime = formatter.string(from: Date().addingTimeInterval(-displayDelay))
             firstFrameMessage =
                 "CAPTURE_FRAME buffer=\(bufferWidth)x\(bufferHeight) " +
-                    "scaleFactor=\(scaleFactor) contentScale=\(contentScale) " +
+                    "scaleFactor=\(metadata.scaleFactor) contentScale=\(metadata.contentScale) " +
                     "wallTime=\(wallTime) ptsSeconds=\(presentationTime.seconds)\n"
             writer.startSession(atSourceTime: presentationTime)
         }
 
-        if input.append(sampleBuffer) {
-            lastPresentationTime = presentationTime
-            frameCount += 1
-            if let firstFrameMessage { writeStandardOutput(firstFrameMessage) }
-        } else {
-            appendError = writer.error ?? CaptureError.writerSetup("Failed to append a video frame")
+        guard let firstPresentationTime else { return }
+        let sourceTime = max(0, CMTimeSubtract(presentationTime, firstPresentationTime).seconds)
+        let pixelComparison = compareCapturedPixels(sampleBuffer)
+        var disposition: FrameWriterDisposition = .notApplicable
+        if metadata.status == .complete {
+            if let lastPresentationTime,
+               CMTimeCompare(presentationTime, lastPresentationTime) <= 0
+            {
+                // Retain this as an integrity failure in the provenance ledger.
+                // A later reducer must not infer idleness across the dropped frame.
+                droppedNonMonotonicFrameCount += 1
+                disposition = .droppedNonMonotonic
+            } else if !input.isReadyForMoreMediaData {
+                droppedBackpressureFrameCount += 1
+                disposition = .droppedBackpressure
+            } else if input.append(sampleBuffer) {
+                lastPresentationTime = presentationTime
+                frameCount += 1
+                disposition = .appended
+                if let firstFrameMessage { writeStandardOutput(firstFrameMessage) }
+            } else {
+                appendFailedFrameCount += 1
+                disposition = .appendFailed
+                appendError = writer.error ?? CaptureError.writerSetup("Failed to append a video frame")
+            }
         }
+        provenanceSamples.append(CapturedFrameSample(
+            sourceTime: sourceTime,
+            displayTime: metadata.displayTime,
+            status: metadata.status,
+            dirtyRects: metadata.dirtyRects,
+            writerDisposition: disposition,
+            pixelComparison: pixelComparison
+        ))
     }
 
-    func finish() async throws -> (frameCount: Int, droppedNonMonotonicFrameCount: Int) {
-        let result: (count: Int, dropped: Int, error: Error?) = lock.withLock {
+    func finish() async throws -> (
+        frameCount: Int,
+        droppedNonMonotonicFrameCount: Int,
+        droppedBackpressureFrameCount: Int
+    ) {
+        let result: (
+            count: Int,
+            nonMonotonic: Int,
+            backpressure: Int,
+            ledger: CaptureFrameLedger,
+            error: Error?
+        ) = lock.withLock {
             input.markAsFinished()
-            return (frameCount, droppedNonMonotonicFrameCount, appendError)
+            return (
+                frameCount,
+                droppedNonMonotonicFrameCount,
+                droppedBackpressureFrameCount,
+                CaptureFrameLedger(
+                    expectedFrameInterval: expectedFrameInterval,
+                    samples: provenanceSamples,
+                    integrity: CaptureIntegrity(
+                        invalidMetadataSamples: invalidMetadataSampleCount,
+                        preRollSamples: preRollSampleCount,
+                        droppedBackpressureFrames: droppedBackpressureFrameCount,
+                        droppedNonMonotonicFrames: droppedNonMonotonicFrameCount,
+                        appendFailedFrames: appendFailedFrameCount
+                    )
+                ),
+                appendError
+            )
         }
         if let error = result.error {
             writer.cancelWriting()
@@ -226,10 +301,19 @@ final class MovieWriter: NSObject, SCStreamOutput, @unchecked Sendable {
         if let error = writer.error {
             throw error
         }
-        return (result.count, result.dropped)
+        try writeProvenance(result.ledger)
+        return (result.count, result.nonMonotonic, result.backpressure)
     }
 
-    private func isCompleteFrame(_ sampleBuffer: CMSampleBuffer) -> Bool {
+    private struct FrameMetadata {
+        let status: CapturedFrameStatus
+        let displayTime: UInt64?
+        let dirtyRects: [CaptureDamageRect]
+        let scaleFactor: Double
+        let contentScale: Double
+    }
+
+    private func frameMetadata(_ sampleBuffer: CMSampleBuffer) -> FrameMetadata? {
         guard
             let attachments = CMSampleBufferGetSampleAttachmentsArray(
                 sampleBuffer,
@@ -238,9 +322,98 @@ final class MovieWriter: NSObject, SCStreamOutput, @unchecked Sendable {
             let statusValue = attachments.first?[.status] as? Int,
             let status = SCFrameStatus(rawValue: statusValue)
         else {
-            return false
+            return nil
         }
-        return status == .complete
+        let info = attachments[0]
+        let dirtyRects = (info[.dirtyRects] as? [NSValue] ?? []).map { value in
+            let rect = value.rectValue
+            return CaptureDamageRect(
+                x: rect.minX, y: rect.minY, width: rect.width, height: rect.height
+            )
+        }
+        return FrameMetadata(
+            status: capturedStatus(status),
+            displayTime: (info[.displayTime] as? NSNumber)?.uint64Value,
+            dirtyRects: dirtyRects,
+            scaleFactor: (info[.scaleFactor] as? NSNumber)?.doubleValue ?? .nan,
+            contentScale: (info[.contentScale] as? NSNumber)?.doubleValue ?? .nan
+        )
+    }
+
+    private func capturedStatus(_ status: SCFrameStatus) -> CapturedFrameStatus {
+        switch status {
+        case .complete: .complete
+        case .idle: .idle
+        case .blank: .blank
+        case .suspended: .suspended
+        case .started: .started
+        case .stopped: .stopped
+        @unknown default: .unknown
+        }
+    }
+
+    /// Exhaustively compares every active BGRA byte before encoding. This is
+    /// not an editorial motion threshold: `identical` means the actual pixels
+    /// available to the recorder did not change between delivered frames.
+    private func compareCapturedPixels(_ sampleBuffer: CMSampleBuffer) -> CapturedPixelComparison {
+        guard let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return .unavailable }
+        guard CVPixelBufferLockBaseAddress(buffer, .readOnly) == kCVReturnSuccess else {
+            return .unavailable
+        }
+        defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(buffer) else { return .unavailable }
+        let width = CVPixelBufferGetWidth(buffer)
+        let height = CVPixelBufferGetHeight(buffer)
+        let rowBytes = CVPixelBufferGetBytesPerRow(buffer)
+        let activeRowBytes = width * 4
+        guard activeRowBytes <= rowBytes, height > 0 else { return .unavailable }
+
+        let required = activeRowBytes * height
+        if previousFramePixels?.count != required {
+            previousFramePixels = [UInt8](repeating: 0, count: required)
+            previousFramePixels!.withUnsafeMutableBytes { destination in
+                for row in 0..<height {
+                    memcpy(
+                        destination.baseAddress!.advanced(by: row * activeRowBytes),
+                        base.advanced(by: row * rowBytes),
+                        activeRowBytes
+                    )
+                }
+            }
+            return .unavailable
+        }
+
+        let identical = previousFramePixels!.withUnsafeBytes { previous in
+            for row in 0..<height where memcmp(
+                previous.baseAddress!.advanced(by: row * activeRowBytes),
+                base.advanced(by: row * rowBytes),
+                activeRowBytes
+            ) != 0 {
+                return false
+            }
+            return true
+        }
+        guard !identical else { return .identical }
+        previousFramePixels!.withUnsafeMutableBytes { destination in
+            for row in 0..<height {
+                memcpy(
+                    destination.baseAddress!.advanced(by: row * activeRowBytes),
+                    base.advanced(by: row * rowBytes),
+                    activeRowBytes
+                )
+            }
+        }
+        return .changed
+    }
+
+    private func writeProvenance(_ ledger: CaptureFrameLedger) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(ledger)
+        let temporary = provenanceURL.appendingPathExtension("tmp-\(ProcessInfo.processInfo.processIdentifier)")
+        try data.write(to: temporary, options: .atomic)
+        try? FileManager.default.removeItem(at: provenanceURL)
+        try FileManager.default.moveItem(at: temporary, to: provenanceURL)
     }
 }
 
@@ -311,9 +484,11 @@ struct CaptureApp {
             }
             let movieWriter = try MovieWriter(
                 outputURL: options.outputURL,
+                provenanceURL: options.outputURL.deletingPathExtension().appendingPathExtension("capture.json"),
                 width: width,
                 height: height,
-                codec: options.codec
+                codec: options.codec,
+                framesPerSecond: options.framesPerSecond
             )
             let stream = SCStream(filter: filter, configuration: configuration, delegate: nil)
             let outputQueue = DispatchQueue(label: "agentrecorder.capture.video", qos: .userInteractive)
@@ -331,7 +506,9 @@ struct CaptureApp {
             writeStandardOutput(
                 "CAPTURE_COMPLETE reason=\(stopReason.rawValue) frames=\(result.frameCount) " +
                     "droppedNonMonotonicFrames=\(result.droppedNonMonotonicFrameCount) " +
-                    "output=\(options.outputURL.path)\n"
+                    "droppedBackpressureFrames=\(result.droppedBackpressureFrameCount) " +
+                    "output=\(options.outputURL.path) " +
+                    "provenance=\(options.outputURL.deletingPathExtension().appendingPathExtension("capture.json").path)\n"
             )
         } catch {
             FileHandle.standardError.write(Data("capture-app: \(error.localizedDescription)\n".utf8))
@@ -343,6 +520,12 @@ struct CaptureApp {
 
 private func writeStandardOutput(_ message: String) {
     FileHandle.standardOutput.write(Data(message.utf8))
+}
+
+private func hostTimeSeconds(_ ticks: UInt64) -> Double {
+    var info = mach_timebase_info_data_t()
+    mach_timebase_info(&info)
+    return Double(ticks) * Double(info.numer) / Double(info.denom) / 1_000_000_000
 }
 
 private enum StopReason: String, Sendable { case requested, timeout }

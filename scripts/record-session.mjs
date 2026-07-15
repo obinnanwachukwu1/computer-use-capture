@@ -5,9 +5,10 @@ import { mkdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
 import { extractComputerUseEvents, findCodexSessions } from "../lib/codex-events.mjs";
+import { CodexEventTailer } from "../lib/codex-event-tailer.mjs";
 import { findScreenshotCoordinateSpaces } from "../lib/codex-screenshots.mjs";
 import { mapEventCoordinates } from "../lib/coordinate-mapper.mjs";
-import { resolveAccessibilityTarget } from "../lib/accessibility-resolver.mjs";
+import { resolveAccessibilityTargets } from "../lib/accessibility-resolver.mjs";
 import { redactAccessibilityObservation, redactEventForPersistence } from "../lib/redaction.mjs";
 
 const repoRoot = path.resolve(import.meta.dirname, "..");
@@ -29,6 +30,7 @@ if (!initialCandidates.length) throw new Error(`Could not find a Codex session f
 let session = initialCandidates[0];
 const videoPath = `${outputBase}.mov`;
 const timelinePath = `${outputBase}.timeline.json`;
+const frameProvenancePath = `${outputBase}.capture.json`;
 const accessibilityPath = `${outputBase}.accessibility.jsonl`;
 const privateAccessibilityPath = `${outputBase}.accessibility.private.tmp`;
 const accessibilityStream = createWriteStream(privateAccessibilityPath, { encoding: "utf8", mode: 0o600 });
@@ -78,8 +80,12 @@ let captureHeight;
 let captureScale;
 let captureCodec;
 let captureMode;
+let captureFrames;
+let droppedNonMonotonicFrames = 0;
+let droppedBackpressureFrames = 0;
 let captureReady = false;
 let stopRequested = false;
+let liveTailersPromise;
 const expectedParentPID = Number(process.env.AGENTRECORDER_PARENT_PID);
 if (Number.isInteger(expectedParentPID)) {
   const parentWatch = setInterval(() => {
@@ -104,6 +110,22 @@ readline.createInterface({ input: child.stdout, crlfDelay: Infinity }).on("line"
   }
   if (line.startsWith("CAPTURE_FRAME") && !captureStartedAt) {
     captureStartedAt = line.match(/wallTime=([^\s]+)/)?.[1] ?? new Date().toISOString();
+    liveTailersPromise = Promise.all(initialCandidates.map(async candidate => {
+      try {
+        const tailer = await new CodexEventTailer({
+          sessionFile: candidate.file,
+          captureStartedAt,
+          onProgress: progress => {
+            if (progress.type === "events") {
+              process.stdout.write(`INTROSPECTION_LIVE events=${progress.eventCount}\n`);
+            }
+          }
+        }).start();
+        return { candidate, tailer };
+      } catch (error) {
+        return { candidate, error };
+      }
+    }));
     process.stdout.write(
       `RECORDING_READY thread=${session.threadId ?? "unknown"} ` +
       `startedAt=${captureStartedAt} stop=send-newline maxDuration=${maximumDuration}s output=${videoPath}\n`
@@ -111,6 +133,9 @@ readline.createInterface({ input: child.stdout, crlfDelay: Infinity }).on("line"
   }
   if (line.startsWith("CAPTURE_COMPLETE")) {
     captureEndedAt = new Date().toISOString();
+    captureFrames = Number(line.match(/frames=(\d+)/)?.[1]);
+    droppedNonMonotonicFrames = Number(line.match(/droppedNonMonotonicFrames=(\d+)/)?.[1] ?? 0);
+    droppedBackpressureFrames = Number(line.match(/droppedBackpressureFrames=(\d+)/)?.[1] ?? 0);
   }
 });
 
@@ -143,10 +168,22 @@ captureEndedAt ??= new Date().toISOString();
 const finalCandidates = explicitSession ? [explicitSession]
   : await findCodexSessions({ cwd: process.cwd(), threadId: process.env.AGENTRECORDER_THREAD_ID });
 const settleResults = await Promise.all(finalCandidates.map(candidate => waitForFileQuiescence(candidate.file)));
-const candidateExtractions = await Promise.all(finalCandidates.map(async candidate => ({
-  candidate,
-  extracted: await extractComputerUseEvents({ sessionFile: candidate.file, captureStartedAt, captureEndedAt })
-})));
+const liveTailers = await (liveTailersPromise ?? Promise.resolve([]));
+const liveByFile = new Map(liveTailers.map(item => [item.candidate.file, item]));
+const candidateExtractions = await Promise.all(finalCandidates.map(async candidate => {
+  const live = liveByFile.get(candidate.file);
+  if (live?.tailer) {
+    try {
+      return { candidate, extracted: await live.tailer.stop({ captureEndedAt }) };
+    } catch (error) {
+      live.error = error;
+    }
+  }
+  return {
+    candidate,
+    extracted: await extractComputerUseEvents({ sessionFile: candidate.file, captureStartedAt, captureEndedAt })
+  };
+}));
 const activeExtractions = candidateExtractions.filter(item => item.extracted.events.length > 0);
 const ambiguous = activeExtractions.length > 1;
 if (activeExtractions.length === 1) session = activeExtractions[0].candidate;
@@ -163,6 +200,19 @@ const extracted = ambiguous
       adapter: { status: "degraded", formatFingerprint: "ambiguous", observedShapes: [] }
     }
   : (activeExtractions[0]?.extracted ?? candidateExtractions[0].extracted);
+for (const item of liveTailers) {
+  if (!item.error) continue;
+  extracted.warnings.push({
+    type: "live_introspection_failed",
+    message: "Live Codex log tailing failed; stop-time reconstruction was used"
+  });
+}
+if (extracted.live?.invalidCompleteLines || extracted.live?.invalidTrailingRecord) {
+  extracted.warnings.push({
+    type: "live_introspection_malformed_record",
+    message: "The live Codex log contained an incomplete or malformed JSONL record"
+  });
+}
 const semanticObservations = await processAccessibilitySidecar({
   privatePath: privateAccessibilityPath,
   publicPath: accessibilityPath,
@@ -171,34 +221,41 @@ const semanticObservations = await processAccessibilitySidecar({
 });
 const reconstruction = {
   status: ambiguous ? "ambiguous"
-    : settleResults.some(result => result.status === "truncated") ? "truncated" : "settled",
+    : (settleResults.some(result => result.status === "truncated")
+      || candidateExtractions.some(item => item.extracted.live?.invalidCompleteLines || item.extracted.live?.invalidTrailingRecord))
+      ? "truncated" : "settled",
   candidateSessions: finalCandidates.length,
   activeSessions: activeExtractions.length,
-  settleWaitMs: Math.max(0, ...settleResults.map(result => result.waitedMs))
+  settleWaitMs: Math.max(0, ...settleResults.map(result => result.waitedMs)),
+  mode: candidateExtractions.some(item => item.extracted.live) ? "live-incremental" : "stop-time-fallback",
+  liveBytesRead: candidateExtractions.reduce((sum, item) => sum + (item.extracted.live?.bytesRead ?? 0), 0)
 };
 const screenshotSpaces = await findScreenshotCoordinateSpaces({
   appName: targetAppName,
   referenceTimes: extracted.events.map(event => Date.parse(event.timestamp))
 });
-const mappedEvents = extracted.events
-  .map((event, index) => mapEventCoordinates({
+const coordinateMappedEvents = extracted.events.map((event, index) => mapEventCoordinates({
     event,
     screenshotSpace: screenshotSpaces[index],
     captureWidth,
     captureHeight,
     observations: semanticObservations
-  }))
-  .map(event => resolveAccessibilityTarget({
-    event,
-    observations: semanticObservations,
-    captureStartedAt,
-    captureWidth,
-    captureHeight
-  }))
+  }));
+const mappedEvents = resolveAccessibilityTargets({
+  events: coordinateMappedEvents,
+  observations: semanticObservations,
+  captureStartedAt,
+  captureWidth,
+  captureHeight
+})
   .map(redactEventForPersistence);
 const occlusionSpans = frontmostOcclusionSpans(semanticObservations, captureStartedAt, captureEndedAt);
 const warnings = [
   ...extracted.warnings,
+  ...((droppedNonMonotonicFrames + droppedBackpressureFrames) > 0 ? [{
+    type: "capture_integrity_degraded",
+    message: `ScreenCaptureKit writer dropped ${droppedNonMonotonicFrames + droppedBackpressureFrames} complete frame(s); waiting reduction will preserve uncertain intervals`
+  }] : []),
   ...mappedEvents.filter(event => event.coordinateResolution?.provenance === "unresolved")
     .map(event => ({ type: "coordinate_unresolved", actionId: event.actionId, message: event.coordinateResolution.reason })),
   ...semanticObserverErrors.filter(Boolean).map(message => ({ type: "semantic_observer", message })),
@@ -219,7 +276,13 @@ const timeline = {
     height: captureHeight,
     pointPixelScale: captureScale,
     codec: captureCodec,
-    mode: captureMode
+    mode: captureMode,
+    frameProvenance: frameProvenancePath,
+    integrity: {
+      frames: captureFrames,
+      droppedNonMonotonicFrames,
+      droppedBackpressureFrames
+    }
   },
   introspection: {
     adapter: "codex-rollout-jsonl",

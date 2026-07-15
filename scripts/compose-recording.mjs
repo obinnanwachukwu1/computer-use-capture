@@ -38,7 +38,15 @@ const keepWaiting = cliArgs.includes("--keep-waiting")
 nativeArgs.push(keepWaiting ? "--keep-waiting" : "--reduce-waiting");
 if (cliArgs.includes("--director-debug")) nativeArgs.push("--director-debug");
 if (cliArgs.includes("--plan-only")) nativeArgs.push("--plan-only");
-for (const flag of ["--cursor-path", "--cursor-tilt-strength"]) {
+if (cliArgs.includes("--no-analysis-cache")) nativeArgs.push("--no-analysis-cache");
+if (cliArgs.includes("--profile")) {
+  const index = cliArgs.indexOf("--profile");
+  nativeArgs.push("--profile");
+  if (cliArgs[index + 1] !== undefined && !cliArgs[index + 1].startsWith("--")) {
+    nativeArgs.push(path.resolve(cliArgs[index + 1]));
+  }
+}
+for (const flag of ["--camera-planner", "--cursor-path", "--cursor-tilt-strength"]) {
   const index = cliArgs.indexOf(flag);
   if (index >= 0 && cliArgs[index + 1] !== undefined) nativeArgs.push(flag, cliArgs[index + 1]);
 }

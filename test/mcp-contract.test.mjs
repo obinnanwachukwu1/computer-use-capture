@@ -19,6 +19,13 @@ test("recorder_start contract accepts the adapter fingerprint it emits", async (
     recordingId: "rec_contractfingerprint",
     state: "recording",
     startedAt: "2026-07-13T20:12:15.098Z",
+    capture: {
+      width: 2560,
+      height: 1440,
+      pixelsPerPoint: 2,
+      codec: "hevc",
+      mode: "application"
+    },
     introspection: {
       codexSession: "attached",
       formatFingerprint: "d2bcf99da22c6aeb"

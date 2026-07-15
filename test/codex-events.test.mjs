@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -9,9 +9,13 @@ import {
   mergeAccessibilityState,
   parseAccessibilityElements
 } from "../lib/codex-events.mjs";
-import { resolveAccessibilityTarget } from "../lib/accessibility-resolver.mjs";
+import {
+  resolveAccessibilityTarget,
+  resolveAccessibilityTargets
+} from "../lib/accessibility-resolver.mjs";
 import { mapEventCoordinates, validateCoordinateSpace } from "../lib/coordinate-mapper.mjs";
 import { redactEventForPersistence } from "../lib/redaction.mjs";
+import { CodexEventTailer } from "../lib/codex-event-tailer.mjs";
 
 test("extracts unchanged sky x-y actions through local variables", () => {
   const calls = extractSkyCalls(`
@@ -263,6 +267,25 @@ test("resolves native geometry by identity, post-action focus, and structural an
   assert.equal(localizedRoleIdentity.targetResolution.provenance, "ax-identity");
   assert.equal(localizedRoleIdentity.semanticTarget.nativeElementIndex, 4);
 
+  const initialWatcherSnapshot = resolveAccessibilityTarget({
+    event: {
+      ...base,
+      timestamp: "2026-07-13T14:09:55.800Z",
+      accessibilityTarget: { role: "text entry area", identifier: "First Text View" }
+    },
+    observations: [{
+      // The watcher intentionally starts before capture commits its first
+      // frame, so the initial full tree can lead captureStartedAt slightly.
+      observedAt: "2026-07-13T14:09:55.600Z", windowBounds,
+      elements: [{
+        index: 4, role: "AXTextArea", identifier: "First Text View",
+        bounds: { x: 120, y: 100, width: 900, height: 700 }
+      }]
+    }],
+    captureStartedAt: "2026-07-13T14:09:55.700Z", captureWidth: 1000, captureHeight: 800
+  });
+  assert.equal(initialWatcherSnapshot.targetResolution.provenance, "ax-identity");
+
   const visibleIdentity = resolveAccessibilityTarget({
     event: { ...base, accessibilityTarget: { role: "button", label: "Create monitor" } },
     observations: [
@@ -389,6 +412,80 @@ test("resolves native geometry by identity, post-action focus, and structural an
   assert.equal(namedMissingSibling.targetResolution.provenance, "unresolved");
 });
 
+test("ordered Computer Use focus ownership outranks a lagging AX focus snapshot", () => {
+  const windowBounds = { x: 100, y: 50, width: 1000, height: 800 };
+  const timing = {
+    toolCallStartedAt: "2026-07-13T14:09:55.000Z",
+    toolCallEndedAt: "2026-07-13T14:09:56.300Z"
+  };
+  const events = [
+    {
+      actionId: "click-name", timestamp: "2026-07-13T14:09:55.200Z", action: "click",
+      args: { element_index: 12 }, timing,
+      accessibilityTarget: { role: "text entry area", label: "Monitor name" }
+    },
+    {
+      actionId: "select-name", timestamp: "2026-07-13T14:09:55.400Z", action: "press_key",
+      args: { key: "CMD+A" }, timing
+    },
+    {
+      actionId: "newline-name", timestamp: "2026-07-13T14:09:55.500Z", action: "press_key",
+      args: { key: "Return" }, timing
+    },
+    {
+      actionId: "type-name", timestamp: "2026-07-13T14:09:55.600Z", action: "type_text",
+      args: { text: "Production API" }, timing
+    }
+  ];
+  const observations = [{
+    observedAt: "2026-07-13T14:09:55.250Z", windowBounds, focused: true,
+    role: "AXTextField", title: "Alert threshold",
+    bounds: { x: 650, y: 650, width: 300, height: 36 },
+    elements: [{
+      index: 30, role: "AXTextArea", title: "Monitor name", identifier: "Monitor name",
+      bounds: { x: 200, y: 650, width: 300, height: 36 }
+    }]
+  }];
+  const resolved = resolveAccessibilityTargets({
+    events, observations, captureStartedAt: "2026-07-13T14:00:00.000Z",
+    captureWidth: 1000, captureHeight: 800
+  });
+
+  assert.equal(resolved[0].semanticTarget.nativeElementIndex, 30);
+  assert.equal(resolved[1].semanticTarget.title, "Monitor name");
+  assert.equal(resolved[2].semanticTarget.title, "Monitor name");
+  assert.equal(resolved[3].semanticTarget.title, "Monitor name");
+  assert.equal(resolved[3].targetResolution.focusOwnership, "computer-use-sequence");
+  assert.equal(resolved[3].coordinates.captureX, resolved[0].coordinates.captureX);
+});
+
+test("an explicit non-text activation ends Computer Use focus ownership", () => {
+  const windowBounds = { x: 0, y: 0, width: 1000, height: 800 };
+  const timing = {
+    toolCallStartedAt: "2026-07-13T14:09:55.000Z",
+    toolCallEndedAt: "2026-07-13T14:09:56.300Z"
+  };
+  const observations = [{
+    observedAt: "2026-07-13T14:09:55.100Z", windowBounds,
+    elements: [
+      { index: 1, role: "AXTextField", title: "Name", bounds: { x: 100, y: 100, width: 300, height: 36 } },
+      { index: 2, role: "AXButton", title: "Save", bounds: { x: 800, y: 700, width: 100, height: 36 } }
+    ]
+  }];
+  const resolved = resolveAccessibilityTargets({
+    events: [
+      { timestamp: "2026-07-13T14:09:55.100Z", action: "click", args: { element_index: 1 }, timing, accessibilityTarget: { role: "text field", label: "Name" } },
+      { timestamp: "2026-07-13T14:09:55.300Z", action: "click", args: { element_index: 2 }, timing, accessibilityTarget: { role: "button", label: "Save" } },
+      { timestamp: "2026-07-13T14:09:55.500Z", action: "type_text", args: { text: "must not inherit" }, timing }
+    ],
+    observations, captureStartedAt: "2026-07-13T14:00:00.000Z",
+    captureWidth: 1000, captureHeight: 800
+  });
+
+  assert.equal(resolved[2].targetResolution.provenance, "unresolved");
+  assert.equal(resolved[2].semanticTarget, undefined);
+});
+
 test("records a semantic viewport relocation when Computer Use brings an offscreen target into view", () => {
   const event = {
     timestamp: "2026-07-13T14:09:55.500Z",
@@ -467,6 +564,45 @@ test("normalizes both historical direct MCP and current node_repl envelopes", as
     ["click", "direct-mcp"],
     ["press_key", "node-repl-sky"]
   ]);
+});
+
+test("live tailing preserves prior AX state and waits for complete appended JSONL", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "agentrecorder-live-tail-"));
+  const sessionFile = path.join(directory, "rollout.jsonl");
+  const record = (timestamp, code, text = "") => JSON.stringify({
+    timestamp,
+    type: "event_msg",
+    payload: {
+      type: "mcp_tool_call_end",
+      invocation: { server: "node_repl", tool: "js", arguments: { code } },
+      duration: { secs: 0, nanos: 100_000_000 },
+      result: { Ok: { content: text ? [{ type: "text", text }] : [] } }
+    }
+  });
+  const context = record(
+    "2026-06-17T00:00:00.500Z",
+    "await sky.get_app_state({app:'com.apple.Safari'})",
+    "11 button Start practicing"
+  );
+  const action = record(
+    "2026-06-17T00:00:02.000Z",
+    "await sky.click({app:'com.apple.Safari', element_index:11})"
+  );
+  const split = Math.floor(action.length / 2);
+  await writeFile(sessionFile, `${context}\n${action.slice(0, split)}`);
+  const tailer = new CodexEventTailer({
+    sessionFile,
+    captureStartedAt: "2026-06-17T00:00:01.000Z"
+  });
+  await tailer.poll();
+  assert.equal(tailer.snapshot().events.length, 0);
+
+  await appendFile(sessionFile, `${action.slice(split)}\n`);
+  await tailer.poll();
+  const result = tailer.snapshot({ captureEndedAt: "2026-06-17T00:00:03.000Z" });
+  assert.equal(result.events.length, 1);
+  assert.equal(result.events[0].accessibilityTarget.label, "Start practicing");
+  assert.equal(result.live.invalidCompleteLines, 0);
 });
 
 test("carries only statically proven values across persistent node_repl invocations", async () => {

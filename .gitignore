@@ -10,11 +10,19 @@ Package.resolved
 
 # Node dependencies and tool caches
 node_modules/
+__pycache__/
+*.pyc
 .npm/
 *.log
 
+# Python analysis helpers
+__pycache__/
+*.py[cod]
+
 # Recorder inputs, rendered videos, frame dumps, and generated assets
 artifacts/
+.benchmarks/
+*.motion-analysis.cache.json
 
 # Local configuration and credentials
 .env

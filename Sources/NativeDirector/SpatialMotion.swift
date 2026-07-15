@@ -16,6 +16,31 @@ public struct DetectedMotionComponent: Sendable {
 }
 
 public enum SpatialMotion {
+    /// The raw component stream intentionally remains sensitive for waiting
+    /// detection and diagnostics. Camera evidence requires a materially sized,
+    /// non-viewport response; tiny glyph/caret deltas and coherent translation
+    /// are retained in reports but cannot direct framing.
+    public static func isFramingEligible(
+        _ observation: VisualMotionObservation,
+        minimumChangedFraction: Double = 0.0015,
+        minimumAreaFraction: CGFloat = 0.008
+    ) -> Bool {
+        let bounds = observation.normalizedBounds
+        return observation.kind != .translation
+            && observation.changedFraction >= minimumChangedFraction
+            && bounds.width * bounds.height >= minimumAreaFraction
+    }
+
+    public static func hasWideFramingCandidate(
+        _ observations: [VisualMotionObservation],
+        minimumAreaFraction: CGFloat = 0.06
+    ) -> Bool {
+        observations.contains { observation in
+            isFramingEligible(observation)
+                && observation.normalizedBounds.width * observation.normalizedBounds.height >= minimumAreaFraction
+        }
+    }
+
     /// Localized translations immediately following activation are part of
     /// the action response (for example chart bars changing height or a
     /// disclosure expanding). Broad coherent translation still describes the

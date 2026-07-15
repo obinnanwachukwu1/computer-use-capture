@@ -1,7 +1,7 @@
 {
-  "$comment": "Source-of-truth contract for the Agent Recorder MCP server. ONLY the objects under `tools` are MCP wire payloads (returned verbatim by `tools/list`). Every other top-level section (contract, identifiers, stateMachines, errorModel, provenance, concurrency, artifacts) is authoring metadata for the server implementation and is NOT part of the MCP wire protocol.",
+  "$comment": "Source-of-truth contract for the Computer Use Capture MCP server. ONLY the objects under `tools` are MCP wire payloads (returned verbatim by `tools/list`). Every other top-level section (contract, identifiers, stateMachines, errorModel, provenance, concurrency, artifacts) is authoring metadata for the server implementation and is NOT part of the MCP wire protocol.",
   "contract": {
-    "name": "agent-recorder",
+    "name": "computer-use-capture",
     "contractVersion": "1.0.0",
     "mcpProtocolRevision": "2025-11-25",
     "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
@@ -197,6 +197,14 @@
               },
               "codec": {
                 "type": "string"
+              },
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "application",
+                  "window"
+                ],
+                "description": "The ScreenCaptureKit filtering mode selected for this recording."
               }
             },
             "additionalProperties": false

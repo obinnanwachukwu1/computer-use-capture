@@ -10,6 +10,15 @@ struct MotionAnalysis {
     let motionFrames: Int
     let observations: [VisualMotionObservation]
     let interactionPhases: [Int: InteractionPhases]
+    let motionFields: [ActionMotionField]
+}
+
+struct ActionMotionField {
+    let actionID: Int
+    let field: MotionField
+    let isActivationResponse: Bool
+    let activeFocus: CGRect?
+    let focusTransition: MotionFocusTransition?
 }
 
 struct InteractionTimingProbe {
@@ -19,6 +28,8 @@ struct InteractionTimingProbe {
     let toolEnd: Double
     let finalActionInToolCall: Bool
     let normalizedTarget: CGRect
+    let hasSpatialTarget: Bool
+    let focusIntent: MotionFocusIntent
 }
 
 private struct ResponseFrame {
@@ -32,12 +43,13 @@ enum MotionAnalyzer {
         track: AVAssetTrack,
         context: CIContext,
         sourceDuration: Double,
-        actionTimes: [Double] = [],
+        fallbackActionTimes: [Int: Double] = [:],
         timingProbes: [InteractionTimingProbe] = [],
         relocationActionIDs: Set<Int> = [],
         samplesPerSecond: Double = 12,
         channelThreshold: Int = 20,
-        changedPixelFraction: Double = 0.00004
+        changedPixelFraction: Double = 0.00004,
+        collectMotionFields: Bool = false
     ) throws -> MotionAnalysis {
         let reader = try AVAssetReader(asset: asset)
         let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
@@ -66,7 +78,9 @@ enum MotionAnalyzer {
         var localPrevious: [Int: [UInt8]] = [:]
         var localActivity: [Int: [InteractionActivitySample]] = [:]
         var responseFrames: [Int: [ResponseFrame]] = [:]
+        var fallbackObservations: [Int: [VisualMotionObservation]] = [:]
         var nextProgressTime = 10.0
+        let probedActionIDs = Set(timingProbes.map(\.actionID))
 
         while autoreleasepool(invoking: {
             guard let sample = output.copyNextSampleBuffer() else { return false }
@@ -132,7 +146,7 @@ enum MotionAnalyzer {
                 print("motion analysis \(percent)% source=\(Int(time))s/\(Int(sourceDuration))s samples=\(sampledFrames)")
                 nextProgressTime += 10
             }
-            for (index, actionTime) in actionTimes.enumerated() {
+            for (index, actionTime) in fallbackActionTimes {
                 if time <= actionTime - 0.85 { baselineSnapshots[index] = pixels }
                 if time <= actionTime - 0.1 { beforeSnapshots[index] = pixels }
                 if afterSnapshots[index] == nil, time >= actionTime + 0.75 { afterSnapshots[index] = pixels }
@@ -151,7 +165,7 @@ enum MotionAnalyzer {
         guard reader.status == .completed else {
             throw Failure(reader.error?.localizedDescription ?? "motion analysis failed")
         }
-        for (index, actionTime) in actionTimes.enumerated() {
+        for (index, actionTime) in fallbackActionTimes {
             guard let before = beforeSnapshots[index], let after = afterSnapshots[index] else { continue }
             let response = SpatialMotion.components(
                 previous: before, current: after, width: analysisWidth, height: analysisHeight,
@@ -163,7 +177,7 @@ enum MotionAnalyzer {
                     channelThreshold: channelThreshold, changedPixelFraction: changedPixelFraction
                 )
             } ?? []
-            observations += SpatialMotion.causalComponents(baseline: baseline, response: response).map {
+            fallbackObservations[index] = SpatialMotion.causalComponents(baseline: baseline, response: response).map {
                 VisualMotionObservation(time: actionTime + 0.75, normalizedBounds: $0.normalizedBounds, changedFraction: $0.changedFraction, magnitude: $0.magnitude, kind: $0.kind)
             }
         }
@@ -186,43 +200,74 @@ enum MotionAnalyzer {
         // real response during ambient-motion rejection.
         let responseWidth = analysisWidth / 2
         let responseHeight = analysisHeight / 2
-        for probe in timingProbes {
+        // Preserve the default detector's normalized grid density after the
+        // response frames are downsampled for bounded memory. A fixed six-pixel
+        // tile at half resolution doubles focus padding and merges foreground
+        // features that remain distinct in the detector debugger.
+        let responseConfiguration = MotionFieldConfiguration(
+            tileSize: MotionFieldConfiguration.normalizedTileSize(forRasterWidth: responseWidth),
+            maximumShift: 28,
+            shiftStep: 4
+        )
+        var actionsWithEligibleActivationResponse = Set<Int>()
+        var motionFields: [ActionMotionField] = []
+        var focusTracker = MotionFocusTracker()
+        for probe in timingProbes.sorted(by: { $0.rawEstimate < $1.rawEstimate }) {
             guard let phase = interactionPhases[probe.actionID],
-                  let frames = responseFrames[probe.actionID], frames.count >= 2,
-                  let before = frames.last(where: { $0.time <= phase.activation + 0.02 })
+                  let frames = responseFrames[probe.actionID], frames.count >= 2
             else { continue }
+            let beforeCutoff = probe.hasSpatialTarget
+                ? phase.activation + 0.02
+                : probe.rawEstimate + 0.02
+            guard let before = frames.last(where: { $0.time <= beforeCutoff }) else { continue }
             let desiredResponseTime = phase.activation + 0.68
             let after = frames.first(where: { $0.time >= desiredResponseTime })
                 ?? frames.last(where: { $0.time >= phase.activation + 0.30 })
             guard let after, after.time > before.time else { continue }
-            let rawResponse = SpatialMotion.components(
-                previous: before.pixels, current: after.pixels,
-                width: responseWidth, height: responseHeight,
-                channelThreshold: channelThreshold, changedPixelFraction: changedPixelFraction
+            let responseField = SpatialMotion.motionField(
+                previous: before.pixels,
+                current: after.pixels,
+                width: responseWidth,
+                height: responseHeight,
+                beforeTime: before.time,
+                afterTime: after.time,
+                configuration: responseConfiguration
             )
+            let rawResponse = detectedComponents(from: responseField, at: after.time)
             let classifiedResponse = SpatialMotion.postActivationResponseComponents(rawResponse)
             let response: [DetectedMotionComponent]
             if relocationActionIDs.contains(probe.actionID) {
+                response = classifiedResponse
+            } else if focusTracker.activeFocus != nil {
+                // The established foreground lifecycle is now the causal
+                // filter. Ambient subtraction can otherwise erase foreground
+                // changes while animation continues behind a modal.
                 response = classifiedResponse
             } else {
                 let baselineEnd = frames.last(where: { $0.time <= phase.activation - 0.10 })
                 let baselineStart = baselineEnd.flatMap { end in
                     frames.last(where: { $0.time <= end.time - 0.35 })
                 }
-                let baseline: [DetectedMotionComponent] = if let baselineStart, let baselineEnd {
-                    SpatialMotion.postActivationResponseComponents(SpatialMotion.components(
-                        previous: baselineStart.pixels, current: baselineEnd.pixels,
-                        width: responseWidth, height: responseHeight,
-                        channelThreshold: channelThreshold, changedPixelFraction: changedPixelFraction
-                    ))
-                } else {
-                    []
+                var baseline: [DetectedMotionComponent] = []
+                if let baselineStart, let baselineEnd {
+                    let field = SpatialMotion.motionField(
+                        previous: baselineStart.pixels,
+                        current: baselineEnd.pixels,
+                        width: responseWidth,
+                        height: responseHeight,
+                        beforeTime: baselineStart.time,
+                        afterTime: baselineEnd.time,
+                        configuration: responseConfiguration
+                    )
+                    baseline = SpatialMotion.postActivationResponseComponents(
+                        detectedComponents(from: field, at: baselineEnd.time)
+                    )
                 }
                 response = SpatialMotion.causalComponents(
                     baseline: baseline, response: classifiedResponse
                 )
             }
-            observations += response.map {
+            let causalObservations = response.map {
                 VisualMotionObservation(
                     time: after.time,
                     normalizedBounds: $0.normalizedBounds,
@@ -231,13 +276,106 @@ enum MotionAnalyzer {
                     kind: $0.kind
                 )
             }
+            let activationObservations: [VisualMotionObservation]
+            if let viewport = responseField.viewportTranslation {
+                // A registered page relocation is a scene fact, not an
+                // editorial command. Preserve localized structural response
+                // observations alongside it so a later shot planner can first
+                // orient to the new viewport and then frame what appeared.
+                focusTracker.reset()
+                let localizedStructure = responseField.structural.map { component in
+                    VisualMotionObservation(
+                        time: after.time,
+                        normalizedBounds: component.normalizedBounds,
+                        changedFraction: component.changedFraction,
+                        magnitude: component.energy,
+                        kind: .appearance,
+                        startTime: before.time
+                    )
+                }
+                activationObservations = [VisualMotionObservation(
+                    time: after.time,
+                    normalizedBounds: CGRect(x: 0, y: 0, width: 1, height: 1),
+                    changedFraction: viewport.supportFraction,
+                    magnitude: viewport.confidence,
+                    kind: .contextTransition,
+                    startTime: before.time
+                )] + localizedStructure
+            } else {
+                let trackedObservations = focusTracker.observations(
+                    for: responseField,
+                    at: after.time,
+                    intent: probe.focusIntent
+                )
+                activationObservations = trackedObservations.contains { $0.kind == .focus }
+                    ? trackedObservations
+                    : causalObservations
+            }
+            if activationObservations.contains(where: { SpatialMotion.isFramingEligible($0) }) {
+                actionsWithEligibleActivationResponse.insert(probe.actionID)
+            }
+            observations += activationObservations
+
+            if collectMotionFields {
+                motionFields.append(ActionMotionField(
+                    actionID: probe.actionID,
+                    field: responseField,
+                    isActivationResponse: true,
+                    activeFocus: focusTracker.activeFocus,
+                    focusTransition: focusTracker.lastTransition
+                ))
+                let anchors = [
+                    before,
+                    frames.first(where: { $0.time >= phase.activation + 0.20 }),
+                    frames.first(where: { $0.time >= phase.activation + 0.45 }),
+                    after
+                ].compactMap { $0 }
+                var uniqueAnchors: [ResponseFrame] = []
+                for anchor in anchors where uniqueAnchors.last?.time != anchor.time {
+                    uniqueAnchors.append(anchor)
+                }
+                for pair in zip(uniqueAnchors, uniqueAnchors.dropFirst()) where pair.1.time > pair.0.time {
+                    motionFields.append(ActionMotionField(
+                        actionID: probe.actionID,
+                        field: SpatialMotion.motionField(
+                            previous: pair.0.pixels,
+                            current: pair.1.pixels,
+                            width: responseWidth,
+                            height: responseHeight,
+                            beforeTime: pair.0.time,
+                            afterTime: pair.1.time,
+                            configuration: responseConfiguration
+                        ),
+                        isActivationResponse: false,
+                        activeFocus: focusTracker.activeFocus,
+                        focusTransition: nil
+                    ))
+                }
+            }
+        }
+        for (actionID, fallback) in fallbackObservations {
+            if !probedActionIDs.contains(actionID) {
+                observations += fallback
+                continue
+            }
+            // The activation-relative comparison is authoritative. Use the
+            // legacy wider snapshot only when a distinct post-activation
+            // response was measured but ambient-motion rejection removed all
+            // material framing candidates (animated charts are the canonical
+            // case). This preserves recall without duplicating every click.
+            if interactionPhases[actionID]?.responseOnset != nil,
+               !actionsWithEligibleActivationResponse.contains(actionID),
+               SpatialMotion.hasWideFramingCandidate(fallback) {
+                observations += fallback
+            }
         }
         return MotionAnalysis(
             ranges: MotionDetection.ranges(forMotionTimes: motionTimes),
             sampledFrames: sampledFrames,
             motionFrames: motionTimes.count,
             observations: observations,
-            interactionPhases: interactionPhases
+            interactionPhases: interactionPhases,
+            motionFields: motionFields
         )
     }
 
@@ -272,6 +410,20 @@ enum MotionAnalyzer {
             format: .RGBA8, colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!
         )
         return pixels
+    }
+
+    private static func detectedComponents(
+        from field: MotionField,
+        at time: Double
+    ) -> [DetectedMotionComponent] {
+        field.framingObservations(at: time).map {
+            DetectedMotionComponent(
+                normalizedBounds: $0.normalizedBounds,
+                changedFraction: $0.changedFraction,
+                magnitude: $0.magnitude,
+                kind: $0.kind
+            )
+        }
     }
 
     private static func meanAbsoluteDifference(_ previous: [UInt8], _ current: [UInt8]) -> Double {

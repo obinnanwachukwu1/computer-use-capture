@@ -1,7 +1,7 @@
 import { readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { extractComputerUseEvents } from "../lib/codex-events.mjs";
-import { resolveAccessibilityTarget } from "../lib/accessibility-resolver.mjs";
+import { resolveAccessibilityTargets } from "../lib/accessibility-resolver.mjs";
 import { mapEventCoordinates } from "../lib/coordinate-mapper.mjs";
 import { redactEventForPersistence } from "../lib/redaction.mjs";
 
@@ -31,21 +31,20 @@ const extracted = await extractComputerUseEvents({
 const screenshots = timeline.coordinateSpace?.screenshotEvidence ?? [];
 const captureWidth = timeline.capture.width;
 const captureHeight = timeline.capture.height;
-const events = extracted.events
-  .map((event, index) => mapEventCoordinates({
+const coordinateMappedEvents = extracted.events.map((event, index) => mapEventCoordinates({
     event,
     screenshotSpace: screenshots[index],
     captureWidth,
     captureHeight,
     observations
-  }))
-  .map(event => resolveAccessibilityTarget({
-    event,
-    observations,
-    captureStartedAt: timeline.capture.startedAt,
-    captureWidth,
-    captureHeight
-  }))
+  }));
+const events = resolveAccessibilityTargets({
+  events: coordinateMappedEvents,
+  observations,
+  captureStartedAt: timeline.capture.startedAt,
+  captureWidth,
+  captureHeight
+})
   .map(redactEventForPersistence);
 
 const observerWarnings = (timeline.warnings ?? []).filter(warning => warning.type === "semantic_observer");
