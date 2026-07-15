@@ -418,7 +418,7 @@ public struct NativeComposition: Sendable {
         self.size = size
         self.reducesWaiting = reduceWaiting
         recipe = DirectorRecipe(
-            deadTimeRate: timeline.composition?.director?.deadTimeRate ?? 6,
+            deadTimeRate: timeline.composition?.director?.deadTimeRate ?? 2,
             cursorCompression: timeline.composition?.director?.cursorCompression ?? 0.1,
             zoomStrength: timeline.composition?.director?.zoomStrength ?? 1,
             cursorPath: cursorPathOverride
@@ -590,7 +590,7 @@ public struct NativeComposition: Sendable {
             return rawSourceTime(atOutputTime: outputTime)
         }
         // Convolving the piecewise-linear time map removes the instantaneous
-        // 1x/6x velocity changes without moving segment endpoints or actions.
+        // 1x/accelerated velocity changes without moving segment endpoints or actions.
         let weights: [Double] = [1, 2, 3, 4, 5, 4, 3, 2, 1]
         let total = weights.reduce(0, +)
         return zip(weights.indices, weights).reduce(0) { sum, pair in
@@ -1418,9 +1418,11 @@ public struct NativeComposition: Sendable {
         let initial = CGPoint(x: size.width * 0.16, y: size.height * 0.16)
         return anchors.enumerated().map { index, next in
             if index == 0 {
+                let distance = hypot(next.point.x - initial.x, next.point.y - initial.y)
+                let duration = pointerTravelDuration(distance: distance, size: size)
                 return PointerTravelInterval(
                     actionID: next.actionID,
-                    start: max(0, next.time - 1.15, next.notBefore ?? 0),
+                    start: max(0, next.time - duration, next.notBefore ?? 0),
                     end: next.time,
                     from: initial,
                     to: next.point,
@@ -1442,7 +1444,7 @@ public struct NativeComposition: Sendable {
                 )
             }
             let distance = hypot(next.point.x - previous.point.x, next.point.y - previous.point.y)
-            let duration = clamp(0.36 + distance / 1_050, 0.42, 1.05)
+            let duration = pointerTravelDuration(distance: distance, size: size)
             let end = next.time - 0.08
             return PointerTravelInterval(
                 actionID: next.actionID,
@@ -1456,6 +1458,15 @@ public struct NativeComposition: Sendable {
                 )
             )
         }
+    }
+
+    /// Cursor travel uses one perceptual timing law for every non-drag trip.
+    /// Square-root distance scaling makes large crossings brisk without making
+    /// short control-to-control hops twitchy; the narrow duration band keeps
+    /// the whole demo at one consistent level of snappiness.
+    private static func pointerTravelDuration(distance: CGFloat, size: CGSize) -> Double {
+        let normalized = Double(distance / max(1, hypot(size.width, size.height)))
+        return clamp(0.30 + sqrt(max(0, normalized)) * 0.55, 0.32, 0.78)
     }
 
     private static func buildRetime(

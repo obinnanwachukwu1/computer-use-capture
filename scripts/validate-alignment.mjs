@@ -32,6 +32,20 @@ if (audit.planner?.startsWith("normal") || audit.planner?.startsWith("experiment
   }
 }
 
+for (const check of audit.causalOrdering?.checks ?? []) {
+  if (check.valid !== true) {
+    failures.push(
+      `${check.actionId ?? check.actionID} activation at ${Number(check.activation).toFixed(3)}s ` +
+      `occurs after its visual response began at ${Number(check.responseOnset).toFixed(3)}s`
+    );
+  }
+}
+if ((audit.causalOrdering?.violations ?? 0) !== (audit.causalOrdering?.checks ?? []).filter(
+  check => check.valid !== true
+).length) {
+  failures.push("causal-order violation summary does not match its checks");
+}
+
 for (const check of audit.alignment ?? []) {
   const identity = `${check.actionId ?? check.actionID}:${check.check}`;
   if (!check.visible) failures.push(`${identity} is outside the rendered frame at the factual action time`);
@@ -143,6 +157,7 @@ const summary = {
   status: failures.length ? "failed" : "passed",
   cameraMoves: audit.moves?.length ?? 0,
   actionChecks: audit.alignment?.length ?? 0,
+  causalOrderChecks: audit.causalOrdering?.checks?.length ?? 0,
   failures,
   warnings
 };

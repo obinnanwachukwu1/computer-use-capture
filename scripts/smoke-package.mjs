@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { execFile } from "node:child_process";
-import { access, mkdtemp, rm } from "node:fs/promises";
+import { access, mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -8,8 +8,9 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
 const run = promisify(execFile);
-const tarball = path.resolve(process.argv[2] ?? "");
-if (!tarball) throw new Error("usage: node scripts/smoke-package.mjs <package.tgz>");
+const packageMetadata = JSON.parse(await readFile(path.resolve("package.json"), "utf8"));
+const defaultTarball = `${packageMetadata.name}-${packageMetadata.version}.tgz`;
+const tarball = path.resolve(process.argv[2] ?? defaultTarball);
 await access(tarball);
 
 const temporary = await mkdtemp(path.join(os.tmpdir(), "computer-use-capture-package-"));
@@ -26,12 +27,21 @@ try {
     });
   }
   await access(path.join(temporary, "node_modules", ".bin", "computer-use-capture"));
+  await run(process.execPath, [
+    path.join(packageRoot, "scripts", "compose-recording.mjs"),
+    path.join(temporary, "asset-smoke"),
+    "--verify-assets-only"
+  ], { maxBuffer: 16 * 1024 * 1024 });
   const store = path.join(temporary, "store");
   const transport = new StdioClientTransport({
     command: "npx",
     args: ["--yes", "--package", tarball, "computer-use-capture"],
     cwd: temporary,
-    env: { ...process.env, COMPUTER_USE_CAPTURE_STORE: store },
+    env: {
+      ...process.env,
+      COMPUTER_USE_CAPTURE_STORE: store,
+      COMPUTER_USE_CAPTURE_DAEMON_IDLE_MS: "10000"
+    },
   });
   const client = new Client({ name: "computer-use-capture-package-smoke", version: "1.0.0" });
   await client.connect(transport);

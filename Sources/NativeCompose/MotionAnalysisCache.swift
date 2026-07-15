@@ -48,9 +48,9 @@ enum MotionAnalysisCache {
     // change. The source digest alone cannot invalidate derived evidence when
     // the implementation evolves.
     private static let formatVersion = 1
-    // Revision 3 preserves localized structural response evidence alongside a
-    // viewport translation instead of caching only the full-frame transition.
-    private static let analyzerRevision = 3
+    // Revision 4 adds energy-weighted sustained-response episodes so long
+    // animations remain first-class global planning evidence.
+    private static let analyzerRevision = 4
 
     static func resolve(
         source: URL,

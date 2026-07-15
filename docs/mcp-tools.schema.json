@@ -108,11 +108,11 @@
     "surfacing": "Per-action provenance, confidence, and unresolvedReason appear in recorder_stop and recorder_get outputs; render results report factual/inferred/omitted cursor counts."
   },
   "concurrency": {
-    "recordings": "At most one active recording per server (v1). recorder_start while one is active fails with active_recording_exists unless the idempotencyKey matches, in which case the existing recording is returned.",
+    "recordings": "All Codex tasks on the Mac coordinate through one local recorder daemon and store. At most one recording is active globally (v1). recorder_start while one is active fails with active_recording_exists unless the idempotencyKey matches, in which case the existing recording is returned.",
     "renders": "At most one render (queued or running) per recording. recorder_edit or recorder_stop(render:'auto') while one exists fails with render_in_progress carrying the running id."
   },
   "artifacts": {
-    "store": "All artifacts live under a recorder-owned project directory keyed by recordingId. No tool accepts a filesystem path as input. Outputs are returned as read-only file:// URIs with sizes.",
+    "store": "All artifacts live under a recorder-owned project directory keyed by recordingId. recorder_edit may import an absolute local image or cursor path; the recorder copies it into that project before rendering so later edits do not depend on the original file. Outputs are returned as read-only file:// URIs with sizes.",
     "retention": "Artifacts persist until recorder_discard. The accessibility sidecar may be stored value-redacted when the server is configured for redaction; timelines record adapter fingerprints for replay diagnostics."
   },
   "tools": [
@@ -284,7 +284,7 @@
               "none"
             ],
             "default": "auto",
-            "description": "'auto' enqueues the default render immediately; 'none' stops and reconstructs only (render later via recorder_edit)."
+            "description": "'auto' enqueues the recommended default render immediately; 'none' stops and reconstructs only for capture-only workflows. recorder_edit requires an inspected completed render, so use 'auto' when a polished video may be needed."
           }
         },
         "additionalProperties": false
@@ -480,7 +480,7 @@
     {
       "name": "recorder_edit",
       "title": "Edit and re-render",
-      "description": "Declaratively adjust the finished recording and enqueue a new render with the updated intent. Intents are high level (waiting reduction, zoom emphasis, cursor styling, per-action emphasis or holds); there is no frame or timeline manipulation. An empty intents object re-renders with the current settings. Returns a render job id to poll with recorder_get. Fails with render_in_progress if a render for this recording is already queued or running (cancel it first or wait).",
+      "description": "After visually inspecting a completed render, declaratively correct a specific observed defect and enqueue a new render. Do not edit from duration, quality status, or metadata alone. review.sourceRenderId must name the completed render you actually inspected, and review.reason must state the concrete visual defect being corrected. Intents are high level (waiting reduction, zoom emphasis, cursor styling, per-action emphasis or holds); there is no frame or timeline manipulation. Returns a render job id to poll with recorder_get. Fails with render_in_progress if a render for this recording is already queued or running (cancel it first or wait).",
       "annotations": {
         "readOnlyHint": false,
         "destructiveHint": false,
@@ -490,12 +490,32 @@
       "inputSchema": {
         "type": "object",
         "required": [
-          "recordingId"
+          "recordingId",
+          "review"
         ],
         "properties": {
           "recordingId": {
             "type": "string",
             "pattern": "^rec_[0-9A-Za-z]{10,}$"
+          },
+          "review": {
+            "type": "object",
+            "description": "Audit trail proving this edit responds to a concrete defect observed in an inspected completed render.",
+            "required": ["sourceRenderId", "reason"],
+            "properties": {
+              "sourceRenderId": {
+                "type": "string",
+                "pattern": "^ren_[0-9A-Za-z]{10,}$",
+                "description": "The completed render that was visually inspected before choosing these edits."
+              },
+              "reason": {
+                "type": "string",
+                "minLength": 12,
+                "maxLength": 500,
+                "description": "A specific visual defect observed in that render and addressed by the supplied intents."
+              }
+            },
+            "additionalProperties": false
           },
           "intents": {
             "type": "object",
@@ -518,6 +538,13 @@
                     "maximum": 2000,
                     "default": 100,
                     "description": "Still time retained around each cut when mode='reduce'."
+                  },
+                  "motionRate": {
+                    "type": "number",
+                    "minimum": 1,
+                    "maximum": 6,
+                    "default": 2,
+                    "description": "Playback rate for otherwise-waiting intervals that still contain verified UI motion. Factual action intervals remain at 1x."
                   }
                 },
                 "additionalProperties": false
@@ -534,6 +561,35 @@
                   }
                 },
                 "additionalProperties": false
+              },
+              "background": {
+                "description": "Canvas behind the captured window. Defaults to wallpaper artwork installed by macOS.",
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "required": ["type"],
+                    "properties": { "type": { "const": "system-wallpaper" } },
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "required": ["type", "path"],
+                    "properties": {
+                      "type": { "const": "image" },
+                      "path": { "type": "string", "minLength": 1, "description": "Absolute local path to a PNG, JPEG, or HEIC image." }
+                    },
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "required": ["type", "color"],
+                    "properties": {
+                      "type": { "const": "solid" },
+                      "color": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}([0-9A-Fa-f]{2})?$" }
+                    },
+                    "additionalProperties": false
+                  }
+                ]
               },
               "cursor": {
                 "type": "object",
@@ -562,6 +618,27 @@
                     "type": "boolean",
                     "default": false,
                     "description": "When true, actions whose target was heuristically inferred (not factual) may render a cursor. Default false: inferred targets influence framing only."
+                  },
+                  "asset": {
+                    "description": "Cursor artwork. The default is exported from the installed macOS cursor resources.",
+                    "oneOf": [
+                      {
+                        "type": "object",
+                        "required": ["type"],
+                        "properties": { "type": { "const": "system" } },
+                        "additionalProperties": false
+                      },
+                      {
+                        "type": "object",
+                        "required": ["type", "path", "metadataPath"],
+                        "properties": {
+                          "type": { "const": "image" },
+                          "path": { "type": "string", "minLength": 1, "description": "Absolute local path to cursor PNG artwork." },
+                          "metadataPath": { "type": "string", "minLength": 1, "description": "Absolute local path to JSON containing logicalWidth, logicalHeight, hotspotX, and hotspotY." }
+                        },
+                        "additionalProperties": false
+                      }
+                    ]
                   }
                 },
                 "additionalProperties": false
@@ -619,7 +696,8 @@
         "required": [
           "recordingId",
           "renderId",
-          "state"
+          "state",
+          "review"
         ],
         "properties": {
           "recordingId": {
@@ -632,6 +710,15 @@
           "state": {
             "type": "string",
             "const": "queued"
+          },
+          "review": {
+            "type": "object",
+            "required": ["sourceRenderId", "reason"],
+            "properties": {
+              "sourceRenderId": { "type": "string" },
+              "reason": { "type": "string" }
+            },
+            "additionalProperties": false
           },
           "effectiveIntents": {
             "type": "object",
@@ -1026,6 +1113,15 @@
                   },
                   "additionalProperties": false
                 }
+              },
+              "quality": {
+                "type": "object",
+                "required": ["status", "issues"],
+                "properties": {
+                  "status": { "type": "string", "enum": ["ok", "degraded"] },
+                  "issues": { "type": "array", "items": { "type": "string" } }
+                },
+                "additionalProperties": false
               },
               "error": {
                 "type": "object",

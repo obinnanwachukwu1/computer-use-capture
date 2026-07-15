@@ -70,6 +70,7 @@ enum MotionAnalyzer {
         var nextSampleTime = 0.0
         var previous: [UInt8]?
         var motionTimes: [Double] = []
+        var globalMotionComponents: [(time: Double, component: DetectedMotionComponent)] = []
         var observations: [VisualMotionObservation] = []
         var sampledFrames = 0
         var beforeSnapshots: [Int: [UInt8]] = [:]
@@ -157,7 +158,10 @@ enum MotionAnalyzer {
                     channelThreshold: channelThreshold, changedPixelFraction: changedPixelFraction,
                     classifyTranslations: false
                 )
-                if !components.isEmpty { motionTimes.append(time) }
+                if !components.isEmpty {
+                    motionTimes.append(time)
+                    globalMotionComponents += components.map { (time, $0) }
+                }
             }
             previous = pixels
             return true
@@ -369,14 +373,70 @@ enum MotionAnalyzer {
                 observations += fallback
             }
         }
+        let motionRanges = MotionDetection.ranges(forMotionTimes: motionTimes)
+        observations += sustainedMotionObservations(
+            ranges: motionRanges,
+            components: globalMotionComponents
+        )
         return MotionAnalysis(
-            ranges: MotionDetection.ranges(forMotionTimes: motionTimes),
+            ranges: motionRanges,
             sampledFrames: sampledFrames,
             motionFrames: motionTimes.count,
             observations: observations,
             interactionPhases: interactionPhases,
             motionFields: motionFields
         )
+    }
+
+    private static func sustainedMotionObservations(
+        ranges: [ClosedRange<Double>],
+        components: [(time: Double, component: DetectedMotionComponent)]
+    ) -> [VisualMotionObservation] {
+        ranges.compactMap { range in
+            guard range.upperBound - range.lowerBound >= 0.75 else { return nil }
+            let episode = components.filter {
+                range.contains($0.time) && SpatialMotion.isFramingEligible(VisualMotionObservation(
+                    time: $0.time,
+                    normalizedBounds: $0.component.normalizedBounds,
+                    changedFraction: $0.component.changedFraction,
+                    magnitude: $0.component.magnitude,
+                    kind: $0.component.kind
+                ))
+            }
+            guard episode.count >= 3 else { return nil }
+            let weighted = episode.map { entry in
+                (entry, max(0.000_001, entry.component.changedFraction * max(0.1, entry.component.magnitude)))
+            }.sorted { $0.1 > $1.1 }
+            let totalWeight = weighted.reduce(0) { $0 + $1.1 }
+            var retained: [(time: Double, component: DetectedMotionComponent)] = []
+            var retainedWeight = 0.0
+            for item in weighted {
+                retained.append(item.0)
+                retainedWeight += item.1
+                if retained.count >= 3 && retainedWeight >= totalWeight * 0.85 { break }
+            }
+            guard let first = retained.first else { return nil }
+            // Treat the episode as an energy distribution. Sparse blinking,
+            // counters, and window chrome may change during a long animation,
+            // but they must not expand the subject beyond the regions carrying
+            // the overwhelming majority of visual change.
+            let bounds = retained.dropFirst().reduce(first.component.normalizedBounds) {
+                $0.union($1.component.normalizedBounds)
+            }.intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
+            guard !bounds.isNull, bounds.width * bounds.height >= 0.006 else { return nil }
+            let frameCount = max(1, Set(episode.map { Int(($0.time * 1000).rounded()) }).count)
+            let changed = min(1, episode.reduce(0) { $0 + $1.component.changedFraction } / Double(frameCount))
+            let magnitude = weighted.reduce(0) { $0 + $1.0.component.magnitude * $1.1 }
+                / max(0.000_001, totalWeight)
+            return VisualMotionObservation(
+                time: range.upperBound,
+                normalizedBounds: bounds,
+                changedFraction: changed,
+                magnitude: magnitude,
+                kind: .transformation,
+                startTime: range.lowerBound
+            )
+        }
     }
 
     private static func renderTimingTarget(

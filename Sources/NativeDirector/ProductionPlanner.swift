@@ -543,7 +543,12 @@ private func actionCandidates(
         }
         let responseTime = attention.evidence
             .filter { ![.pointer, .visualPointer, .accessibility, .dragPath].contains($0.source) }
-            .map { $0.timeRange.upperBound }
+            .map {
+                let duration = $0.timeRange.upperBound - $0.timeRange.lowerBound
+                return duration > 1.0
+                    ? $0.timeRange.lowerBound + min(0.55, duration)
+                    : $0.timeRange.upperBound
+            }
             .max()
             ?? timing.responseOnset
             ?? (timing.activation + 0.28)
@@ -557,6 +562,7 @@ private func actionCandidates(
         } else {
             boundaryRole = nil
         }
+        let sceneContextReward = persistentSceneContextValue(attention)
         for arrival in arrivalPoses {
             for response in responsePoses {
                 let internalTravel = hypot(response.0.x - arrival.0.x, response.0.y - arrival.0.y) / max(1, hypot(size.width, size.height))
@@ -570,6 +576,7 @@ private func actionCandidates(
                     responseTime: max(timing.activation + 0.08, responseTime),
                     boundaryRole: boundaryRole,
                     cost: timing.cost + attention.cost + arrival.1 + response.1 + internalCost
+                        - sceneContextReward
                 ))
             }
         }
@@ -609,6 +616,23 @@ private func actionCandidates(
         if $0.timing.id != $1.timing.id { return $0.timing.id < $1.timing.id }
         return $0.attention.id < $1.attention.id
     }.prefix(112))
+}
+
+private func persistentSceneContextValue(
+    _ attention: ProductionPlanGraph.AttentionHypothesis
+) -> Double {
+    attention.evidence.compactMap { evidence -> Double? in
+        guard [.visualResponse, .visualFocus].contains(evidence.source) else { return nil }
+        let duration = evidence.timeRange.upperBound - evidence.timeRange.lowerBound
+        guard duration >= 0.75 else { return nil }
+        // Persistent scene evidence is valuable even when it predates the
+        // current action and therefore cannot claim causal credit. Confidence,
+        // framing weight, and persistence keep tiny periodic deltas from
+        // overpowering factual pointer evidence, while a viewport-sized live
+        // response can justify holding a broad shot.
+        let durationValue = 0.8 + min(2.0, duration * 0.35)
+        return min(4.5, durationValue * evidence.framingWeight * (0.5 + evidence.persistence) * 1.1)
+    }.max() ?? 0
 }
 
 private func activationHypothesis(
@@ -936,6 +960,8 @@ private func attributionReuseCost(
 
 private func observationExplanationValue(_ observation: VisualMotionObservation) -> Double {
     let area = Double(observation.normalizedBounds.width * observation.normalizedBounds.height)
+    let duration = max(0, observation.time - observation.startTime)
+    let persistenceGain = min(4.5, duration * 0.28)
     let structuralGain = min(
         2.6,
         observation.changedFraction * 10
@@ -946,9 +972,9 @@ private func observationExplanationValue(_ observation: VisualMotionObservation)
     case .contextTransition: return 3.2
     case .focus: return 2.2 + min(0.9, structuralGain * 0.35)
     case .appearance:
-        return SpatialMotion.isFramingEligible(observation) ? 0.7 + structuralGain : 0.15
+        return SpatialMotion.isFramingEligible(observation) ? 0.7 + structuralGain + persistenceGain : 0.15
     case .transformation:
-        return SpatialMotion.isFramingEligible(observation) ? 0.55 + structuralGain : 0.15
+        return SpatialMotion.isFramingEligible(observation) ? 0.55 + structuralGain + persistenceGain : 0.15
     case .translation: return 0.08
     }
 }

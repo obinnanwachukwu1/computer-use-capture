@@ -1,13 +1,17 @@
 {
   "name": "computer-use-capture",
-  "version": "0.1.0",
+  "version": "0.1.4",
   "description": "Turn Codex Computer Use sessions into polished macOS product-demo videos.",
   "type": "module",
   "bin": {
     "computer-use-capture": "scripts/mcp-server.mjs"
   },
-  "os": ["darwin"],
-  "cpu": ["arm64"],
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
   "engines": {
     "node": ">=20"
   },
@@ -15,6 +19,7 @@
     "docs/mcp-tools.schema.json",
     "lib/",
     "scripts/mcp-server.mjs",
+    "scripts/recorder-daemon.mjs",
     "scripts/record-session.mjs",
     "scripts/compose-recording.mjs",
     "vendor/darwin-arm64/"

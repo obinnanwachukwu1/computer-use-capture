@@ -207,7 +207,8 @@ public enum CaptureTruthAnalyzer {
                 to: &intervals
             )
         }
-        for pair in zip(samples, samples.dropFirst()) {
+        for index in 0..<(samples.count - 1) {
+            let pair = (samples[index], samples[index + 1])
             let start = max(0, pair.0.sourceTime)
             let end = min(sourceDuration, pair.1.sourceTime)
             guard end > start else { continue }
@@ -220,6 +221,21 @@ public enum CaptureTruthAnalyzer {
                 state = .visibleChange
             } else if pair.1.pixelComparison == .identical {
                 state = .provenIdle
+            } else if pair.1.status == .idle,
+                      pair.1.writerDisposition == .notApplicable,
+                      pair.0.status != .idle,
+                      pair.1.dirtyRects.isEmpty,
+                      index + 2 < samples.count {
+                // ScreenCaptureKit may interleave an explicit idle callback
+                // between two appended frames. The following appended frame's
+                // exact pixel identity proves that the whole interval stayed
+                // unchanged; do not split one waiting episode at every idle
+                // callback and apply editorial retention hundreds of times.
+                let following = samples[index + 2]
+                state = following.sourceTime - pair.1.sourceTime <= maximumGap
+                    && !isDropped(following)
+                    && following.pixelComparison == .identical
+                    ? .provenIdle : .unknown
             } else if pair.1.status == .complete || !pair.1.dirtyRects.isEmpty {
                 // A complete frame without an exact raw-pixel comparison may
                 // contain a change. Preserve it even when dirtyRects is empty.

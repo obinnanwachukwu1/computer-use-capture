@@ -20,8 +20,10 @@ struct Options {
     let source: URL
     let timeline: URL
     let output: URL
-    let wallpaper: URL
+    let wallpaper: URL?
+    let backgroundColor: CIColor?
     let cursor: URL
+    let cursorMetadata: URL
     let fps: Int32
     let samples: Int
     let shutter: CGFloat
@@ -34,11 +36,12 @@ struct Options {
     let cameraPlanner: CameraPlanner
     let profile: URL?
     let useAnalysisCache: Bool
+    let verifyAssetsOnly: Bool
 
     static func parse() throws -> Options {
         let args = Array(CommandLine.arguments.dropFirst())
         guard args.count >= 3 else {
-            throw Failure("usage: native-compose <source.mov> <timeline.json> <output.mp4> [--experimental-camera-planner] [--output-scale 1|2] [--fps 60] [--samples 8] [--shutter 0.55] [--cursor-path natural|straight] [--cursor-tilt-strength 0...1.5] [--keep-waiting] [--waiting-time milliseconds] [--plan-only] [--director-debug] [--profile [profile.json]] [--no-analysis-cache]")
+            throw Failure("usage: native-compose <source.mov> <timeline.json> <output.mp4> [--wallpaper image] [--background-color '#RRGGBB'] [--cursor image --cursor-metadata json] [--experimental-camera-planner] [--output-scale 1|2] [--fps 60] [--samples 8] [--shutter 0.55] [--cursor-path natural|straight] [--cursor-tilt-strength 0...1.5] [--keep-waiting] [--waiting-time milliseconds] [--plan-only] [--director-debug] [--profile [profile.json]] [--no-analysis-cache]")
         }
         func value(_ flag: String, _ fallback: String) -> String {
             guard let index = args.firstIndex(of: flag), index + 1 < args.count else { return fallback }
@@ -67,6 +70,17 @@ struct Options {
             ? .experimental : .normal
         let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
         let output = URL(fileURLWithPath: args[2], relativeTo: cwd).standardizedFileURL
+        let wallpaper = optionalValue("--wallpaper").map {
+            URL(fileURLWithPath: $0, relativeTo: cwd).standardizedFileURL
+        }
+        let backgroundColor = try optionalValue("--background-color").map(parseHexColor)
+        if wallpaper != nil && backgroundColor != nil {
+            throw Failure("--wallpaper and --background-color are mutually exclusive")
+        }
+        let cursor = URL(fileURLWithPath: value("--cursor", "artifacts/macos-arrow.png"), relativeTo: cwd).standardizedFileURL
+        let cursorMetadata = URL(
+            fileURLWithPath: value("--cursor-metadata", cursor.path + ".json"), relativeTo: cwd
+        ).standardizedFileURL
         let profile: URL?
         if let index = args.firstIndex(of: "--profile") {
             if index + 1 < args.count, !args[index + 1].hasPrefix("--") {
@@ -81,8 +95,10 @@ struct Options {
             source: URL(fileURLWithPath: args[0], relativeTo: cwd).standardizedFileURL,
             timeline: URL(fileURLWithPath: args[1], relativeTo: cwd).standardizedFileURL,
             output: output,
-            wallpaper: URL(fileURLWithPath: value("--wallpaper", "artifacts/tahoe-light.jpg"), relativeTo: cwd).standardizedFileURL,
-            cursor: URL(fileURLWithPath: value("--cursor", "artifacts/macos-arrow.png"), relativeTo: cwd).standardizedFileURL,
+            wallpaper: wallpaper,
+            backgroundColor: backgroundColor,
+            cursor: cursor,
+            cursorMetadata: cursorMetadata,
             fps: max(30, Int32(value("--fps", "60")) ?? 60),
             samples: max(1, Int(value("--samples", "8")) ?? 8),
             shutter: min(1, max(0, CGFloat(Double(value("--shutter", "0.55")) ?? 0.55))),
@@ -96,7 +112,8 @@ struct Options {
             cursorTiltStrength: cursorTiltStrength,
             cameraPlanner: cameraPlanner,
             profile: profile,
-            useAnalysisCache: !args.contains("--no-analysis-cache")
+            useAnalysisCache: !args.contains("--no-analysis-cache"),
+            verifyAssetsOnly: args.contains("--verify-assets-only")
         )
     }
 }
@@ -152,6 +169,13 @@ do {
 }
 
 func render(_ options: Options) async throws {
+    if options.verifyAssetsOnly {
+        if let wallpaper = options.wallpaper { _ = try loadImage(wallpaper) }
+        _ = try loadImage(options.cursor)
+        _ = try loadCursorMetadata(options.cursorMetadata)
+        print("native render assets verified")
+        return
+    }
     let profiler = PipelineProfiler()
     let device = try require(MTLCreateSystemDefaultDevice(), "Metal is unavailable")
     let context = CIContext(mtlDevice: device, options: [.cacheIntermediates: false])
@@ -318,6 +342,8 @@ func render(_ options: Options) async throws {
         try writeCameraTrajectoryAudit(
             composition: composition, plan: cameraPlan, sampledPlan: sampledPlan,
             frameCount: totalFrames, fps: options.fps, samples: options.samples,
+            motionObservations: motionAnalysis.observations,
+            contentRect: contentRect,
             output: options.output
         )
         profiler.complete("cameraSamplingAndAudit")
@@ -375,9 +401,11 @@ func render(_ options: Options) async throws {
     }
     writer.startSession(atSourceTime: .zero)
 
-    let wallpaper = try loadImage(options.wallpaper)
+    let wallpaper = try options.wallpaper.map(loadImage)
+        ?? CIImage(color: options.backgroundColor ?? CIColor(red: 0.12, green: 0.12, blue: 0.14))
+            .cropped(to: CGRect(origin: .zero, size: outputSize))
     let cursor = try loadImage(options.cursor)
-    let cursorMetadata = try loadCursorMetadata(options.cursor)
+    let cursorMetadata = try loadCursorMetadata(options.cursorMetadata)
     let totalFrames = Int(ceil(composition.outputDuration * Double(options.fps)))
     profiler.complete("mediaPipelineSetup")
     emitProgress(phase: "rendering", percent: 0)
@@ -391,6 +419,8 @@ func render(_ options: Options) async throws {
         frameCount: totalFrames,
         fps: options.fps,
         samples: options.samples,
+        motionObservations: motionAnalysis.observations,
+        contentRect: contentRect,
         output: options.output
     )
     profiler.complete("cameraSamplingAndAudit")
@@ -915,6 +945,8 @@ private func writeCameraTrajectoryAudit(
     frameCount: Int,
     fps: Int32,
     samples: Int,
+    motionObservations: [VisualMotionObservation],
+    contentRect: CGRect,
     output: URL
 ) throws {
     let cameras = sampledPlan.states
@@ -1069,6 +1101,65 @@ private func writeCameraTrajectoryAudit(
             "scale": exp(sampled.camera.logScale)
         ]
     }
+    let causalOrdering: [[String: Any]] = composition.actions.compactMap { action in
+        guard let phase = composition.interactionPhases[action.id],
+              let responseOnset = phase.responseOnset else { return nil }
+        let tolerance = 0.08
+        return [
+            "actionID": action.id,
+            "actionId": action.actionId,
+            "kind": action.kind,
+            "activation": action.time,
+            "responseOnset": responseOnset,
+            "timingSource": phase.source,
+            "valid": action.time <= responseOnset + tolerance
+        ]
+    }
+    let sustainedResponses: [[String: Any]] = motionObservations.compactMap { observation in
+        let duration = observation.time - observation.startTime
+        guard duration >= 0.75, SpatialMotion.isFramingEligible(observation) else { return nil }
+        let sampleTime = min(observation.time, observation.startTime + 0.65)
+        let sampled = camera(atSourceTime: sampleTime)
+        let subject = CGRect(
+            x: contentRect.minX + observation.normalizedBounds.minX * contentRect.width,
+            y: contentRect.maxY - observation.normalizedBounds.maxY * contentRect.height,
+            width: observation.normalizedBounds.width * contentRect.width,
+            height: observation.normalizedBounds.height * contentRect.height
+        )
+        let minimum = projectPointThroughCamera(subject.origin, camera: sampled.camera, outputSize: logicalOutputSize)
+        let maximum = projectPointThroughCamera(
+            CGPoint(x: subject.maxX, y: subject.maxY), camera: sampled.camera, outputSize: logicalOutputSize
+        )
+        let projected = CGRect(
+            x: min(minimum.x, maximum.x), y: min(minimum.y, maximum.y),
+            width: abs(maximum.x - minimum.x), height: abs(maximum.y - minimum.y)
+        )
+        let visible = projected.intersection(CGRect(origin: .zero, size: logicalOutputSize))
+        let visibleFraction = projected.width * projected.height > 0 && !visible.isNull
+            ? visible.width * visible.height / (projected.width * projected.height) : 0
+        let visibleOccupancy = visible.width * visible.height
+            / max(1, logicalOutputSize.width * logicalOutputSize.height)
+        let scale = exp(sampled.camera.logScale)
+        // A response that already fills nearly the full viewport is correctly
+        // framed at overview; zooming further would crop its subject. Smaller
+        // sustained responses should receive a genuinely tighter shot.
+        let overviewIsTight = observation.normalizedBounds.height >= 0.85
+            || observation.normalizedBounds.width >= 0.9
+        return [
+            "sourceStart": observation.startTime,
+            "sourceEnd": observation.time,
+            "sampleOutputTime": sampled.outputTime,
+            "cameraScale": scale,
+            "visibleFraction": visibleFraction,
+            "framed": (scale >= 1.08 || overviewIsTight || visibleOccupancy >= 0.30)
+                && visibleFraction >= 0.85,
+            "visibleOccupancy": visibleOccupancy,
+            "bounds": [
+                "x": observation.normalizedBounds.minX, "y": observation.normalizedBounds.minY,
+                "width": observation.normalizedBounds.width, "height": observation.normalizedBounds.height
+            ]
+        ]
+    }
     let pointerActions = composition.actions.filter { ["click", "drag"].contains($0.kind) }
     let factualPointers = pointerActions.filter { $0.rendersCursor && isFactualCursorTarget($0) }
     let inferredRenderedPointers = pointerActions.filter { $0.rendersCursor && !isFactualCursorTarget($0) }
@@ -1099,6 +1190,14 @@ private func writeCameraTrajectoryAudit(
         "moves": moveWindows,
         "tracks": trackWindows,
         "beatScales": beatScales,
+        "causalOrdering": [
+            "checks": causalOrdering,
+            "violations": causalOrdering.filter { ($0["valid"] as? Bool) != true }.count
+        ],
+        "semanticCoverage": [
+            "sustainedResponses": sustainedResponses,
+            "unframedSustainedResponses": sustainedResponses.filter { ($0["framed"] as? Bool) != true }.count
+        ],
         "alignment": alignment
     ]
     let data = try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])
@@ -1629,9 +1728,23 @@ func overlayCursor(
     return placedCursor.composited(over: background).cropped(to: CGRect(origin: .zero, size: outputSize))
 }
 
-func loadCursorMetadata(_ cursorURL: URL) throws -> CursorMetadata {
-    let metadataURL = URL(fileURLWithPath: cursorURL.path + ".json")
+func loadCursorMetadata(_ metadataURL: URL) throws -> CursorMetadata {
     return try JSONDecoder().decode(CursorMetadata.self, from: Data(contentsOf: metadataURL))
+}
+
+func parseHexColor(_ value: String) throws -> CIColor {
+    let raw = value.trimmingCharacters(in: CharacterSet(charactersIn: "#"))
+    guard raw.count == 6 || raw.count == 8, let number = UInt64(raw, radix: 16) else {
+        throw Failure("--background-color must be #RRGGBB or #RRGGBBAA")
+    }
+    let alpha: CGFloat = raw.count == 8 ? CGFloat(number & 0xff) / 255 : 1
+    let shifted = raw.count == 8 ? number >> 8 : number
+    return CIColor(
+        red: CGFloat((shifted >> 16) & 0xff) / 255,
+        green: CGFloat((shifted >> 8) & 0xff) / 255,
+        blue: CGFloat(shifted & 0xff) / 255,
+        alpha: alpha
+    )
 }
 
 func aspectFill(_ image: CIImage, into rect: CGRect) -> CIImage {

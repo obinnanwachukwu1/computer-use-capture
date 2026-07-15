@@ -686,6 +686,62 @@ test("joins element-index actions to the preceding Computer Use accessibility st
   assert.match(result.events[0].actionId, /^act_[0-9a-f]{16}$/);
 });
 
+test("exact post-action focus overrides a stale same-number AX control", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "computer-use-capture-focus-transaction-"));
+  const sessionFile = path.join(directory, "rollout.jsonl");
+  const records = [
+    {
+      timestamp: "2026-06-17T00:00:01.000Z", type: "event_msg",
+      payload: {
+        type: "mcp_tool_call_end",
+        invocation: { server: "node_repl", tool: "js", arguments: {
+          code: "await sky.get_app_state({app:'com.apple.Safari'})"
+        } },
+        duration: { secs: 0, nanos: 100_000_000 },
+        result: { Ok: { content: [{ type: "text", text: "185 full screen button" }] } }
+      }
+    },
+    {
+      timestamp: "2026-06-17T00:00:02.000Z", type: "event_msg",
+      payload: {
+        type: "mcp_tool_call_end",
+        invocation: { server: "node_repl", tool: "js", arguments: {
+          code: "await sky.click({app:'com.apple.Safari',element_index:185}); await sky.get_app_state({app:'com.apple.Safari',disableDiff:true})"
+        } },
+        duration: { secs: 0, nanos: 200_000_000 },
+        result: { Ok: { content: [{ type: "text", text:
+          "210 full screen button\nThe focused UI element is 186 button Next step"
+        }] } }
+      }
+    }
+  ];
+  await writeFile(sessionFile, records.map(JSON.stringify).join("\n"));
+  const result = await extractComputerUseEvents({
+    sessionFile,
+    captureStartedAt: "2026-06-17T00:00:00.000Z",
+    captureEndedAt: "2026-06-17T00:00:03.000Z"
+  });
+  assert.equal(result.events[0].accessibilityTarget.role, "full screen button");
+  assert.equal(result.events[0].postActionFocus.label, "Next step");
+
+  const resolved = resolveAccessibilityTarget({
+    event: result.events[0],
+    observations: [{
+      observedAt: "2026-06-17T00:00:02.050Z",
+      windowBounds: { x: 0, y: 0, width: 1000, height: 800 },
+      elements: [
+        { index: 318, role: "AXButton", title: "Next step", bounds: { x: 700, y: 700, width: 40, height: 30 } },
+        { index: 319, role: "AXButton", title: "", bounds: { x: 40, y: 20, width: 15, height: 15 } }
+      ]
+    }],
+    captureStartedAt: "2026-06-17T00:00:00.000Z",
+    captureWidth: 1000,
+    captureHeight: 800
+  });
+  assert.equal(resolved.semanticTarget.title, "Next step");
+  assert.equal(resolved.coordinates.captureX, 720);
+});
+
 test("does not invent actions for failed Computer Use calls", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "computer-use-capture-failed-"));
   const sessionFile = path.join(directory, "rollout.jsonl");

@@ -3,6 +3,9 @@
 Computer Use Capture turns a Codex Computer Use session into a polished product-demo video. Codex starts recording, uses Computer Use normally, and stops recording. The recorder passively reconstructs the factual cursor path and produces a directed 60fps render with smooth camera movement, a native macOS cursor, motion blur, and proven waiting time removed.
 
 The recorder does not wrap or replace Computer Use. It is a local, macOS-only MCP server for Codex.
+Every Codex task connects to one shared local recorder daemon, so a recording
+started in one task is visible to subsequent MCP calls from that task even when
+Codex creates a fresh MCP stdio process.
 
 ## Requirements
 
@@ -58,7 +61,7 @@ The first permission check may open macOS Privacy & Security prompts. Grant Scre
 | `recorder_start` | Start ScreenCaptureKit capture and return once frames are being committed. |
 | `recorder_stop` | Stop capture, reconstruct the action timeline, and optionally queue a render. |
 | `recorder_get` | Read recording state or poll render progress and artifacts. |
-| `recorder_edit` | Apply high-level waiting, camera, cursor, or per-action changes and re-render. |
+| `recorder_edit` | After inspecting a completed render, apply a specific high-level correction and re-render. |
 | `recorder_cancel` | Cancel a queued or active render without deleting the recording. |
 | `recorder_discard` | Permanently delete a recording and all of its artifacts. |
 
@@ -66,7 +69,31 @@ The complete wire contract is [`docs/mcp-tools.schema.json`](docs/mcp-tools.sche
 
 ## Defaults and guarantees
 
-The default `product-demo` render uses automatic semantic framing, a native `3x` macOS cursor, motion blur, and 100 ms handles around proven-idle cuts. Visible UI motion and factual action intervals remain at normal speed.
+The default `product-demo` render uses automatic semantic framing, a native `3x` macOS cursor, motion blur, and 100 ms handles around proven-idle cuts. Factual action intervals remain at normal speed; otherwise-waiting intervals with verified UI motion play at a conservative 2x instead of being removed. Before calling `recorder_edit`, inspect a completed render and provide its render ID plus the specific visual defect being corrected; duration or quality metadata alone is not a review. `recorder_edit` can set `waiting.motionRate` from 1 to 6.
+
+The default wallpaper and cursor are loaded from the Mac's installed system
+resources. They can be replaced for a re-render with `recorder_edit`:
+
+```json
+{
+  "recordingId": "rec_...",
+  "intents": {
+    "background": { "type": "solid", "color": "#F6F7F9" },
+    "cursor": {
+      "asset": {
+        "type": "image",
+        "path": "/absolute/path/cursor.png",
+        "metadataPath": "/absolute/path/cursor.json"
+      }
+    }
+  }
+}
+```
+
+For a custom wallpaper, use `background: {"type":"image","path":"/absolute/path/image.png"}`.
+Use `system-wallpaper` and cursor asset type `system` to restore the macOS
+defaults. Custom files are copied into the private recording project before the
+render, so moving the original file does not break later edits.
 
 Computer Use is authoritative about which actions occurred. Direct coordinates and verified Accessibility matches can render a cursor; unresolved targets remain cursorless rather than being shown at a guessed location. Every factual click or drag that is rendered must remain visible throughout its interaction.
 

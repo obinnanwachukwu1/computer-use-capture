@@ -79,8 +79,17 @@ public struct ProductionPlanGraph: Sendable {
             contentRect: contentRect,
             size: composition.size
         )
+        let causalOnsets = causalResponseOnsets(
+            actions: composition.actions,
+            phases: composition.interactionPhases,
+            observations: orderedObservations.map(\.element)
+        )
         let timingByAction = Dictionary(uniqueKeysWithValues: composition.actions.map { action in
-            (action.id, timingHypotheses(for: action, phase: composition.interactionPhases[action.id]))
+            (action.id, timingHypotheses(
+                for: action,
+                phase: composition.interactionPhases[action.id],
+                causalResponseOnset: causalOnsets[action.id]
+            ))
         })
 
         var allAttributions: [AttributionHypothesis] = []
@@ -179,6 +188,40 @@ public struct ProductionPlanGraph: Sendable {
                         // may claim that observation in the global objective.
                         observationIDs: [],
                         cost: factual.isEmpty ? 0.34 : 0.18
+                    ))
+                    nextAttentionID += 1
+                }
+
+                // Long-running visual responses remain scene evidence for
+                // every action that occurs while they are active. This lets
+                // the global solver hold one useful shot through playback,
+                // progress animations, and live previews instead of treating
+                // the response as a one-frame click decoration and returning
+                // to overview at the next locationless control.
+                for entry in orderedObservations where
+                    entry.element.time - entry.element.startTime >= 0.75
+                    && entry.element.timeRange.contains(timing.activation)
+                    && SpatialMotion.isFramingEligible(entry.element) {
+                    let evidence = visualEvidence(
+                        observationID: entry.offset,
+                        observation: entry.element,
+                        actionID: action.id,
+                        contentRect: contentRect,
+                        size: composition.size
+                    )
+                    hypotheses.append(AttentionHypothesis(
+                        id: nextAttentionID,
+                        actionID: action.id,
+                        timingID: timing.id,
+                        bounds: unionBounds((factual + [evidence]).map(\.bounds)),
+                        behavior: .wideResponse,
+                        evidence: factual + [evidence],
+                        // An already-running response is scene context, not
+                        // proof that this action caused it. Keep it available
+                        // for framing without letting the action claim the
+                        // observation in the global explanation objective.
+                        observationIDs: [],
+                        cost: factual.isEmpty ? 0.16 : 0.10
                     ))
                     nextAttentionID += 1
                 }
@@ -291,7 +334,8 @@ public struct ProductionPlanGraph: Sendable {
 
 private func timingHypotheses(
     for action: DirectedAction,
-    phase: InteractionPhases?
+    phase: InteractionPhases?,
+    causalResponseOnset: Double? = nil
 ) -> [ProductionPlanGraph.TimingHypothesis] {
     guard let phase else {
         return [ProductionPlanGraph.TimingHypothesis(
@@ -310,6 +354,13 @@ private func timingHypotheses(
         Seed(activation: phase.rawEstimate, source: "telemetry-estimate", cost: 0.72),
         Seed(activation: phase.toolEnd, source: "tool-completion", cost: 0.58),
     ]
+    if let causalResponseOnset {
+        seeds.append(Seed(
+            activation: causalResponseOnset,
+            source: "causal-response-onset",
+            cost: 0.02
+        ))
+    }
     let threshold = max(0.001, phase.activityThreshold ?? 1)
     for cluster in phase.activityClusters {
         guard cluster.start >= phase.toolStart - 0.08,
@@ -330,9 +381,16 @@ private func timingHypotheses(
     // editorial preference. Later visual clusters remain useful competing
     // activation candidates, but no hypothesis may move the click to before
     // that factual activity has settled.
-    if let activityEnd = phase.preActivationActivityEnd {
+    if causalResponseOnset == nil, let activityEnd = phase.preActivationActivityEnd {
         let causalFloor = activityEnd + 0.05
         seeds.removeAll { $0.activation < causalFloor - 0.001 }
+    }
+    if let causalResponseOnset {
+        // Apply this after visual-cluster candidates are added. A sustained
+        // response owns the activity at its onset, so that activity cannot
+        // simultaneously be treated as pre-click hover evidence or permit a
+        // later cluster/tool-completion candidate to reverse cause and effect.
+        seeds.removeAll { $0.activation > causalResponseOnset + 0.08 }
     }
     seeds.sort {
         if abs($0.cost - $1.cost) > 0.000_001 { return $0.cost < $1.cost }
@@ -350,11 +408,52 @@ private func timingHypotheses(
             actionID: action.id,
             pointerArrival: min(seed.activation, max(phase.toolStart, phase.pointerArrival + shift)),
             activation: seed.activation,
-            responseOnset: phase.responseOnset.map { $0 + shift },
+            responseOnset: causalResponseOnset ?? phase.responseOnset.map { $0 + shift },
             source: seed.source,
             cost: seed.cost
         )
     }
+}
+
+private func causalResponseOnsets(
+    actions: [DirectedAction],
+    phases: [Int: InteractionPhases],
+    observations: [VisualMotionObservation]
+) -> [Int: Double] {
+    // Sustained structural motion is clip-level evidence. Assign each onset
+    // once to the chronologically nearest action whose factual tool envelope
+    // begins with it. This prevents one long animation from constraining every
+    // later action while still allowing the global solver to use information
+    // that a target-local hover detector cannot see.
+    let candidates = observations.filter { observation in
+        observation.kind != .translation
+            && observation.time - observation.startTime >= 0.75
+            && SpatialMotion.isFramingEligible(observation)
+    }.sorted { $0.startTime < $1.startTime }
+    var result: [Int: Double] = [:]
+    for observation in candidates {
+        let eligible = actions.compactMap { action -> (DirectedAction, InteractionPhases, Double)? in
+            guard result[action.id] == nil,
+                  ["click", "drag"].contains(action.kind),
+                  let phase = phases[action.id],
+                  observation.startTime >= phase.toolStart - 0.35,
+                  observation.startTime <= phase.toolEnd + 0.10,
+                  observation.time >= phase.toolStart + 0.30
+            else { return nil }
+            let boundedOnset = max(phase.toolStart, observation.startTime)
+            return (action, phase, boundedOnset)
+        }
+        guard let owner = eligible.min(by: { left, right in
+            let leftDistance = abs(left.1.rawEstimate - left.2)
+            let rightDistance = abs(right.1.rawEstimate - right.2)
+            if abs(leftDistance - rightDistance) > 0.000_001 {
+                return leftDistance < rightDistance
+            }
+            return left.0.time < right.0.time
+        }) else { continue }
+        result[owner.0.id] = owner.2
+    }
+    return result
 }
 
 private func factualEvidence(for action: DirectedAction) -> [AttentionEvidence] {
@@ -402,8 +501,12 @@ private func attributionHypothesis(
     contentRect: CGRect,
     size: CGSize
 ) -> ProductionPlanGraph.AttributionHypothesis {
-    let delta = observation.time - activation
-    guard delta >= -0.75, delta <= 1.75 else {
+    // A sustained response is attributed by its onset, while its complete
+    // range remains available for reading holds and camera continuity.
+    let responseOnset = observation.startTime
+    let delta = responseOnset - activation
+    let analysisTolerance = observation.time - observation.startTime >= 0.75 ? 0.35 : 0.08
+    guard responseOnset >= activation - analysisTolerance, delta <= 1.75 else {
         return .init(observationID: observationID, actionID: action.id, cost: 9, temporalDistance: abs(delta), spatialAgreement: 0)
     }
     let mapped = mapObservation(observation, contentRect: contentRect, size: size)
@@ -417,8 +520,9 @@ private func attributionHypothesis(
         agreement = 0.35
     }
     let preferredDelay = observation.kind == .focus || observation.kind == .contextTransition ? 0.28 : 0.38
-    let temporal = abs(delta - preferredDelay)
-    let futurePenalty = delta < -0.08 ? 1.0 : 0
+    let effectiveDelta = max(0, delta)
+    let temporal = abs(effectiveDelta - preferredDelay)
+    let futurePenalty = delta < -analysisTolerance ? 1.0 : 0
     return .init(
         observationID: observationID,
         actionID: action.id,

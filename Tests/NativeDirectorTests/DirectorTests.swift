@@ -54,6 +54,17 @@ private func composition(
     )
 }
 
+@Test func productDemoDefaultsWaitingMotionToTwoTimes() throws {
+    let timeline = try JSONDecoder().decode(
+        Timeline.self,
+        from: Data("{\"composition\":{\"director\":{}},\"events\":[]}".utf8)
+    )
+    let directed = NativeComposition(
+        timeline: timeline, size: size, contentRect: rect, sourceDuration: 4
+    )
+    #expect(directed.recipe.deadTimeRate == 2)
+}
+
 @Test func cinematicMotionUsesMinimumJerkEndpointEasing() {
     #expect(cinematicMotionProgress(-1) == 0)
     #expect(cinematicMotionProgress(0) == 0)
@@ -398,7 +409,7 @@ private struct TimelineFixture: Encodable {
         waitingTime: 0.1,
         motionRanges: [3...7]
     )
-    #expect(directed.retime.contains { $0.sourceStart <= 3 && $0.sourceEnd >= 7 && $0.rate == 6 })
+    #expect(directed.retime.contains { $0.sourceStart <= 3 && $0.sourceEnd >= 7 && $0.rate == 2 })
 }
 
 @Test func localizedMotionAndPeriodicBlinkingAreDetected() {
@@ -1190,14 +1201,31 @@ private func rectArea(_ rect: CGRect) -> CGFloat {
         interactionPhases: [0: phases]
     )
 
-    // The reconstructed pointer starts at 3.05. Camera follows 100 ms later,
-    // rather than waiting for the measured click activation at 4.70.
-    #expect(abs(directed.shots[0].start - 3.15) < 0.001)
+    let trip = try #require(directed.pointerTrip(forActionID: 0))
+    // Camera follows the reconstructed departure 100 ms later rather than
+    // waiting for the measured click activation at 4.70.
+    #expect(abs(directed.shots[0].start - (trip.start + 0.1)) < 0.001)
     #expect(exp(try #require(directed.settledCamera(forActionID: 0)).logScale) > 1)
-    #expect(directed.cursor(at: 3.5).point.x > size.width * 0.16)
+    #expect(directed.cursor(at: (trip.start + trip.end) / 2).point.x > size.width * 0.16)
     #expect(directed.retime.contains {
-        $0.sourceStart <= 3.05 && $0.sourceEnd >= 4.7 && $0.rate == 1
+        $0.sourceStart <= trip.start && $0.sourceEnd >= 4.7 && $0.rate == 1
     })
+}
+
+@Test func everyNonDragCursorTripUsesOneSnappyDurationBand() throws {
+    let directed = try composition("""
+    [
+      {"action":"click","time":3,"coordinates":{"xNorm":0.85,"yNorm":0.85}},
+      {"action":"click","time":6,"coordinates":{"xNorm":0.10,"yNorm":0.10}},
+      {"action":"click","time":8,"coordinates":{"xNorm":0.12,"yNorm":0.12}}
+    ]
+    """, duration: 10)
+    let trips = try (0...2).map { try #require(directed.pointerTrip(forActionID: $0)) }
+    let durations = trips.map { $0.end - $0.start }
+
+    #expect(durations.allSatisfy { $0 >= 0.32 - 0.001 && $0 <= 0.78 + 0.001 })
+    #expect(durations[0] > durations[2])
+    #expect(durations[1] > durations[2])
 }
 
 @Test func pageSizedNavigationResponseDoesNotForceZoom() throws {
@@ -1336,7 +1364,8 @@ private func rectArea(_ rect: CGRect) -> CGFloat {
     """)
     #expect(directed.actions.count == 4)
     #expect(directed.shots.count == 2)
-    #expect(abs(directed.shots[0].start - 1.95) < 0.001)
+    let firstTrip = try #require(directed.pointerTrip(forActionID: 0))
+    #expect(abs(directed.shots[0].start - (firstTrip.start + 0.1)) < 0.001)
     #expect(abs(directed.shots[0].focusStart - 3.12) < 0.001)
     #expect(directed.shots[0].focusEnd > 4.9)
     #expect(abs(directed.cursor(at: 3).point.x - 200) < 0.001)
@@ -1523,6 +1552,32 @@ private func rectArea(_ rect: CGRect) -> CGFloat {
     #expect(graph.actions.allSatisfy { $0.attention.count >= 2 })
 }
 
+@Test func productionGraphTreatsPreexistingSustainedMotionAsContextNotActionResponse() throws {
+    let directed = try composition("""
+    [{"action":"click","time":2.0,"coordinates":{"xNorm":0.2,"yNorm":0.2},"targetResolution":{"provenance":"direct","confidence":0.99}}]
+    """, duration: 6)
+    let observations = [VisualMotionObservation(
+        time: 4.0,
+        normalizedBounds: CGRect(x: 0.55, y: 0.15, width: 0.3, height: 0.5),
+        changedFraction: 0.08, magnitude: 0.9, kind: .transformation,
+        startTime: 1.0
+    )]
+    let graph = ProductionPlanGraph.make(
+        from: directed, contentRect: rect, sourceDuration: 6,
+        observations: observations, motionRanges: [1.0...4.0]
+    )
+
+    #expect(graph.attributions.filter { $0.observationID == 0 }.allSatisfy { $0.actionID == nil })
+    #expect(graph.actions[0].attention.contains {
+        $0.evidence.contains(where: { $0.source == .visualResponse })
+            && $0.observationIDs.isEmpty
+    })
+    let base = CameraState(x: size.width / 2, y: size.height / 2, logScale: 0)
+    let plan = ProductionPlanner.plan(graph: graph, composition: directed, base: base)
+    let decision = try #require(plan.decisions.first)
+    #expect(exp(decision.pose.logScale) < 1.3)
+}
+
 @Test func productionGraphTimingHypothesesHonorObservedActivityFence() throws {
     let phases = InteractionPhases(
         rawEstimate: 4.2,
@@ -1555,6 +1610,61 @@ private func rectArea(_ rect: CGRect) -> CGFloat {
     #expect(!timings.isEmpty)
     #expect(timings.allSatisfy { $0.activation >= 4.23 - 0.001 })
     #expect(timings.contains { abs($0.activation - 4.3) < 0.001 })
+}
+
+@Test func sustainedResponseOnsetMakesLaterToolCompletionCausallyInfeasible() throws {
+    let phases = InteractionPhases(
+        rawEstimate: 7.324,
+        toolStart: 3.20,
+        toolEnd: 19.695,
+        pointerArrival: 7.324,
+        activation: 7.324,
+        responseOnset: nil,
+        source: "telemetry-estimate",
+        activityThreshold: 0.55,
+        preActivationActivityEnd: 3.452,
+        activityClusters: [
+            InteractionActivityCluster(
+                start: 3.302, end: 3.452, peak: 8.12, peakTime: 3.302, count: 3
+            ),
+            InteractionActivityCluster(
+                start: 14.34, end: 14.34, peak: 7.21, peakTime: 14.34, count: 1
+            ),
+        ]
+    )
+    let directed = try composition(
+        """
+        [{"action":"click","time":7.324,"coordinates":{"xNorm":0.13,"yNorm":0.97},"targetResolution":{"provenance":"direct","confidence":0.99}}]
+        """,
+        duration: 22.3,
+        interactionPhases: [0: phases]
+    )
+    let response = VisualMotionObservation(
+        time: 14.823,
+        normalizedBounds: CGRect(x: 0.05, y: 0.10, width: 0.95, height: 0.90),
+        changedFraction: 0.021,
+        magnitude: 0.86,
+        kind: .transformation,
+        startTime: 2.952
+    )
+    let graph = ProductionPlanGraph.make(
+        from: directed,
+        contentRect: rect,
+        sourceDuration: 22.3,
+        observations: [response],
+        motionRanges: [2.952...14.823]
+    )
+    let timings = try #require(graph.actions.first).timings
+
+    #expect(timings.contains { $0.source == "causal-response-onset" })
+    #expect(timings.allSatisfy { $0.activation <= 3.281 })
+    #expect(timings.allSatisfy { abs(($0.responseOnset ?? 0) - 3.20) < 0.001 })
+
+    let base = CameraState(x: size.width / 2, y: size.height / 2, logScale: 0)
+    let plan = ProductionPlanner.plan(graph: graph, composition: directed, base: base)
+    let decision = try #require(plan.decisions.first)
+    #expect(decision.timingSource == "causal-response-onset")
+    #expect(abs(decision.activation - 3.20) < 0.001)
 }
 
 @Test func productionPlannerUsesSeparateActivationAndResponsePoses() throws {

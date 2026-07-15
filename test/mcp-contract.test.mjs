@@ -7,7 +7,34 @@ import Ajv2020 from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { RecorderService } from "../lib/recorder-service.mjs";
+import { RecorderService, renderQuality } from "../lib/recorder-service.mjs";
+import { codexThreadId } from "../lib/codex-request-context.mjs";
+
+test("Codex request metadata binds recorder_start to the calling task", () => {
+  assert.equal(codexThreadId({
+    "x-codex-turn-metadata": {
+      thread_id: "thread-fixture-primary",
+      session_id: "fallback"
+    }
+  }), "thread-fixture-primary");
+  assert.equal(codexThreadId({
+    "x-codex-turn-metadata": { session_id: "session-fallback" }
+  }), "session-fallback");
+  assert.equal(codexThreadId({}), undefined);
+});
+
+test("render quality rejects causal-order inversions", () => {
+  assert.deepEqual(renderQuality(
+    { pointerRendering: { omittedUnresolved: 0 } },
+    {
+      semanticCoverage: { unframedSustainedResponses: 0 },
+      causalOrdering: { violations: 1 }
+    }
+  ), {
+    status: "degraded",
+    issues: ["1 action was rendered after its visual response began"]
+  });
+});
 
 test("recorder_start contract accepts the adapter fingerprint it emits", async () => {
   const contract = JSON.parse(await readFile(path.resolve("docs/mcp-tools.schema.json"), "utf8"));
@@ -33,12 +60,45 @@ test("recorder_start contract accepts the adapter fingerprint it emits", async (
   }), true, JSON.stringify(validate.errors));
 });
 
+test("recorder_edit accepts system, custom, and solid render assets", async () => {
+  const contract = JSON.parse(await readFile(path.resolve("docs/mcp-tools.schema.json"), "utf8"));
+  const editTool = contract.tools.find(tool => tool.name === "recorder_edit");
+  const ajv = new Ajv2020({ allErrors: true, strict: false });
+  addFormats(ajv);
+  const validate = ajv.compile(editTool.inputSchema);
+  const recordingId = "rec_assetcontract";
+  const review = {
+    sourceRenderId: "ren_reviewsourcefixture",
+    reason: "The inspected render crops the activated control."
+  };
+  assert.equal(validate({ recordingId, review, intents: {
+    background: { type: "system-wallpaper" }, cursor: { asset: { type: "system" } }
+  } }), true, JSON.stringify(validate.errors));
+  assert.equal(validate({ recordingId, review, intents: {
+    background: { type: "image", path: "/tmp/wallpaper.png" },
+    cursor: { asset: { type: "image", path: "/tmp/cursor.png", metadataPath: "/tmp/cursor.json" } }
+  } }), true, JSON.stringify(validate.errors));
+  assert.equal(validate({ recordingId, review, intents: {
+    background: { type: "solid", color: "#F6F7F9" }
+  } }), true, JSON.stringify(validate.errors));
+  assert.equal(validate({ recordingId, review, intents: {
+    background: { type: "solid", color: "white" }
+  } }), false);
+  assert.equal(validate({ recordingId, intents: { zoom: { strength: 0.8 } } }), false);
+});
+
 test("MCP server publishes the reviewed seven-tool contract", async () => {
   const store = await mkdtemp(path.join(os.tmpdir(), "computer-use-capture-mcp-"));
+  const firstCallerDirectory = await mkdtemp(path.join(os.tmpdir(), "computer-use-capture-caller-a-"));
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [path.resolve("scripts/mcp-server.mjs")],
-    env: { ...process.env, COMPUTER_USE_CAPTURE_STORE: store }
+    env: {
+      ...process.env,
+      COMPUTER_USE_CAPTURE_STORE: store,
+      COMPUTER_USE_CAPTURE_DAEMON_IDLE_MS: "10000"
+    },
+    cwd: firstCallerDirectory
   });
   const client = new Client({ name: "computer-use-capture-test", version: "1.0.0" });
   await client.connect(transport);
@@ -58,8 +118,50 @@ test("MCP server publishes the reviewed seven-tool contract", async () => {
     assert.equal(result.structuredContent.contractVersion, "1.0.0");
     assert.equal(result.structuredContent.limits.maxConcurrentRecordings, 1);
     assert.deepEqual(result.structuredContent.defaults.waiting, {
-      mode: "reduce", retainMs: 100
+      mode: "reduce", retainMs: 100, motionRate: 2
     });
+    assert.deepEqual(result.structuredContent.defaults.background, { type: "system-wallpaper" });
+    assert.deepEqual(result.structuredContent.defaults.cursor.asset, { type: "system" });
+    assert.match(
+      result.structuredContent.adapters.codexRollout.detail,
+      new RegExp(firstCallerDirectory.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    );
+
+    const metadataResult = await client.callTool({
+      name: "recorder_capabilities",
+      arguments: {},
+      _meta: {
+        "x-codex-turn-metadata": {
+          thread_id: "thread-fixture-primary"
+        }
+      }
+    });
+    assert.equal(metadataResult.isError, undefined);
+
+    const secondCallerDirectory = await mkdtemp(path.join(os.tmpdir(), "computer-use-capture-caller-b-"));
+    const secondTransport = new StdioClientTransport({
+      command: process.execPath,
+      args: [path.resolve("scripts/mcp-server.mjs")],
+      env: {
+        ...process.env,
+        COMPUTER_USE_CAPTURE_STORE: store,
+        COMPUTER_USE_CAPTURE_DAEMON_IDLE_MS: "10000"
+      },
+      cwd: secondCallerDirectory
+    });
+    const secondClient = new Client({ name: "computer-use-capture-second-task", version: "1.0.0" });
+    await secondClient.connect(secondTransport);
+    try {
+      const shared = await secondClient.callTool({ name: "recorder_capabilities", arguments: {} });
+      assert.equal(shared.isError, undefined);
+      assert.equal(shared.structuredContent.contractVersion, "1.0.0");
+      assert.match(
+        shared.structuredContent.adapters.codexRollout.detail,
+        new RegExp(secondCallerDirectory.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+      );
+    } finally {
+      await secondClient.close();
+    }
 
     const invalid = await client.callTool({ name: "recorder_get", arguments: { id: "not-an-id" } });
     assert.equal(invalid.isError, true);
@@ -70,6 +172,13 @@ test("MCP server publishes the reviewed seven-tool contract", async () => {
     const projectDir = path.join(store, recordingId);
     const base = path.join(projectDir, "source");
     await mkdir(path.join(projectDir, "renders"), { recursive: true });
+    const reviewedRenderId = "ren_reviewsourcefixture";
+    const reviewedOutput = path.join(projectDir, "renders", `${reviewedRenderId}.mp4`);
+    const review = {
+      sourceRenderId: reviewedRenderId,
+      reason: "The inspected render crops the activated control."
+    };
+    await writeFile(reviewedOutput, Buffer.from("completed-render-fixture"));
     await writeFile(path.join(projectDir, "manifest.json"), JSON.stringify({
       version: 1,
       kind: "recording",
@@ -86,11 +195,19 @@ test("MCP server publishes the reviewed seven-tool contract", async () => {
       actionCount: 1,
       warningCount: 0,
       base,
-      renders: [],
+      renders: [{
+        kind: "render", renderId: reviewedRenderId, recordingId,
+        state: "completed", createdAt: "2026-07-13T12:00:00.000Z",
+        finishedAt: "2026-07-13T12:00:01.000Z", output: reviewedOutput
+      }],
       effectiveIntents: {
-        waiting: { mode: "reduce", retainMs: 100 },
+        waiting: { mode: "reduce", retainMs: 100, motionRate: 2 },
         zoom: { strength: 1 },
-        cursor: { scale: 3, path: "natural", tiltStrength: 1, allowInferredTargets: false },
+        background: { type: "system-wallpaper" },
+        cursor: {
+          scale: 3, path: "natural", tiltStrength: 1, allowInferredTargets: false,
+          asset: { type: "system" }
+        },
         motionBlur: "standard",
         actions: []
       }
@@ -110,6 +227,24 @@ test("MCP server publishes the reviewed seven-tool contract", async () => {
       warnings: []
     }));
 
+    const customWallpaper = path.join(store, "custom-wallpaper.png");
+    await writeFile(customWallpaper, Buffer.from("project-owned-asset-fixture"));
+    const importedEdit = await client.callTool({
+      name: "recorder_edit",
+      arguments: {
+        recordingId,
+        review,
+        intents: { background: { type: "image", path: customWallpaper }, motionBlur: "none" }
+      }
+    });
+    assert.equal(importedEdit.isError, undefined);
+    const importedPath = importedEdit.structuredContent.effectiveIntents.background.path;
+    assert.equal(path.dirname(importedPath), path.join(projectDir, "assets"));
+    assert.equal(await readFile(importedPath, "utf8"), "project-owned-asset-fixture");
+    await client.callTool({
+      name: "recorder_cancel", arguments: { renderId: importedEdit.structuredContent.renderId }
+    });
+
     const stopped = await client.callTool({ name: "recorder_stop", arguments: { recordingId, render: "auto" } });
     assert.equal(stopped.isError, undefined);
     assert.equal(stopped.structuredContent.state, "stopped");
@@ -117,11 +252,11 @@ test("MCP server publishes the reviewed seven-tool contract", async () => {
     const concurrentEdits = await Promise.all([
       client.callTool({
         name: "recorder_edit",
-        arguments: { recordingId, intents: { zoom: { strength: 1.2 }, motionBlur: "none" } }
+        arguments: { recordingId, review, intents: { zoom: { strength: 1.2 }, motionBlur: "none" } }
       }),
       client.callTool({
         name: "recorder_edit",
-        arguments: { recordingId, intents: { zoom: { strength: 1.1 } } }
+        arguments: { recordingId, review, intents: { zoom: { strength: 1.1 } } }
       })
     ]);
     const [edited] = concurrentEdits.filter(result => result.isError !== true);
@@ -130,6 +265,7 @@ test("MCP server publishes the reviewed seven-tool contract", async () => {
     assert.equal(JSON.parse(rejectedEdit.content[0].text).code, "render_in_progress");
     assert.equal(edited.isError, undefined);
     assert.equal(edited.structuredContent.state, "queued");
+    assert.deepEqual(edited.structuredContent.review, review);
     assert.ok([1.1, 1.2].includes(edited.structuredContent.effectiveIntents.zoom.strength));
     const updatedTimeline = JSON.parse(await readFile(`${base}.timeline.json`, "utf8"));
     assert.equal(updatedTimeline.events[0].editingIntent, undefined);

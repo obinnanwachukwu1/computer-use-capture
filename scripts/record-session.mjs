@@ -312,7 +312,7 @@ const timeline = {
     preset: "product-demo",
     cursorScale: 3,
     director: {
-      deadTimeRate: 6,
+      deadTimeRate: 2,
       cursorCompression: 0.1,
       zoomStrength: 1,
       cursorPath: "natural",

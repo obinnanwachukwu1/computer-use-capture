@@ -6,7 +6,9 @@ import addFormats from "ajv-formats";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { RecorderError, RecorderService } from "../lib/recorder-service.mjs";
+import { RecorderError } from "../lib/recorder-service.mjs";
+import { RecorderDaemonClient } from "../lib/recorder-daemon-client.mjs";
+import { codexThreadId } from "../lib/codex-request-context.mjs";
 
 const repoRoot = path.resolve(import.meta.dirname, "..");
 const contract = JSON.parse(await readFile(path.join(repoRoot, "docs", "mcp-tools.schema.json"), "utf8"));
@@ -18,8 +20,7 @@ const validators = new Map(contract.tools.map(tool => [tool.name, {
   output: ajv.compile(tool.outputSchema)
 }]));
 const validateError = ajv.compile(contract.errorModel.errorSchema);
-const service = new RecorderService({ repoRoot });
-await service.initialize();
+const service = await RecorderDaemonClient.connect({ repoRoot });
 
 const server = new Server(
   { name: "computer-use-capture", version: contract.contract.contractVersion },
@@ -47,15 +48,21 @@ server.setRequestHandler(CallToolRequestSchema, async request => {
       recorder_discard: "discard",
       recorder_capabilities: "capabilities"
     })[name];
+    const requestThreadId = codexThreadId(request.params?._meta);
+    const serviceArgs = name === "recorder_start" && !args.threadId && requestThreadId
+      ? { ...args, threadId: requestThreadId }
+      : args;
     const activeRecordingBeforeStart = name === "recorder_start"
-      ? await service.activeRecordingId()
+      ? await service.call("activeRecordingId", {}, { threadId: requestThreadId })
       : null;
-    const result = await service[method](args);
+    const result = await service.call(method, serviceArgs, { threadId: requestThreadId });
     if (!validate.output(result)) {
       if (name === "recorder_start"
           && result?.recordingId
           && result.recordingId !== activeRecordingBeforeStart) {
-        await service.discard({ recordingId: result.recordingId }).catch(() => {});
+        await service.call("discard", { recordingId: result.recordingId }, {
+          threadId: requestThreadId
+        }).catch(() => {});
       }
       throw new RecorderError("storage_unavailable", "Server produced a result outside its MCP output contract", {
         data: { validationErrors: validate.output.errors }
@@ -96,7 +103,6 @@ let shuttingDown = false;
 async function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
-  await service.shutdown();
   await server.close();
   process.exit(0);
 }

@@ -42,6 +42,19 @@ private let scroll = FactualActionWindow(
     #expect(analysis.provenIdleRanges == [0...0.25])
 }
 
+@Test func idleCallbacksBetweenIdenticalFramesFormOneWaitingEpisode() {
+    let capture = ledger([
+        sample(0, .complete, pixels: .unavailable),
+        sample(0.016, .complete, pixels: .identical),
+        sample(0.033, .idle),
+        sample(0.050, .complete, pixels: .identical),
+        sample(0.067, .idle),
+        sample(0.084, .complete, pixels: .identical)
+    ])
+    let analysis = CaptureTruthAnalyzer.analyze(ledger: capture, sourceDuration: 0.084)
+    #expect(analysis.provenIdleRanges == [0...0.084])
+}
+
 @Test func oneCompleteFrameMakesTheActionVisible() {
     let analysis = CaptureTruthAnalyzer.analyze(
         ledger: ledger([
