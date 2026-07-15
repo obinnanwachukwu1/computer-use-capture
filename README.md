@@ -170,3 +170,6 @@ that every binary is arm64-only, rejects embedded local build paths, and writes
 checksums under `vendor/darwin-arm64`. Ad-hoc signing does not require an Apple
 Developer account. `npm pack` repeats the build and verification through the
 package's `prepack` hook and creates `computer-use-capture-<version>.tgz`.
+## License
+
+Licensed under the [MIT License](LICENSE).

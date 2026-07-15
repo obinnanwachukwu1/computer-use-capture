@@ -1,6 +1,7 @@
 {
   "name": "computer-use-capture",
-  "version": "0.1.5",
+  "version": "0.1.6",
+  "license": "MIT",
   "description": "Turn Codex Computer Use sessions into polished macOS product-demo videos.",
   "type": "module",
   "bin": {
