@@ -1,6 +1,6 @@
 # Computer Use Capture
 
-This macOS-only proof records a declared application window with ScreenCaptureKit while Codex uses the original Computer Use tool unchanged. It tails Computer Use actions from the current Codex task's read-only event stream during capture, maps screenshot coordinates into capture coordinates, and renders a synthetic cursor plus spring-driven camera motion with a native Metal/Core Image compositor.
+Computer Use Capture turns a macOS Computer Use session into a polished, editorless product demo. An agent starts recording, works through the original Computer Use tool unchanged, and stops recording; the native pipeline reconstructs the factual cursor, removes proven dead time, and renders smooth directed camera motion at 60fps. Capture uses ScreenCaptureKit, while final composition and motion blur run through Metal/Core Image rather than a browser renderer.
 
 ## Boundary
 
