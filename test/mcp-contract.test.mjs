@@ -36,6 +36,22 @@ test("render quality rejects causal-order inversions", () => {
   });
 });
 
+test("render quality exposes a failed global camera plan", () => {
+  const quality = renderQuality(
+    { pointerRendering: { omittedUnresolved: 0 } },
+    {
+      planFeasible: false,
+      planFailure: "global production search exhausted at action 2",
+      semanticCoverage: { unframedSustainedResponses: 0 },
+      causalOrdering: { violations: 0 }
+    }
+  );
+  assert.equal(quality.status, "degraded");
+  assert.deepEqual(quality.issues, [
+    "camera planner failed: global production search exhausted at action 2"
+  ]);
+});
+
 test("recorder_start contract accepts the adapter fingerprint it emits", async () => {
   const contract = JSON.parse(await readFile(path.resolve("docs/mcp-tools.schema.json"), "utf8"));
   const startTool = contract.tools.find(tool => tool.name === "recorder_start");

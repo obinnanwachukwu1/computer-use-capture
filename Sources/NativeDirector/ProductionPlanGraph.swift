@@ -84,11 +84,16 @@ public struct ProductionPlanGraph: Sendable {
             phases: composition.interactionPhases,
             observations: orderedObservations.map(\.element)
         )
+        let activationWindows = orderedActivationWindows(
+            actions: composition.actions,
+            phases: composition.interactionPhases
+        )
         let timingByAction = Dictionary(uniqueKeysWithValues: composition.actions.map { action in
             (action.id, timingHypotheses(
                 for: action,
                 phase: composition.interactionPhases[action.id],
-                causalResponseOnset: causalOnsets[action.id]
+                causalResponseOnset: causalOnsets[action.id],
+                activationWindow: activationWindows[action.id]
             ))
         })
 
@@ -335,7 +340,8 @@ public struct ProductionPlanGraph: Sendable {
 private func timingHypotheses(
     for action: DirectedAction,
     phase: InteractionPhases?,
-    causalResponseOnset: Double? = nil
+    causalResponseOnset: Double? = nil,
+    activationWindow: ClosedRange<Double>? = nil
 ) -> [ProductionPlanGraph.TimingHypothesis] {
     guard let phase else {
         return [ProductionPlanGraph.TimingHypothesis(
@@ -392,6 +398,19 @@ private func timingHypotheses(
         // later cluster/tool-completion candidate to reverse cause and effect.
         seeds.removeAll { $0.activation > causalResponseOnset + 0.08 }
     }
+    if let activationWindow {
+        seeds.removeAll { !activationWindow.contains($0.activation) }
+    }
+    // The adapter's estimate is the ordered factual fallback. Visual timing
+    // may refine it, but an ambiguous or over-constrained visual lattice must
+    // never erase the action itself.
+    if seeds.isEmpty {
+        seeds = [Seed(
+            activation: phase.rawEstimate,
+            source: "telemetry-order-fallback",
+            cost: 0.76
+        )]
+    }
     seeds.sort {
         if abs($0.cost - $1.cost) > 0.000_001 { return $0.cost < $1.cost }
         return $0.activation < $1.activation
@@ -413,6 +432,51 @@ private func timingHypotheses(
             cost: seed.cost
         )
     }
+}
+
+private func orderedActivationWindows(
+    actions: [DirectedAction],
+    phases: [Int: InteractionPhases]
+) -> [Int: ClosedRange<Double>] {
+    // Multiple Computer Use actions can share one node_repl/tool envelope.
+    // Their raw estimates encode the only factual total order available.
+    // Partition that envelope at adjacent midpoints so independent visual
+    // probes cannot assign one response cluster to two actions, collapse two
+    // clicks onto one frame, or reverse their order during fixed-point passes.
+    let ordered = actions.compactMap { action -> (DirectedAction, InteractionPhases)? in
+        phases[action.id].map { (action, $0) }
+    }.sorted { left, right in
+        if abs(left.1.toolStart - right.1.toolStart) > 0.001 {
+            return left.1.toolStart < right.1.toolStart
+        }
+        return left.1.rawEstimate < right.1.rawEstimate
+    }
+    var groups: [[(DirectedAction, InteractionPhases)]] = []
+    for entry in ordered {
+        if let last = groups.indices.last,
+           let first = groups[last].first,
+           abs(first.1.toolStart - entry.1.toolStart) <= 0.001,
+           abs(first.1.toolEnd - entry.1.toolEnd) <= 0.001 {
+            groups[last].append(entry)
+        } else {
+            groups.append([entry])
+        }
+    }
+    var result: [Int: ClosedRange<Double>] = [:]
+    for group in groups where group.count > 1 {
+        let byEstimate = group.sorted { $0.1.rawEstimate < $1.1.rawEstimate }
+        for index in byEstimate.indices {
+            let phase = byEstimate[index].1
+            let lower = index == byEstimate.startIndex
+                ? phase.toolStart
+                : (byEstimate[index - 1].1.rawEstimate + phase.rawEstimate) / 2 + 0.001
+            let upper = index == byEstimate.index(before: byEstimate.endIndex)
+                ? phase.toolEnd
+                : (phase.rawEstimate + byEstimate[index + 1].1.rawEstimate) / 2 - 0.001
+            result[byEstimate[index].0.id] = min(lower, upper)...max(lower, upper)
+        }
+    }
+    return result
 }
 
 private func causalResponseOnsets(

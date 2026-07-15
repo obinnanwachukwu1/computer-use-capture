@@ -742,6 +742,43 @@ test("exact post-action focus overrides a stale same-number AX control", async (
   assert.equal(resolved.coordinates.captureX, 720);
 });
 
+test("a corroborated clicked control outranks focus moved into its revealed surface", () => {
+  const event = {
+    timestamp: "2026-07-15T21:49:31.439Z",
+    action: "click",
+    args: { app: "com.google.Chrome", element_index: 167 },
+    accessibilityTarget: {
+      elementIndex: 167, role: "pop up button", roleKnown: true, label: "Pick a date"
+    },
+    postActionFocus: {
+      elementIndex: 360, role: "button", roleKnown: true, label: "Go to the Previous Month"
+    },
+    timing: {
+      toolCallStartedAt: "2026-07-15T21:49:30.918Z",
+      toolCallEndedAt: "2026-07-15T21:49:33.002Z"
+    }
+  };
+  const resolved = resolveAccessibilityTarget({
+    event,
+    observations: [{
+      observedAt: "2026-07-15T21:49:25.319Z",
+      treeComplete: true,
+      windowBounds: { x: 3817, y: -239, width: 1406, height: 972 },
+      elements: [{
+        index: 439, role: "AXPopUpButton", roleDescription: "pop up button",
+        title: "Pick a date", bounds: { x: 4406, y: 243, width: 213, height: 32 }
+      }]
+    }],
+    captureStartedAt: "2026-07-15T21:49:04.000Z",
+    captureWidth: 1406,
+    captureHeight: 972
+  });
+
+  assert.equal(resolved.targetResolution.provenance, "ax-identity");
+  assert.equal(resolved.semanticTarget.title, "Pick a date");
+  assert.equal(resolved.semanticTarget.nativeElementIndex, 439);
+});
+
 test("does not invent actions for failed Computer Use calls", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "computer-use-capture-failed-"));
   const sessionFile = path.join(directory, "rollout.jsonl");

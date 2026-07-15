@@ -1667,6 +1667,69 @@ private func rectArea(_ rect: CGRect) -> CGFloat {
     #expect(abs(decision.activation - 3.20) < 0.001)
 }
 
+@Test func batchedComputerUseActionsCannotShareOrReverseAVisualCluster() throws {
+    let sharedStart = 53.057
+    let sharedEnd = 58.232
+    let phases: [Int: InteractionPhases] = [
+        0: InteractionPhases(
+            rawEstimate: 53.489, toolStart: sharedStart, toolEnd: sharedEnd,
+            pointerArrival: 57.047, activation: 57.167, responseOnset: nil,
+            source: "target-visual", activityThreshold: 0.55,
+            activityClusters: [InteractionActivityCluster(
+                start: 57.167, end: 57.167, peak: 8.2, peakTime: 57.167, count: 1
+            )]
+        ),
+        1: InteractionPhases(
+            rawEstimate: 55.214, toolStart: sharedStart, toolEnd: sharedEnd,
+            pointerArrival: 57.047, activation: 57.167, responseOnset: nil,
+            source: "target-visual", activityThreshold: 0.55,
+            activityClusters: [InteractionActivityCluster(
+                start: 57.167, end: 57.167, peak: 8.2, peakTime: 57.167, count: 1
+            )]
+        ),
+        2: InteractionPhases(
+            rawEstimate: 56.938, toolStart: sharedStart, toolEnd: sharedEnd,
+            pointerArrival: 56.507, activation: 57.107, responseOnset: nil,
+            source: "target-visual", activityThreshold: 0.55,
+            activityClusters: [InteractionActivityCluster(
+                start: 57.107, end: 57.167, peak: 16.0, peakTime: 57.167, count: 2
+            )]
+        ),
+    ]
+    let directed = try composition(
+        """
+        [
+          {"action":"click","time":53.489,"coordinates":{"xNorm":0.63,"yNorm":0.63},"targetResolution":{"provenance":"direct","confidence":0.99}},
+          {"action":"click","time":55.214,"coordinates":{"xNorm":0.63,"yNorm":0.63},"targetResolution":{"provenance":"direct","confidence":0.99}},
+          {"action":"click","time":56.938,"coordinates":{"xNorm":0.04,"yNorm":0.54},"targetResolution":{"provenance":"direct","confidence":0.99}}
+        ]
+        """,
+        duration: 60,
+        interactionPhases: phases
+    )
+    let graph = ProductionPlanGraph.make(
+        from: directed, contentRect: rect, sourceDuration: 60,
+        observations: [], motionRanges: []
+    )
+    let timings = Dictionary(uniqueKeysWithValues: graph.actions.map {
+        ($0.action.id, $0.timings.map(\.activation))
+    })
+    let firstUpper = try #require(timings[0]?.max())
+    let secondLower = try #require(timings[1]?.min())
+    let secondUpper = try #require(timings[1]?.max())
+    let thirdLower = try #require(timings[2]?.min())
+
+    #expect(firstUpper < secondLower)
+    #expect(secondUpper < thirdLower)
+    #expect(timings[0]?.contains(57.167) == false)
+    #expect(timings[1]?.contains(57.167) == false)
+
+    let base = CameraState(x: size.width / 2, y: size.height / 2, logScale: 0)
+    let plan = ProductionPlanner.plan(graph: graph, composition: directed, base: base)
+    #expect(plan.camera.diagnostics.feasible)
+    #expect(plan.decisions.count == 3)
+}
+
 @Test func productionPlannerUsesSeparateActivationAndResponsePoses() throws {
     let directed = try composition("""
     [

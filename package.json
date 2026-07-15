@@ -1,6 +1,6 @@
 {
   "name": "computer-use-capture",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Turn Codex Computer Use sessions into polished macOS product-demo videos.",
   "type": "module",
   "bin": {
