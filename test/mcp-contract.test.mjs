@@ -34,13 +34,13 @@ test("recorder_start contract accepts the adapter fingerprint it emits", async (
 });
 
 test("MCP server publishes the reviewed seven-tool contract", async () => {
-  const store = await mkdtemp(path.join(os.tmpdir(), "agentrecorder-mcp-"));
+  const store = await mkdtemp(path.join(os.tmpdir(), "computer-use-capture-mcp-"));
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [path.resolve("scripts/mcp-server.mjs")],
-    env: { ...process.env, AGENTRECORDER_STORE: store }
+    env: { ...process.env, COMPUTER_USE_CAPTURE_STORE: store }
   });
-  const client = new Client({ name: "agentrecorder-test", version: "1.0.0" });
+  const client = new Client({ name: "computer-use-capture-test", version: "1.0.0" });
   await client.connect(transport);
   try {
     const listed = await client.listTools();
@@ -151,7 +151,7 @@ test("MCP server publishes the reviewed seven-tool contract", async () => {
 });
 
 test("project store has one daemon writer and safely recovers stale locks", async () => {
-  const store = await mkdtemp(path.join(os.tmpdir(), "agentrecorder-lock-"));
+  const store = await mkdtemp(path.join(os.tmpdir(), "computer-use-capture-lock-"));
   const first = new RecorderService({ storeRoot: store });
   const second = new RecorderService({ storeRoot: store });
   await first.initialize();

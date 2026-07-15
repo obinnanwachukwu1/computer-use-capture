@@ -526,7 +526,7 @@ test("retains unknown future sky actions for fail-open compatibility", () => {
 });
 
 test("normalizes both historical direct MCP and current node_repl envelopes", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "agentrecorder-events-"));
+  const directory = await mkdtemp(path.join(os.tmpdir(), "computer-use-capture-events-"));
   const sessionFile = path.join(directory, "rollout.jsonl");
   const records = [
     {
@@ -567,7 +567,7 @@ test("normalizes both historical direct MCP and current node_repl envelopes", as
 });
 
 test("live tailing preserves prior AX state and waits for complete appended JSONL", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "agentrecorder-live-tail-"));
+  const directory = await mkdtemp(path.join(os.tmpdir(), "computer-use-capture-live-tail-"));
   const sessionFile = path.join(directory, "rollout.jsonl");
   const record = (timestamp, code, text = "") => JSON.stringify({
     timestamp,
@@ -606,7 +606,7 @@ test("live tailing preserves prior AX state and waits for complete appended JSON
 });
 
 test("carries only statically proven values across persistent node_repl invocations", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "agentrecorder-repl-env-"));
+  const directory = await mkdtemp(path.join(os.tmpdir(), "computer-use-capture-repl-env-"));
   const sessionFile = path.join(directory, "rollout.jsonl");
   const resultEnvelope = { Ok: { content: [] } };
   const record = (timestamp, code, result = resultEnvelope) => ({
@@ -641,7 +641,7 @@ test("carries only statically proven values across persistent node_repl invocati
 });
 
 test("joins element-index actions to the preceding Computer Use accessibility state", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "agentrecorder-index-"));
+  const directory = await mkdtemp(path.join(os.tmpdir(), "computer-use-capture-index-"));
   const sessionFile = path.join(directory, "rollout.jsonl");
   const records = [
     {
@@ -687,7 +687,7 @@ test("joins element-index actions to the preceding Computer Use accessibility st
 });
 
 test("does not invent actions for failed Computer Use calls", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "agentrecorder-failed-"));
+  const directory = await mkdtemp(path.join(os.tmpdir(), "computer-use-capture-failed-"));
   const sessionFile = path.join(directory, "rollout.jsonl");
   const record = {
     timestamp: "2026-06-17T00:00:02.000Z",
@@ -712,7 +712,7 @@ test("does not invent actions for failed Computer Use calls", async () => {
 });
 
 test("skips structurally uncertain calls instead of fabricating actions", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "agentrecorder-uncertain-"));
+  const directory = await mkdtemp(path.join(os.tmpdir(), "computer-use-capture-uncertain-"));
   const sessionFile = path.join(directory, "rollout.jsonl");
   const record = {
     timestamp: "2026-06-17T00:00:02.000Z", type: "event_msg",

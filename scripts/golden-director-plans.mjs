@@ -8,8 +8,8 @@ const command = process.argv[2];
 if (!["update", "verify"].includes(command)) {
   throw new Error("Usage: node scripts/golden-director-plans.mjs <update|verify> [recordingId ...]");
 }
-const storeRoot = path.resolve(process.env.AGENTRECORDER_STORE
-  ?? path.join(os.homedir(), "Library", "Application Support", "AgentRecorder", "projects"));
+const storeRoot = path.resolve(process.env.COMPUTER_USE_CAPTURE_STORE
+  ?? path.join(os.homedir(), "Library", "Application Support", "ComputerUseCapture", "projects"));
 const requested = process.argv.slice(3);
 const recordingIds = requested.length ? requested : (await readdir(storeRoot, { withFileTypes: true }).catch(() => []))
   .filter(entry => entry.isDirectory() && entry.name.startsWith("rec_"))

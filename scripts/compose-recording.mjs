@@ -4,7 +4,7 @@ import path from "node:path";
 import { runtimeBinaryPath, runtimeMode, verifyPrebuiltRuntime } from "../lib/runtime-binaries.mjs";
 
 const repoRoot = path.resolve(import.meta.dirname, "..");
-const expectedParentPID = Number(process.env.AGENTRECORDER_PARENT_PID);
+const expectedParentPID = Number(process.env.COMPUTER_USE_CAPTURE_PARENT_PID);
 if (Number.isInteger(expectedParentPID)) {
   const parentWatch = setInterval(() => {
     if (process.ppid !== expectedParentPID) process.kill(process.pid, "SIGTERM");
@@ -20,7 +20,7 @@ const outputPath = outputIndex >= 0 ? path.resolve(cliArgs[outputIndex + 1]) : `
 const outputScaleIndex = cliArgs.indexOf("--output-scale");
 const outputScale = outputScaleIndex >= 0
   ? cliArgs[outputScaleIndex + 1]
-  : process.env.AGENTRECORDER_OUTPUT_SCALE ?? "1";
+  : process.env.COMPUTER_USE_CAPTURE_OUTPUT_SCALE ?? "1";
 await Promise.all([access(videoPath), access(timelinePath)]);
 if (runtimeMode(repoRoot) === "source") {
   await run("swift", ["build", "-c", "release", "--product", "native-compose"]);
@@ -33,12 +33,12 @@ const nativeArgs = [
   timelinePath,
   outputPath,
   "--output-scale", outputScale,
-  "--fps", process.env.AGENTRECORDER_FPS ?? "60",
-  "--samples", process.env.AGENTRECORDER_MOTION_SAMPLES ?? "8",
-  "--shutter", process.env.AGENTRECORDER_SHUTTER ?? "0.55"
+  "--fps", process.env.COMPUTER_USE_CAPTURE_FPS ?? "60",
+  "--samples", process.env.COMPUTER_USE_CAPTURE_MOTION_SAMPLES ?? "8",
+  "--shutter", process.env.COMPUTER_USE_CAPTURE_SHUTTER ?? "0.55"
 ];
 const keepWaiting = cliArgs.includes("--keep-waiting")
-  || process.env.AGENTRECORDER_REDUCE_WAITING === "0";
+  || process.env.COMPUTER_USE_CAPTURE_REDUCE_WAITING === "0";
 nativeArgs.push(keepWaiting ? "--keep-waiting" : "--reduce-waiting");
 if (cliArgs.includes("--director-debug")) nativeArgs.push("--director-debug");
 if (cliArgs.includes("--plan-only")) nativeArgs.push("--plan-only");
@@ -58,7 +58,7 @@ for (const flag of ["--cursor-path", "--cursor-tilt-strength"]) {
 const waitingTimeIndex = cliArgs.indexOf("--waiting-time");
 const waitingTime = waitingTimeIndex >= 0
   ? cliArgs[waitingTimeIndex + 1]
-  : process.env.AGENTRECORDER_WAITING_TIME_MS;
+  : process.env.COMPUTER_USE_CAPTURE_WAITING_TIME_MS;
 if (waitingTime !== undefined) nativeArgs.push("--waiting-time", waitingTime);
 await run(runtimeBinaryPath(repoRoot, "native-compose"), nativeArgs);
 

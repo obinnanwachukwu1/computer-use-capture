@@ -31,7 +31,7 @@ try {
     command: "npx",
     args: ["--yes", "--package", tarball, "computer-use-capture"],
     cwd: temporary,
-    env: { ...process.env, AGENTRECORDER_STORE: store },
+    env: { ...process.env, COMPUTER_USE_CAPTURE_STORE: store },
   });
   const client = new Client({ name: "computer-use-capture-package-smoke", version: "1.0.0" });
   await client.connect(transport);

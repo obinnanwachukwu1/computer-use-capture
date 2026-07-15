@@ -262,7 +262,7 @@ private final class FeasibilityTrace: @unchecked Sendable {
         actionID: Int, label: String, outputTime: Double, sourceTime: Double,
         state: CameraState, adjusted: CameraState
     ) {
-        guard ProcessInfo.processInfo.environment["AGENTRECORDER_TRACE_FEASIBILITY"] == "1" else { return }
+        guard ProcessInfo.processInfo.environment["COMPUTER_USE_CAPTURE_TRACE_FEASIBILITY"] == "1" else { return }
         lock.lock()
         defer { lock.unlock() }
         let key = "\(actionID):\(label)"

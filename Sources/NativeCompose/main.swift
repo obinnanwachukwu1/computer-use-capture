@@ -49,7 +49,7 @@ struct Options {
             return args[index + 1]
         }
         if args.contains("--camera-planner")
-            || ProcessInfo.processInfo.environment["AGENTRECORDER_CAMERA_PLANNER"] != nil {
+            || ProcessInfo.processInfo.environment["COMPUTER_USE_CAPTURE_CAMERA_PLANNER"] != nil {
             throw Failure("--camera-planner was removed; normal is the default and the replacement is available only through --experimental-camera-planner")
         }
         let cursorPath: CursorPathStyle?
@@ -63,7 +63,7 @@ struct Options {
         }
         let cursorTiltStrength = optionalValue("--cursor-tilt-strength").flatMap(Double.init)
         let cameraPlanner: CameraPlanner = args.contains("--experimental-camera-planner")
-            || ProcessInfo.processInfo.environment["AGENTRECORDER_EXPERIMENTAL_CAMERA_PLANNER"] == "1"
+            || ProcessInfo.processInfo.environment["COMPUTER_USE_CAPTURE_EXPERIMENTAL_CAMERA_PLANNER"] == "1"
             ? .experimental : .normal
         let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
         let output = URL(fileURLWithPath: args[2], relativeTo: cwd).standardizedFileURL
@@ -129,7 +129,7 @@ let renderScale: CGFloat = {
     let cliValue = arguments.firstIndex(of: "--output-scale").flatMap { index in
         index + 1 < arguments.count ? Double(arguments[index + 1]) : nil
     }
-    let environmentValue = ProcessInfo.processInfo.environment["AGENTRECORDER_OUTPUT_SCALE"].flatMap(Double.init)
+    let environmentValue = ProcessInfo.processInfo.environment["COMPUTER_USE_CAPTURE_OUTPUT_SCALE"].flatMap(Double.init)
     return CGFloat(min(2, max(1, cliValue ?? environmentValue ?? 1)))
 }()
 let width = Int(logicalOutputSize.width * renderScale)
@@ -576,7 +576,7 @@ private func factualActionWindows(
 func emitProgress(phase: String, percent: Double) {
     let payload: [String: Any] = ["phase": phase, "percent": min(100, max(0, percent))]
     guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) else { return }
-    print("AGENTRECORDER_PROGRESS \(String(decoding: data, as: UTF8.self))")
+    print("COMPUTER_USE_CAPTURE_PROGRESS \(String(decoding: data, as: UTF8.self))")
 }
 
 func writeCompositionReport(composition: NativeComposition, output: URL, state: String) throws {

@@ -30,16 +30,16 @@ struct CaptureOptions {
             throw CaptureError.usage("The target app must be a macOS bundle identifier")
         }
 
-        let modeName = ProcessInfo.processInfo.environment["AGENTRECORDER_CAPTURE_MODE"] ?? "application"
+        let modeName = ProcessInfo.processInfo.environment["COMPUTER_USE_CAPTURE_CAPTURE_MODE"] ?? "application"
         guard let mode = CaptureMode(rawValue: modeName) else {
             throw CaptureError.usage(
-                "AGENTRECORDER_CAPTURE_MODE must be 'application' or 'window'"
+                "COMPUTER_USE_CAPTURE_CAPTURE_MODE must be 'application' or 'window'"
             )
         }
-        let codecName = ProcessInfo.processInfo.environment["AGENTRECORDER_CAPTURE_CODEC"] ?? "hevc"
+        let codecName = ProcessInfo.processInfo.environment["COMPUTER_USE_CAPTURE_CAPTURE_CODEC"] ?? "hevc"
         guard let codec = CaptureCodec(rawValue: codecName) else {
             throw CaptureError.usage(
-                "AGENTRECORDER_CAPTURE_CODEC must be 'hevc', 'h264', 'prores422lt', or 'prores4444'"
+                "COMPUTER_USE_CAPTURE_CAPTURE_CODEC must be 'hevc', 'h264', 'prores422lt', or 'prores4444'"
             )
         }
 
@@ -491,7 +491,7 @@ struct CaptureApp {
                 framesPerSecond: options.framesPerSecond
             )
             let stream = SCStream(filter: filter, configuration: configuration, delegate: nil)
-            let outputQueue = DispatchQueue(label: "agentrecorder.capture.video", qos: .userInteractive)
+            let outputQueue = DispatchQueue(label: "computerusecapture.capture.video", qos: .userInteractive)
             try stream.addStreamOutput(movieWriter, type: .screen, sampleHandlerQueue: outputQueue)
 
             try await stream.startCapture()

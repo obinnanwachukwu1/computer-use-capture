@@ -23,11 +23,11 @@ if (!Number.isFinite(maximumDuration) || maximumDuration <= 0) {
 if (runtimeMode(repoRoot) === "prebuilt") await verifyPrebuiltRuntime(repoRoot);
 
 await mkdir(path.dirname(outputBase), { recursive: true });
-const explicitSession = process.env.AGENTRECORDER_SESSION_FILE
-  ? { file: path.resolve(process.env.AGENTRECORDER_SESSION_FILE), threadId: process.env.AGENTRECORDER_THREAD_ID ?? null }
+const explicitSession = process.env.COMPUTER_USE_CAPTURE_SESSION_FILE
+  ? { file: path.resolve(process.env.COMPUTER_USE_CAPTURE_SESSION_FILE), threadId: process.env.COMPUTER_USE_CAPTURE_THREAD_ID ?? null }
   : undefined;
 const initialCandidates = explicitSession ? [explicitSession]
-  : await findCodexSessions({ cwd: process.cwd(), threadId: process.env.AGENTRECORDER_THREAD_ID });
+  : await findCodexSessions({ cwd: process.cwd(), threadId: process.env.COMPUTER_USE_CAPTURE_THREAD_ID });
 if (!initialCandidates.length) throw new Error(`Could not find a Codex session for ${process.cwd()}`);
 let session = initialCandidates[0];
 const videoPath = `${outputBase}.mov`;
@@ -88,7 +88,7 @@ let droppedBackpressureFrames = 0;
 let captureReady = false;
 let stopRequested = false;
 let liveTailersPromise;
-const expectedParentPID = Number(process.env.AGENTRECORDER_PARENT_PID);
+const expectedParentPID = Number(process.env.COMPUTER_USE_CAPTURE_PARENT_PID);
 if (Number.isInteger(expectedParentPID)) {
   const parentWatch = setInterval(() => {
     if (process.ppid !== expectedParentPID) requestStop();
@@ -168,7 +168,7 @@ if (!captureReady || !captureStartedAt) throw new Error("Capture process never c
 captureEndedAt ??= new Date().toISOString();
 
 const finalCandidates = explicitSession ? [explicitSession]
-  : await findCodexSessions({ cwd: process.cwd(), threadId: process.env.AGENTRECORDER_THREAD_ID });
+  : await findCodexSessions({ cwd: process.cwd(), threadId: process.env.COMPUTER_USE_CAPTURE_THREAD_ID });
 const settleResults = await Promise.all(finalCandidates.map(candidate => waitForFileQuiescence(candidate.file)));
 const liveTailers = await (liveTailersPromise ?? Promise.resolve([]));
 const liveByFile = new Map(liveTailers.map(item => [item.candidate.file, item]));
@@ -195,7 +195,7 @@ const extracted = ambiguous
       warnings: [{
         type: "introspection_ambiguous",
         message: "Multiple Codex sessions in this working directory emitted Computer Use actions during capture",
-        ...(process.env.AGENTRECORDER_PERSIST_PRIVATE_PATHS === "1"
+        ...(process.env.COMPUTER_USE_CAPTURE_PERSIST_PRIVATE_PATHS === "1"
           ? { threadIds: activeExtractions.map(item => item.candidate.threadId) }
           : { sessionCount: activeExtractions.length })
       }],
@@ -289,9 +289,9 @@ const timeline = {
   introspection: {
     adapter: "codex-rollout-jsonl",
     adapterStatus: extracted.adapter,
-    sessionBinding: process.env.AGENTRECORDER_THREAD_ID ? "explicit" : ambiguous ? "ambiguous" : "auto-resolved",
-    ...(process.env.AGENTRECORDER_PERSIST_PRIVATE_PATHS === "1" ? { threadId: session.threadId } : {}),
-    ...(process.env.AGENTRECORDER_PERSIST_PRIVATE_PATHS === "1" ? { sessionFile: session.file } : {}),
+    sessionBinding: process.env.COMPUTER_USE_CAPTURE_THREAD_ID ? "explicit" : ambiguous ? "ambiguous" : "auto-resolved",
+    ...(process.env.COMPUTER_USE_CAPTURE_PERSIST_PRIVATE_PATHS === "1" ? { threadId: session.threadId } : {}),
+    ...(process.env.COMPUTER_USE_CAPTURE_PERSIST_PRIVATE_PATHS === "1" ? { sessionFile: session.file } : {}),
     reconstruction,
     readOnly: true,
     semanticAdapter: "macos-accessibility-indexed-snapshot",

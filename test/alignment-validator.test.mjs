@@ -10,7 +10,7 @@ const execFileAsync = promisify(execFile);
 const validator = path.resolve("scripts/validate-alignment.mjs");
 
 test("alignment audit rejects a hidden zoom pulse inside a nominal pan", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "agentrecorder-alignment-"));
+  const directory = await mkdtemp(path.join(os.tmpdir(), "computer-use-capture-alignment-"));
   const auditPath = path.join(directory, "probe.camera-audit.json");
   const directorPath = path.join(directory, "probe.director.json");
   await writeFile(auditPath, JSON.stringify({
@@ -35,7 +35,7 @@ test("alignment audit rejects a hidden zoom pulse inside a nominal pan", async (
 });
 
 test("alignment audit requires the click spring and visual cluster to share one activation frame", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "agentrecorder-click-phase-"));
+  const directory = await mkdtemp(path.join(os.tmpdir(), "computer-use-capture-click-phase-"));
   const auditPath = path.join(directory, "probe.camera-audit.json");
   const directorPath = path.join(directory, "probe.director.json");
   await writeFile(auditPath, JSON.stringify({
@@ -69,7 +69,7 @@ test("alignment audit requires the click spring and visual cluster to share one 
 });
 
 test("alignment audit rejects adjacent camera moves that pan out and immediately back", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "agentrecorder-camera-detour-"));
+  const directory = await mkdtemp(path.join(os.tmpdir(), "computer-use-capture-camera-detour-"));
   const auditPath = path.join(directory, "probe.camera-audit.json");
   const directorPath = path.join(directory, "probe.director.json");
   const move = (label, start, end, dx) => ({
@@ -116,7 +116,7 @@ test("production audit rejects infeasible plans and any renderer visibility corr
 });
 
 test("alignment audit catches a perceptual A-B-A detour separated by a short hold", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "agentrecorder-camera-churn-"));
+  const directory = await mkdtemp(path.join(os.tmpdir(), "computer-use-capture-camera-churn-"));
   const auditPath = path.join(directory, "probe.camera-audit.json");
   const directorPath = path.join(directory, "probe.director.json");
   const move = (label, start, end, dx) => ({
@@ -142,7 +142,7 @@ test("alignment audit catches a perceptual A-B-A detour separated by a short hol
 });
 
 test("alignment audit permits an explicit episode return to base", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "agentrecorder-camera-boundary-"));
+  const directory = await mkdtemp(path.join(os.tmpdir(), "computer-use-capture-camera-boundary-"));
   const auditPath = path.join(directory, "probe.camera-audit.json");
   const directorPath = path.join(directory, "probe.director.json");
   const move = (label, start, end, dx) => ({
@@ -164,7 +164,7 @@ test("alignment audit permits an explicit episode return to base", async () => {
 });
 
 test("alignment audit marks unresolved pointer evidence as a degraded taste fixture", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "agentrecorder-evidence-quality-"));
+  const directory = await mkdtemp(path.join(os.tmpdir(), "computer-use-capture-evidence-quality-"));
   const auditPath = path.join(directory, "probe.camera-audit.json");
   const directorPath = path.join(directory, "probe.director.json");
   await writeFile(auditPath, JSON.stringify({

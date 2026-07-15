@@ -77,7 +77,7 @@ Safari uses application-filter capture so Safari-owned popovers can remain visib
 Capture, reconstruction, analysis, and rendering run locally. Projects are stored under:
 
 ```text
-~/Library/Application Support/AgentRecorder/projects
+~/Library/Application Support/ComputerUseCapture/projects
 ```
 
 The recorder stores source video, a value-redacted Accessibility sidecar, the reconstructed timeline, diagnostics, and renders until `recorder_discard` is called. Raw Accessibility observations are temporary, typed values are redacted, and private Codex session paths are omitted from persisted output.
