@@ -9,7 +9,7 @@ The recorder does not wrap or replace Computer Use. It is a local, macOS-only MC
 - macOS 14 or later
 - Apple Silicon
 - Codex with Computer Use
-- Node.js and npm
+- Node.js 20 or later and npm
 - Screen Recording and Accessibility permission
 - Exactly one eligible window for the app being recorded
 
@@ -99,14 +99,47 @@ The recorder stores source video, a value-redacted Accessibility sidecar, the re
 - [Production camera planner](docs/production-planner.md)
 - [Experimental camera planner](docs/experimental-camera-planner.md)
 
-## Development
+## Build from source
+
+Building requires Apple Silicon macOS 14 or later, Node.js 20 or later, and the
+Swift 6 toolchain from Xcode or Xcode Command Line Tools.
 
 ```sh
-npm install
+git clone https://github.com/obinnanwachukwu1/computer-use-capture.git
+cd computer-use-capture
+npm ci
 swift build -c release
+```
+
+Register that checkout as a separate development MCP server:
+
+```sh
+codex mcp add computer-use-capture-source -- node "$PWD/scripts/mcp-server.mjs"
+codex mcp get computer-use-capture-source
+```
+
+Source checkouts use the executables in `.build/release`. Run the verification
+suite with:
+
+```sh
 npm test
 swift test
 npm run audit:privacy
 ```
 
-Development checkouts use locally built Swift executables. Packaged npm installs use the precompiled runtime automatically. Build and verify a release payload with `npm run build:prebuilt` and `npm run verify:prebuilt`; run the MCP server directly with `npm run mcp`.
+The privacy audit requires [Gitleaks](https://github.com/gitleaks/gitleaks).
+
+## Build the npm package
+
+```sh
+npm ci
+npm run build:prebuilt
+npm run verify:prebuilt
+npm pack
+```
+
+`build:prebuilt` compiles the release runtime, strips it, ad-hoc signs it, checks
+that every binary is arm64-only, rejects embedded local build paths, and writes
+checksums under `vendor/darwin-arm64`. Ad-hoc signing does not require an Apple
+Developer account. `npm pack` repeats the build and verification through the
+package's `prepack` hook and creates `computer-use-capture-<version>.tgz`.
