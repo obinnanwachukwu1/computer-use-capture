@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { access, mkdir } from "node:fs/promises";
 import path from "node:path";
+import { runtimeBinaryPath, runtimeMode, verifyPrebuiltRuntime } from "../lib/runtime-binaries.mjs";
 
 const repoRoot = path.resolve(import.meta.dirname, "..");
 const expectedParentPID = Number(process.env.AGENTRECORDER_PARENT_PID);
@@ -21,9 +22,12 @@ const outputScale = outputScaleIndex >= 0
   ? cliArgs[outputScaleIndex + 1]
   : process.env.AGENTRECORDER_OUTPUT_SCALE ?? "1";
 await Promise.all([access(videoPath), access(timelinePath)]);
+if (runtimeMode(repoRoot) === "source") {
+  await run("swift", ["build", "-c", "release", "--product", "native-compose"]);
+} else {
+  await verifyPrebuiltRuntime(repoRoot);
+}
 await Promise.all([ensureTahoeWallpaper(), ensureMacOSCursor()]);
-
-await run("swift", ["build", "-c", "release", "--product", "native-compose"]);
 const nativeArgs = [
   videoPath,
   timelinePath,
@@ -56,7 +60,7 @@ const waitingTime = waitingTimeIndex >= 0
   ? cliArgs[waitingTimeIndex + 1]
   : process.env.AGENTRECORDER_WAITING_TIME_MS;
 if (waitingTime !== undefined) nativeArgs.push("--waiting-time", waitingTime);
-await run(path.join(repoRoot, ".build/release/native-compose"), nativeArgs);
+await run(runtimeBinaryPath(repoRoot, "native-compose"), nativeArgs);
 
 function run(command, args) {
   return new Promise((resolve, reject) => {
@@ -79,7 +83,7 @@ function run(command, args) {
 }
 
 async function ensureTahoeWallpaper() {
-  const destination = path.join(repoRoot, "artifacts/tahoe-light.jpg");
+  const destination = path.join(path.dirname(base), "assets", "tahoe-light.jpg");
   try {
     await access(destination);
     return;
@@ -94,7 +98,7 @@ async function ensureTahoeWallpaper() {
 }
 
 async function ensureMacOSCursor() {
-  const destination = path.join(repoRoot, "artifacts/macos-arrow.png");
+  const destination = path.join(path.dirname(base), "assets", "macos-arrow.png");
   try {
     await Promise.all([access(destination), access(`${destination}.json`)]);
     return;
@@ -102,6 +106,8 @@ async function ensureMacOSCursor() {
     // Generated from the installed macOS cursor artwork and metadata.
   }
   await mkdir(path.dirname(destination), { recursive: true });
-  await run("swift", ["build", "-c", "release", "--product", "export-macos-cursor"]);
-  await run(path.join(repoRoot, ".build/release/export-macos-cursor"), [destination]);
+  if (runtimeMode(repoRoot) === "source") {
+    await run("swift", ["build", "-c", "release", "--product", "export-macos-cursor"]);
+  }
+  await run(runtimeBinaryPath(repoRoot, "export-macos-cursor"), [destination]);
 }

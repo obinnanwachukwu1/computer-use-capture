@@ -10,6 +10,7 @@ import { findScreenshotCoordinateSpaces } from "../lib/codex-screenshots.mjs";
 import { mapEventCoordinates } from "../lib/coordinate-mapper.mjs";
 import { resolveAccessibilityTargets } from "../lib/accessibility-resolver.mjs";
 import { redactAccessibilityObservation, redactEventForPersistence } from "../lib/redaction.mjs";
+import { runtimeBinaryPath, runtimeMode, verifyPrebuiltRuntime } from "../lib/runtime-binaries.mjs";
 
 const repoRoot = path.resolve(import.meta.dirname, "..");
 const outputBase = path.resolve(process.argv[2] ?? "artifacts/recording");
@@ -19,6 +20,7 @@ const targetAppName = targetApp.split(".").at(-1);
 if (!Number.isFinite(maximumDuration) || maximumDuration <= 0) {
   throw new Error("Maximum duration must be a positive number of seconds");
 }
+if (runtimeMode(repoRoot) === "prebuilt") await verifyPrebuiltRuntime(repoRoot);
 
 await mkdir(path.dirname(outputBase), { recursive: true });
 const explicitSession = process.env.AGENTRECORDER_SESSION_FILE
@@ -46,7 +48,7 @@ accessibilityStream.on("error", error => {
   requestStop();
 });
 const semanticObserver = spawn(
-  path.join(repoRoot, ".build/release/inspect-focused-element"),
+  runtimeBinaryPath(repoRoot, "inspect-focused-element"),
   [targetApp, "--watch"],
   { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"] }
 );
@@ -68,7 +70,7 @@ semanticObserver.once("error", error => {
   requestStop();
 });
 const child = spawn(
-  path.join(repoRoot, ".build/release/capture-app"),
+  runtimeBinaryPath(repoRoot, "capture-app"),
   [videoPath, String(maximumDuration), targetApp],
   { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"] }
 );

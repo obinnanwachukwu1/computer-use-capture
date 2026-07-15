@@ -1,8 +1,24 @@
 {
   "name": "computer-use-capture",
-  "private": true,
   "version": "0.1.0",
+  "description": "Turn Codex Computer Use sessions into polished macOS product-demo videos.",
   "type": "module",
+  "bin": {
+    "computer-use-capture": "scripts/mcp-server.mjs"
+  },
+  "os": ["darwin"],
+  "cpu": ["arm64"],
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "docs/mcp-tools.schema.json",
+    "lib/",
+    "scripts/mcp-server.mjs",
+    "scripts/record-session.mjs",
+    "scripts/compose-recording.mjs",
+    "vendor/darwin-arm64/"
+  ],
   "scripts": {
     "reprocess": "node scripts/reprocess-timeline.mjs",
     "test": "node --test",
@@ -12,6 +28,10 @@
     "audit:accessibility": "node scripts/audit-accessibility-vocabulary.mjs",
     "audit:alignment": "node scripts/validate-alignment.mjs",
     "audit:privacy": "node scripts/audit-repository-hygiene.mjs",
+    "build:prebuilt": "node scripts/build-prebuilt.mjs",
+    "verify:prebuilt": "node scripts/verify-prebuilt.mjs",
+    "smoke:package": "node scripts/smoke-package.mjs",
+    "prepack": "npm run build:prebuilt && npm run verify:prebuilt",
     "compare:experimental": "node scripts/compare-camera-plans.mjs --planners normal,experimental",
     "golden:update": "node scripts/golden-director-plans.mjs update",
     "test:golden": "node scripts/golden-director-plans.mjs verify",
