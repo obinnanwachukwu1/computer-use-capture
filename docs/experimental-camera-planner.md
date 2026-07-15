@@ -1,8 +1,8 @@
 # Experimental camera planner: subjects, shots, and continuous trajectories
 
-The experimental planner is a staged replacement for the normal camera model. It implements the architectural correction from the external design review: camera direction is expressed in persistent visual subjects and time-spanned shots, not as a sequence of independently optimized action poses.
+The experimental planner is a staged replacement for the normal camera model. Camera direction is expressed in persistent visual subjects and time-spanned shots, not as a sequence of independently optimized action poses.
 
-The normal planner remains the production default while this planner is compared on fresh captures and the frozen corpus.
+The normal planner remains the production default while this planner is compared on fresh captures and the deterministic fixture set.
 
 ## Ownership
 

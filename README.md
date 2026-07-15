@@ -45,8 +45,8 @@ Persistent reveals can also create an attention episode. If at least two later a
 
 This is the editing surface for now: an agent can change intent-level values and re-render without a visual timeline editor.
 
-The historical Computer Use compatibility audit is in [`docs/computer-use-compatibility.md`](docs/computer-use-compatibility.md).
-The AX and Computer Use descriptor audit is in [`docs/accessibility-vocabulary.md`](docs/accessibility-vocabulary.md). Re-run the local corpus audit with `npm run audit:accessibility`.
+The supported Computer Use envelopes are documented in [`docs/computer-use-compatibility.md`](docs/computer-use-compatibility.md).
+AX parsing and identity-field behavior are documented in [`docs/accessibility-vocabulary.md`](docs/accessibility-vocabulary.md). A local compatibility corpus can be checked with `npm run audit:accessibility`; generated results are never committed.
 
 ## MCP workflow
 
@@ -184,7 +184,7 @@ npm run audit:alignment -- artifacts/my-recording.directed.camera-audit.json
 
 The audit fails when a factual click/drag is off-screen, the synthetic hotspot misses the reconstructed target, a camera move reverses direction, a nominal pan contains a zoom pulse, or visual timing falls outside the Computer Use tool/response envelope. Preferred safety-inset misses are warnings; factual visibility is mandatory.
 
-For V2, the audit additionally fails if no hard-constraint-feasible plan exists or if the renderer applies even one emergency visibility correction. This makes the correction path a last-resort safety mechanism rather than a hidden second camera planner.
+The experimental planner audit additionally fails if no hard-constraint-feasible plan exists or if the renderer applies even one emergency visibility correction. This makes the correction path a last-resort safety mechanism rather than a hidden second camera planner.
 
 ### Agent waiting time
 

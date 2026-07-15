@@ -93,8 +93,8 @@ Or choose any planner set and fixture bases:
 node scripts/compare-camera-plans.mjs --planners normal,experimental artifacts/native-alignment-rig
 ```
 
-The planner became the normal default after passing the factual alignment gate with zero renderer visibility corrections on fresh web/native captures and the frozen native/Chrome comparison corpus. Default promotion does not delete the controls: prefer deleting an old component only after its remaining renderer/data contract has moved to a neutral type.
+The normal planner must pass the factual alignment gate with zero renderer visibility corrections on fresh web/native captures and the deterministic fixture set. Default promotion does not delete the controls: prefer deleting an old component only after its remaining renderer/data contract has moved to a neutral type.
 
 ## Current boundary
 
-This is not yet a fully end-to-end learned scene model. The bundled Swift motion analysis still produces raw timing activity and motion ranges. The stronger Python scene model can provide global structural observations through `--experimental-scene-plan`; it is not yet the automatic production default. `NativeComposition` also remains a compatibility substrate for event normalization and rendering facts. Those boundaries are deliberately called out so production success is not confused with completion of the whole migration.
+This is not yet a fully end-to-end learned scene model. The bundled Swift motion analysis produces raw timing activity and motion ranges, while `NativeComposition` remains a compatibility substrate for event normalization and rendering facts. Those boundaries are deliberately called out so production success is not confused with completion of the whole migration.

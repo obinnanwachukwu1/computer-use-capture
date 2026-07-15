@@ -11,6 +11,7 @@
     "record": "node scripts/record-session.mjs",
     "audit:accessibility": "node scripts/audit-accessibility-vocabulary.mjs",
     "audit:alignment": "node scripts/validate-alignment.mjs",
+    "audit:privacy": "node scripts/audit-repository-hygiene.mjs",
     "compare:experimental": "node scripts/compare-camera-plans.mjs --planners normal,experimental",
     "golden:update": "node scripts/golden-director-plans.mjs update",
     "test:golden": "node scripts/golden-director-plans.mjs verify",

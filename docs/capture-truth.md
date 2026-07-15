@@ -53,7 +53,7 @@ A scroll is considered a proven visual no-op only when the interval from its exa
 
 Removing a no-op scroll's hold does not remove the action record. It lets the ordinary proven-idle interval collapse to the configured still-frame handles in the edit decision list.
 
-## Tests and live probes
+## Verification
 
 `CaptureTruthTests` covers:
 
@@ -66,11 +66,4 @@ Removing a no-op scroll's hold does not remove the action record. It lets the or
 - missing metadata;
 - blank and suspended capture.
 
-Director tests verify that a factual action stays protected without proof, a proven no-op can lose only its generic hold, and every unverified interval remains contiguous at 1x.
-
-The live Safari probes found:
-
-- a six-second static capture: 242 ScreenCaptureKit `complete` samples, 240 exact-identical transitions, one exact change, and no dropped frames;
-- a dialog-open capture: 428 `complete` samples, eight exact changes across two animation bursts, 419 identical transitions, and no dropped frames.
-
-The dialog changes were retained even though ScreenCaptureKit supplied no dirty rectangles. This is the intended asymmetric behavior: uncertainty can retain too much time, but it cannot delete visible information.
+Director tests verify that a factual action stays protected without proof, a proven no-op can lose only its generic hold, and every unverified interval remains contiguous at 1x. This preserves the intended asymmetric behavior: uncertainty can retain too much time, but it cannot delete visible information.

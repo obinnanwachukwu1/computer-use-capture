@@ -32,15 +32,13 @@ struct Options {
     let cursorPath: CursorPathStyle?
     let cursorTiltStrength: Double?
     let cameraPlanner: CameraPlanner
-    let experimentalMotionObservations: URL?
-    let experimentalScenePlan: URL?
     let profile: URL?
     let useAnalysisCache: Bool
 
     static func parse() throws -> Options {
         let args = Array(CommandLine.arguments.dropFirst())
         guard args.count >= 3 else {
-            throw Failure("usage: native-compose <source.mov> <timeline.json> <output.mp4> [--experimental-camera-planner] [--output-scale 1|2] [--fps 60] [--samples 8] [--shutter 0.55] [--cursor-path natural|straight] [--cursor-tilt-strength 0...1.5] [--keep-waiting] [--waiting-time milliseconds] [--experimental-motion-observations study.json | --experimental-scene-plan scene-plan.json] [--plan-only] [--director-debug] [--profile [profile.json]] [--no-analysis-cache]")
+            throw Failure("usage: native-compose <source.mov> <timeline.json> <output.mp4> [--experimental-camera-planner] [--output-scale 1|2] [--fps 60] [--samples 8] [--shutter 0.55] [--cursor-path natural|straight] [--cursor-tilt-strength 0...1.5] [--keep-waiting] [--waiting-time milliseconds] [--plan-only] [--director-debug] [--profile [profile.json]] [--no-analysis-cache]")
         }
         func value(_ flag: String, _ fallback: String) -> String {
             guard let index = args.firstIndex(of: flag), index + 1 < args.count else { return fallback }
@@ -68,15 +66,6 @@ struct Options {
             || ProcessInfo.processInfo.environment["AGENTRECORDER_EXPERIMENTAL_CAMERA_PLANNER"] == "1"
             ? .experimental : .normal
         let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-        let experimentalMotionObservations = optionalValue("--experimental-motion-observations").map {
-            URL(fileURLWithPath: $0, relativeTo: cwd).standardizedFileURL
-        }
-        let experimentalScenePlan = optionalValue("--experimental-scene-plan").map {
-            URL(fileURLWithPath: $0, relativeTo: cwd).standardizedFileURL
-        }
-        guard experimentalMotionObservations == nil || experimentalScenePlan == nil else {
-            throw Failure("use either --experimental-motion-observations or --experimental-scene-plan, not both")
-        }
         let output = URL(fileURLWithPath: args[2], relativeTo: cwd).standardizedFileURL
         let profile: URL?
         if let index = args.firstIndex(of: "--profile") {
@@ -106,8 +95,6 @@ struct Options {
             cursorPath: cursorPath,
             cursorTiltStrength: cursorTiltStrength,
             cameraPlanner: cameraPlanner,
-            experimentalMotionObservations: experimentalMotionObservations,
-            experimentalScenePlan: experimentalScenePlan,
             profile: profile,
             useAnalysisCache: !args.contains("--no-analysis-cache")
         )
@@ -191,7 +178,7 @@ func render(_ options: Options) async throws {
     let fallbackActionTimes = Dictionary(uniqueKeysWithValues: timeline.events.enumerated().compactMap { id, event in
         event.time.map { (id, $0) }
     })
-    let collectMotionFields = options.directorDebug || options.experimentalMotionObservations != nil
+    let collectMotionFields = options.directorDebug
     let cachedMotionAnalysis = try MotionAnalysisCache.resolve(
         source: options.source,
         fallbackActionTimes: fallbackActionTimes,
@@ -213,53 +200,7 @@ func render(_ options: Options) async throws {
     }
     let rawMotionAnalysis = cachedMotionAnalysis.analysis
     profiler.complete("motionAnalysis")
-    let motionAnalysis: MotionAnalysis
-    if let scenePlanURL = options.experimentalScenePlan {
-        let scenePlan = try JSONDecoder().decode(
-            GlobalScenePlanFile.self,
-            from: Data(contentsOf: scenePlanURL)
-        )
-        guard scenePlan.version == 1 else {
-            throw Failure("experimental scene plan must use version 1")
-        }
-        guard scenePlan.coordinateSpace == "source-window-normalized-top-left" else {
-            throw Failure("experimental scene plan must use source-window-normalized-top-left coordinates")
-        }
-        motionAnalysis = MotionAnalysis(
-            ranges: rawMotionAnalysis.ranges,
-            sampledFrames: rawMotionAnalysis.sampledFrames,
-            motionFrames: rawMotionAnalysis.motionFrames,
-            observations: applyingGlobalScenePlan(scenePlan, to: rawMotionAnalysis.observations),
-            interactionPhases: rawMotionAnalysis.interactionPhases,
-            motionFields: rawMotionAnalysis.motionFields
-        )
-        print("native experimental-scene-plan=\(scenePlan.sceneEpisodes.count) model=\(scenePlan.model) source=\(scenePlanURL.path)")
-    } else if let overrideURL = options.experimentalMotionObservations {
-        let overrideFile = try JSONDecoder().decode(
-            MotionObservationOverrideFile.self,
-            from: Data(contentsOf: overrideURL)
-        )
-        guard overrideFile.version == 1 else {
-            throw Failure("experimental motion observations must use version 1")
-        }
-        guard overrideFile.coordinateSpace == "source-window-normalized-top-left" else {
-            throw Failure("experimental motion observations must use source-window-normalized-top-left coordinates")
-        }
-        motionAnalysis = MotionAnalysis(
-            ranges: rawMotionAnalysis.ranges,
-            sampledFrames: rawMotionAnalysis.sampledFrames,
-            motionFrames: rawMotionAnalysis.motionFrames,
-            observations: applyingMotionObservationOverrides(
-                overrideFile.observationOverrides,
-                to: rawMotionAnalysis.observations
-            ),
-            interactionPhases: rawMotionAnalysis.interactionPhases,
-            motionFields: rawMotionAnalysis.motionFields
-        )
-        print("native experimental-motion-observations=\(overrideFile.observationOverrides.count) source=\(overrideURL.path)")
-    } else {
-        motionAnalysis = rawMotionAnalysis
-    }
+    let motionAnalysis = rawMotionAnalysis
     let captureTruth = loadCaptureTruth(
         timeline: timeline,
         timelineURL: options.timeline,

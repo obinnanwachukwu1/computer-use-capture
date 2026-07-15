@@ -1,21 +1,15 @@
-# Computer Use compatibility audit
+# Computer Use compatibility
 
-A read-only scan covered 3,409 Codex session files under `~/.codex/sessions` and `~/.codex/archived_sessions`.
+Computer Use Capture treats the invocation envelope as the compatibility boundary rather than assuming one transport. The adapter supports:
 
-## Result
-
-Computer Use action semantics and argument names have been comparatively stable. The invocation transport changed materially in July 2026:
-
-- From April 17 through July 7, 1,546 calls used direct `mcp_tool_call_end` invocations with `server: "computer-use"`, a method in `tool`, and its object in `arguments`.
-- On July 11–12, 286 records used `server: "node_repl"`, `tool: "js"`, with one or more `sky.*` calls embedded in JavaScript.
-
-Historical direct-method totals were 623 clicks, 485 state reads, 164 key presses, 120 value assignments, 73 text insertions, 41 app listings, 26 secondary actions, 12 scrolls, and 2 text selections. The dominant argument shapes match the current `sky` API: coordinate or element clicks, `from_x/from_y/to_x/to_y` drags, element-based scrolls, and app-scoped keyboard/text actions.
+- direct `mcp_tool_call_end` invocations with `server: "computer-use"`, a method in `tool`, and an object in `arguments`;
+- Node REPL invocations with `server: "node_repl"`, `tool: "js"`, and one or more ordered `sky.*` calls embedded in JavaScript.
 
 The compatibility boundary is therefore the envelope, not the action vocabulary. `lib/codex-events.mjs` supports both transports, normalizes known camelCase aliases, preserves original method names, parses multiple ordered `sky.*` calls, and retains unknown future methods as additive events.
 
 ## Result payload cautions
 
-Older direct calls commonly returned base64 image blocks as JPEG or PNG. Current Node REPL calls generally return text and top-level `codex/toolSurface` metadata, with screenshots exposed as local `file://` URLs when serialized. A small number of historical image blocks declared PNG while containing JPEG bytes, so any future image ingestion must sniff bytes rather than trusting MIME metadata.
+Direct calls may return base64 image blocks as JPEG or PNG. Node REPL calls may return text and top-level `codex/toolSurface` metadata, with screenshots exposed as local `file://` URLs when serialized. Image ingestion must sniff bytes rather than trusting declared MIME metadata.
 
 ## Compatibility fixtures to retain
 

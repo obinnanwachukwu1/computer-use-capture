@@ -1,0 +1,11 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Generated dependencies and local render products are never repository inputs"
+paths = [
+  '''(^|/)\.build(/|$)''',
+  '''(^|/)node_modules(/|$)''',
+  '''(^|/)artifacts(/|$)''',
+  '''(^|/)\.benchmarks(/|$)'''
+]

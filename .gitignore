@@ -33,3 +33,6 @@ artifacts/
 .vscode/
 .idea/
 *~
+
+# Local research prototypes are retained on the developer machine, never shipped
+.local-research/

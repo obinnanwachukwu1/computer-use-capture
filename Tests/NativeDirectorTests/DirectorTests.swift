@@ -122,47 +122,6 @@ private func composition(
     #expect(abs(exp(camera.logScale) - 1) < 0.000_001)
 }
 
-@Test func globalScenePlanOwnsStructuralObservationsButPreservesTranslation() throws {
-    let plan = try JSONDecoder().decode(GlobalScenePlanFile.self, from: Data("""
-    {
-      "version": 1,
-      "coordinateSpace": "source-window-normalized-top-left",
-      "model": "global-scene-sequence-v1",
-      "sceneEpisodes": [
-        {"start": 3.0, "end": 3.4, "kind": "contextTransition", "bounds": null,
-         "features": {"evidenceCoverage": 0.3}},
-        {"start": 5.0, "end": 5.5, "kind": "focusGained",
-         "bounds": {"x": 0.3, "y": 0.2, "width": 0.4, "height": 0.5},
-         "features": {"evidenceCoverage": 0.2}},
-        {"start": 8.0, "end": 8.3, "kind": "focusReleased",
-         "bounds": {"x": 0.3, "y": 0.2, "width": 0.4, "height": 0.5},
-         "features": {"evidenceCoverage": 0.2}}
-      ]
-    }
-    """.utf8))
-    let original = [
-        VisualMotionObservation(
-            time: 2.0, normalizedBounds: CGRect(x: 0, y: 0.2, width: 1, height: 0.7),
-            changedFraction: 0.3, magnitude: 1, kind: .translation
-        ),
-        VisualMotionObservation(
-            time: 3.3, normalizedBounds: CGRect(x: 0.2, y: 0.2, width: 0.3, height: 0.3),
-            changedFraction: 0.1, magnitude: 0.8, kind: .appearance
-        ),
-        VisualMotionObservation(
-            time: 5.7, normalizedBounds: CGRect(x: 0.1, y: 0.1, width: 0.8, height: 0.8),
-            changedFraction: 0.2, magnitude: 0.9, kind: .focus, focusTransition: .gained
-        ),
-    ]
-
-    let result = applyingGlobalScenePlan(plan, to: original)
-    #expect(result.count == 4)
-    #expect(result.filter { $0.kind == .translation }.count == 1)
-    #expect(result.filter { $0.kind == .appearance }.isEmpty)
-    #expect(result.filter { $0.kind == .contextTransition }.count == 1)
-    #expect(result.filter { $0.kind == .focus }.map(\.focusTransition) == [.gained, .released])
-}
-
 @Test func overlappingWideResponsesShareOneTightShotPose() throws {
     let directed = try composition("""
     [
@@ -873,36 +832,6 @@ private struct TimelineFixture: Encodable {
     #expect(fullTile == 6)
     #expect(halfTile == 3)
     #expect(abs(Double(fullTile) / Double(fullWidth) - Double(halfTile) / Double(halfWidth)) < 0.000_001)
-}
-
-@Test func experimentalObservationOverrideReplacesOnlyVisualEvidenceInItsCausalWindow() {
-    let original = [
-        VisualMotionObservation(time: 3.2, normalizedBounds: CGRect(x: 0.1, y: 0.1, width: 0.2, height: 0.2), changedFraction: 0.1, magnitude: 0.5, kind: .appearance),
-        VisualMotionObservation(time: 3.3, normalizedBounds: CGRect(x: 0, y: 0, width: 1, height: 1), changedFraction: 0.5, magnitude: 0.8, kind: .translation),
-        VisualMotionObservation(time: 8, normalizedBounds: CGRect(x: 0.6, y: 0.6, width: 0.1, height: 0.1), changedFraction: 0.1, magnitude: 0.5, kind: .appearance),
-    ]
-    let replacement = MotionObservationOverride(
-        actionID: 4,
-        replaceStart: 3,
-        replaceEnd: 4,
-        time: 3.7,
-        bounds: .init(x: 0.3, y: 0.2, width: 0.4, height: 0.5),
-        kind: .focus,
-        focusTransition: .gained,
-        changedFraction: 0.2,
-        magnitude: 0.9
-    )
-
-    let result = applyingMotionObservationOverrides([replacement], to: original)
-    #expect(result.count == 3)
-    #expect(result.contains { $0.kind == .translation && $0.time == 3.3 })
-    #expect(result.contains { $0.kind == .appearance && $0.time == 8 })
-    let focus = result.first { $0.kind == .focus }
-    #expect(abs((focus?.normalizedBounds.minX ?? 0) - 0.3) < 0.000_001)
-    #expect(abs((focus?.normalizedBounds.minY ?? 0) - 0.2) < 0.000_001)
-    #expect(abs((focus?.normalizedBounds.width ?? 0) - 0.4) < 0.000_001)
-    #expect(abs((focus?.normalizedBounds.height ?? 0) - 0.5) < 0.000_001)
-    #expect(focus?.focusTransition == .gained)
 }
 
 private func texturedFrame(width: Int, height: Int) -> [UInt8] {
