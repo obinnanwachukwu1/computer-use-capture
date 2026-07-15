@@ -9,7 +9,7 @@ const positional = argv.filter((value, index) =>
 );
 
 if (positional.length < 2) {
-  console.error("usage: npm run benchmark:pipeline -- <source.mov> <timeline.json> [--mode both|plan|render] [--trials 3] [--planner v3] [--fps 60] [--samples 8] [--analysis-cache warm|cold|off] [--output-scale 1] [--output directory] [--keep-outputs]");
+  console.error("usage: npm run benchmark:pipeline -- <source.mov> <timeline.json> [--mode both|plan|render] [--planner normal|experimental] [--fps 60] [--samples 8] [--analysis-cache warm|cold|off] [--output-scale 1] [--output directory] [--keep-outputs]");
   process.exit(2);
 }
 
@@ -17,7 +17,7 @@ const source = path.resolve(positional[0]);
 const timeline = path.resolve(positional[1]);
 const mode = value("--mode", "both");
 const trials = positiveInteger("--trials", 3);
-const planner = value("--planner", "v3");
+const planner = value("--planner", "normal");
 const fps = positiveInteger("--fps", 60);
 const samples = positiveInteger("--samples", 8);
 const outputScale = positiveInteger("--output-scale", 1);
@@ -32,6 +32,10 @@ const modes = mode === "both" ? ["plan", "render"] : [mode];
 if (!modes.every(candidate => ["plan", "render"].includes(candidate))) {
   throw new Error("--mode must be both, plan, or render");
 }
+if (!["normal", "experimental"].includes(planner)) {
+  throw new Error("--planner must be normal or experimental");
+}
+const plannerArgs = planner === "experimental" ? ["--experimental-camera-planner"] : [];
 
 await mkdir(outputDirectory, { recursive: true });
 await run("swift", ["build", "-c", "release", "--product", "native-compose"], { inherit: true });
@@ -43,7 +47,7 @@ if (analysisCache === "warm") {
   const primeProfile = path.join(outputDirectory, "cache-prime.profile.json");
   await run(binary, [
     source, timeline, primeOutput,
-    "--camera-planner", planner,
+    ...plannerArgs,
     "--fps", String(fps),
     "--samples", String(samples),
     "--output-scale", String(outputScale),
@@ -62,7 +66,7 @@ for (const currentMode of modes) {
     const profile = path.join(outputDirectory, `${stem}.profile.json`);
     const composeArgs = [
       source, timeline, output,
-      "--camera-planner", planner,
+      ...plannerArgs,
       "--fps", String(fps),
       "--samples", String(samples),
       "--output-scale", String(outputScale),

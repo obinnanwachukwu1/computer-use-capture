@@ -32,27 +32,41 @@ public enum GlobalRetimePlanner {
         protectedResponseRanges: [ClosedRange<Double>] = [],
         verifiedIdleRanges: [ClosedRange<Double>]? = nil,
         provenIdleActionIDs: Set<Int> = [],
+        firstPointerMovementTime: Double? = nil,
         reduceWaiting: Bool,
         waitingTime: Double,
         deadTimeRate: Double
     ) -> [RetimeSegment] {
         guard sourceDuration > 0 else { return [] }
-        let actionRanges = actions.filter { !provenIdleActionIDs.contains($0.id) }.map { action in
-            max(0, action.time - 0.82)...min(sourceDuration, NativeComposition.holdEnd(for: action))
-        } + protectedInteractionRanges.map {
-            max(0, $0.lowerBound)...min(sourceDuration, $0.upperBound)
-        }.filter { $0.upperBound > $0.lowerBound }
-            + [0...min(sourceDuration, 1.4), max(0, sourceDuration - 1.1)...sourceDuration]
         let motion = motionRanges.map {
-            max(0, $0.lowerBound)...min(sourceDuration, $0.upperBound)
-        }.filter { $0.upperBound > $0.lowerBound }
-        let protectedResponses = protectedResponseRanges.map {
             max(0, $0.lowerBound)...min(sourceDuration, $0.upperBound)
         }.filter { $0.upperBound > $0.lowerBound }
         let verifiedIdle = verifiedIdleRanges?.map {
             max(0, $0.lowerBound)...min(sourceDuration, $0.upperBound)
         }.filter { $0.upperBound > $0.lowerBound }
+        let leadingTrimStart = computeLeadingTrimStart(
+            sourceDuration: sourceDuration,
+            firstPointerMovementTime: firstPointerMovementTime,
+            motionRanges: motion,
+            verifiedIdleRanges: verifiedIdle,
+            reduceWaiting: reduceWaiting
+        )
+        var actionRanges = actions.filter { !provenIdleActionIDs.contains($0.id) }.map { action in
+            max(0, action.time - 0.82)...min(sourceDuration, NativeComposition.holdEnd(for: action))
+        } + protectedInteractionRanges.map {
+            max(0, $0.lowerBound)...min(sourceDuration, $0.upperBound)
+        }.filter { $0.upperBound > $0.lowerBound }
+            + [max(0, sourceDuration - 1.1)...sourceDuration]
+        if let leadingTrimStart, let firstPointerMovementTime {
+            actionRanges.append(leadingTrimStart...min(sourceDuration, firstPointerMovementTime))
+        } else {
+            actionRanges.append(0...min(sourceDuration, 1.4))
+        }
+        let protectedResponses = protectedResponseRanges.map {
+            max(0, $0.lowerBound)...min(sourceDuration, $0.upperBound)
+        }.filter { $0.upperBound > $0.lowerBound }
         var boundaryValues = [0, sourceDuration]
+        if let leadingTrimStart { boundaryValues.append(leadingTrimStart) }
         boundaryValues += actionRanges.flatMap { [$0.lowerBound, $0.upperBound] }
         boundaryValues += motion.flatMap { [$0.lowerBound, $0.upperBound] }
         boundaryValues += protectedResponses.flatMap { [$0.lowerBound, $0.upperBound] }
@@ -79,24 +93,26 @@ public enum GlobalRetimePlanner {
 
         var raw: [(Double, Double, Double)] = []
         for interval in labeled {
+            if let leadingTrimStart, interval.end <= leadingTrimStart { continue }
+            let intervalStart = max(interval.start, leadingTrimStart ?? 0)
             switch interval.label {
             case .action, .protectedResponse:
-                raw.append((interval.start, interval.end, 1))
+                raw.append((intervalStart, interval.end, 1))
             case .unverified:
                 // Missing provenance is not evidence of idleness. Preserve it
                 // at source speed rather than allowing an editorial detector
                 // to erase a factual interval.
-                raw.append((interval.start, interval.end, 1))
+                raw.append((intervalStart, interval.end, 1))
             case .ambientMotion:
-                raw.append((interval.start, interval.end, max(1, deadTimeRate)))
+                raw.append((intervalStart, interval.end, max(1, deadTimeRate)))
             case .staticGap:
                 if !reduceWaiting {
-                    raw.append((interval.start, interval.end, max(1, deadTimeRate)))
+                    raw.append((intervalStart, interval.end, max(1, deadTimeRate)))
                     continue
                 }
-                let retained = min(interval.end - interval.start, max(0, waitingTime))
+                let retained = min(interval.end - intervalStart, max(0, waitingTime))
                 let leading = retained / 2
-                if leading > 0 { raw.append((interval.start, interval.start + leading, 1)) }
+                if leading > 0 { raw.append((intervalStart, intervalStart + leading, 1)) }
                 let trailing = retained - leading
                 if trailing > 0 { raw.append((interval.end - trailing, interval.end, 1)) }
             }
@@ -111,4 +127,42 @@ public enum GlobalRetimePlanner {
             return segment
         }
     }
+}
+
+private func computeLeadingTrimStart(
+    sourceDuration: Double,
+    firstPointerMovementTime: Double?,
+    motionRanges: [ClosedRange<Double>],
+    verifiedIdleRanges: [ClosedRange<Double>]?,
+    reduceWaiting: Bool
+) -> Double? {
+    guard reduceWaiting,
+          let firstPointerMovementTime,
+          firstPointerMovementTime > 1,
+          firstPointerMovementTime <= sourceDuration,
+          let verifiedIdleRanges,
+          !motionRanges.contains(where: {
+              $0.lowerBound < firstPointerMovementTime && $0.upperBound > 0
+          }),
+          coversContinuously(
+              0...firstPointerMovementTime,
+              with: verifiedIdleRanges
+          )
+    else { return nil }
+    return firstPointerMovementTime - 1
+}
+
+private func coversContinuously(
+    _ required: ClosedRange<Double>,
+    with ranges: [ClosedRange<Double>],
+    tolerance: Double = 0.000_001
+) -> Bool {
+    var coveredThrough = required.lowerBound
+    for range in ranges.sorted(by: { $0.lowerBound < $1.lowerBound }) {
+        if range.upperBound < coveredThrough - tolerance { continue }
+        if range.lowerBound > coveredThrough + tolerance { return false }
+        coveredThrough = max(coveredThrough, range.upperBound)
+        if coveredThrough >= required.upperBound - tolerance { return true }
+    }
+    return coveredThrough >= required.upperBound - tolerance
 }

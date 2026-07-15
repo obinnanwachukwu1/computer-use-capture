@@ -60,7 +60,6 @@ through the unchanged director and camera planner for detector A/B evaluation:
 
 ```sh
 swift run native-compose source.mov timeline.json /tmp/oracle.mp4 \
-  --camera-planner v3 \
   --experimental-motion-observations /tmp/focus-study/study.json
 ```
 
@@ -96,7 +95,6 @@ cost for inspection.
 ```sh
 python3 scripts/motion_scene_model.py source.mov --output /tmp/global-scene
 swift run native-compose source.mov timeline.json /tmp/global.mp4 \
-  --camera-planner v3 \
   --experimental-scene-plan /tmp/global-scene/scene-plan.json
 ```
 

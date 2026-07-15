@@ -1,6 +1,6 @@
-# Production planner V3
+# Production planner
 
-V3 is the default path for replacing locally staged direction with one clip-wide inference problem. V1 and V2 remain available as controls; V3 does not call either planner and does not consume their shot groupings.
+This is the normal and default camera path: one clip-wide inference problem rather than locally staged direction.
 
 ## Ownership
 
@@ -15,7 +15,7 @@ ProductionPlanGraph
   foreground lifecycles
   attention alternatives
         ↓
-ProductionPlannerV3
+ProductionPlanner
   clip-wide beam over actions
   activation pose + response pose
   camera trajectory
@@ -26,7 +26,7 @@ GlobalRetimePlanner
 NativeComposition adapter → renderer + audit
 ```
 
-The adapter exists because cursor interpolation, source/output time mapping, rendering, and validation already consume `NativeComposition`. For V3 it contains no inferred shots. Its earlier local attention, shot, and retime choices are replaced by the global selections before rendering.
+The adapter exists because cursor interpolation, source/output time mapping, rendering, and validation already consume `NativeComposition`. It contains no inferred shots. Its earlier local attention, shot, and retime choices are replaced by the global selections before rendering.
 
 ## Evidence is not a decision
 
@@ -72,29 +72,29 @@ Because retiming changes camera scheduling and selected timing changes retiming,
 Plan without rendering:
 
 ```sh
-npm run compose -- artifacts/my-recording --camera-planner v3 --plan-only
+npm run compose -- artifacts/my-recording --plan-only
 ```
 
-V3 writes:
+The normal planner writes:
 
 - `.director.json`: renderer-facing resolved actions, attention, and retime;
 - `.camera-audit.json`: the exact sampled trajectory, factual alignment, and emergency correction count;
 - `.production-plan.json`: selected timing and attention hypothesis IDs, observation ownership, activation/response poses, camera moves, and cumulative costs.
 
-Compare production V3 with experimental V4 on both standard fixtures:
+Compare the normal and experimental planners on both standard fixtures:
 
 ```sh
-npm run compare:v4
+npm run compare:experimental
 ```
 
 Or choose any planner set and fixture bases:
 
 ```sh
-node scripts/compare-camera-plans.mjs --planners v3,v4 artifacts/native-alignment-rig
+node scripts/compare-camera-plans.mjs --planners normal,experimental artifacts/native-alignment-rig
 ```
 
-V3 became the default after passing the factual alignment gate with zero renderer visibility corrections on fresh web/native captures and the frozen native/Chrome comparison corpus. Default promotion does not delete the controls: prefer deleting an old component only after its remaining renderer/data contract has moved to a neutral type and V3 has clearly superseded its policy behavior.
+The planner became the normal default after passing the factual alignment gate with zero renderer visibility corrections on fresh web/native captures and the frozen native/Chrome comparison corpus. Default promotion does not delete the controls: prefer deleting an old component only after its remaining renderer/data contract has moved to a neutral type.
 
 ## Current boundary
 
-This is not yet a fully end-to-end learned scene model. The bundled Swift motion analysis still produces raw timing activity and motion ranges. The stronger Python scene model can provide global structural observations through `--experimental-scene-plan`; it is not yet the automatic production default. `NativeComposition` also remains a compatibility substrate for event normalization and rendering facts. Those boundaries are deliberately called out so a V3 success is not confused with completion of the whole migration.
+This is not yet a fully end-to-end learned scene model. The bundled Swift motion analysis still produces raw timing activity and motion ranges. The stronger Python scene model can provide global structural observations through `--experimental-scene-plan`; it is not yet the automatic production default. `NativeComposition` also remains a compatibility substrate for event normalization and rendering facts. Those boundaries are deliberately called out so production success is not confused with completion of the whole migration.

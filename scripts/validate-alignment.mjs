@@ -22,8 +22,8 @@ if ((audit.pointerEvidence?.unresolved ?? 0) > 0) {
   );
 }
 
-if (audit.planner?.startsWith("v3") || audit.planner?.startsWith("v4")) {
-  const plannerFamily = audit.planner.startsWith("v4") ? "v4" : "v3";
+if (audit.planner?.startsWith("normal") || audit.planner?.startsWith("experimental")) {
+  const plannerFamily = audit.planner.startsWith("experimental") ? "experimental" : "normal";
   if (audit.planFeasible !== true) {
     failures.push(`${plannerFamily} camera plan is infeasible${audit.planFailure ? `: ${audit.planFailure}` : ""}`);
   }
@@ -158,5 +158,5 @@ function zip(left, right) {
 }
 
 function isEpisodeBoundary(move) {
-  return /(?:episode-\d+-end|shot-zoom-out|viewport-relocation-zoom-out|v3-scene-transition|v3-focus-release)/.test(move.label ?? "");
+  return /(?:episode-\d+-end|shot-zoom-out|viewport-relocation-zoom-out|normal-scene-transition|normal-focus-release)/.test(move.label ?? "");
 }

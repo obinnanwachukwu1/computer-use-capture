@@ -8,9 +8,9 @@ const args = process.argv.slice(2);
 const plannerFlag = args.indexOf("--planners");
 const planners = plannerFlag >= 0
   ? args[plannerFlag + 1].split(",").map(value => value.trim()).filter(Boolean)
-  : ["v3", "v4"];
-if (!planners.length || planners.some(planner => !["v3", "v4"].includes(planner))) {
-  throw new Error("--planners must contain a comma-separated subset of v3,v4");
+  : ["normal", "experimental"];
+if (!planners.length || planners.some(planner => !["normal", "experimental"].includes(planner))) {
+  throw new Error("--planners must contain a comma-separated subset of normal,experimental");
 }
 const requested = args.filter((_, index) => index !== plannerFlag && index !== plannerFlag + 1);
 const fixtures = requested.length ? requested : [
@@ -26,11 +26,13 @@ for (const fixture of fixtures) {
   const plans = {};
   for (const planner of planners) {
     const output = path.join(outputRoot, `${path.basename(base)}-${planner}.mp4`);
-    await run(process.execPath, [
+    const composeArgs = [
       path.join(repoRoot, "scripts", "compose-recording.mjs"), base,
-      "--output", output, "--plan-only", "--camera-planner", planner,
+      "--output", output, "--plan-only",
       "--director-debug"
-    ]);
+    ];
+    if (planner === "experimental") composeArgs.push("--experimental-camera-planner");
+    await run(process.execPath, composeArgs);
     const auditPath = output.replace(/\.mp4$/, ".camera-audit.json");
     const directorPath = output.replace(/\.mp4$/, ".director.json");
     const validation = await run(process.execPath, [

@@ -1628,7 +1628,7 @@ private func rectArea(_ rect: CGRect) -> CGFloat {
     #expect(timings.contains { abs($0.activation - 4.3) < 0.001 })
 }
 
-@Test func productionPlannerV3UsesSeparateActivationAndResponsePoses() throws {
+@Test func productionPlannerUsesSeparateActivationAndResponsePoses() throws {
     let directed = try composition("""
     [
       {"action":"click","time":2.0,"coordinates":{"xNorm":0.5,"yNorm":0.5},"targetResolution":{"provenance":"direct","confidence":0.99}},
@@ -1652,7 +1652,7 @@ private func rectArea(_ rect: CGRect) -> CGFloat {
         observations: observations, motionRanges: [2.2...2.5, 5.2...5.5]
     )
     let base = CameraState(x: size.width / 2, y: size.height / 2, logScale: 0)
-    let plan = ProductionPlannerV3.plan(graph: graph, composition: directed, base: base)
+    let plan = ProductionPlanner.plan(graph: graph, composition: directed, base: base)
     let close = try #require(plan.decisions.last)
 
     #expect(plan.camera.diagnostics.feasible)
@@ -1661,7 +1661,7 @@ private func rectArea(_ rect: CGRect) -> CGFloat {
     #expect(plan.camera.moves.contains { $0.label.contains("focus-release") })
 }
 
-@Test func productionPlannerV3RetainsStructuralAlternativesBeyondCheapPoseVariants() throws {
+@Test func productionPlannerRetainsStructuralAlternativesBeyondCheapPoseVariants() throws {
     let phases = InteractionPhases(
         rawEstimate: 2.0,
         toolStart: 1.6,
@@ -1696,14 +1696,14 @@ private func rectArea(_ rect: CGRect) -> CGFloat {
         observations: observations, motionRanges: [2.3...2.6]
     )
     let base = CameraState(x: size.width / 2, y: size.height / 2, logScale: 0)
-    let plan = ProductionPlannerV3.plan(graph: graph, composition: directed, base: base)
+    let plan = ProductionPlanner.plan(graph: graph, composition: directed, base: base)
     let decision = try #require(plan.decisions.first)
 
     #expect(plan.camera.diagnostics.feasible)
     #expect(decision.observationIDs == [0])
 }
 
-@Test func productionPlannerV3UsesInformationGainToPreferSubstantialReveal() throws {
+@Test func productionPlannerUsesInformationGainToPreferSubstantialReveal() throws {
     let directed = try composition("""
     [{"action":"click","time":2.0,"coordinates":{"xNorm":0.5,"yNorm":0.5},"targetResolution":{"provenance":"direct","confidence":0.99}}]
     """, duration: 6)
@@ -1724,13 +1724,13 @@ private func rectArea(_ rect: CGRect) -> CGFloat {
         observations: observations, motionRanges: [2.2...2.6]
     )
     let base = CameraState(x: size.width / 2, y: size.height / 2, logScale: 0)
-    let plan = ProductionPlannerV3.plan(graph: graph, composition: directed, base: base)
+    let plan = ProductionPlanner.plan(graph: graph, composition: directed, base: base)
     let decision = try #require(plan.decisions.first)
 
     #expect(decision.observationIDs == [1])
 }
 
-@Test func productionPlannerV3ContextTransitionRequiresEstablishingOverview() throws {
+@Test func productionPlannerContextTransitionRequiresEstablishingOverview() throws {
     let directed = try composition("""
     [
       {"action":"click","time":2.0,"coordinates":{"xNorm":0.12,"yNorm":0.46},"targetResolution":{"provenance":"direct","confidence":0.99}},
@@ -1756,7 +1756,7 @@ private func rectArea(_ rect: CGRect) -> CGFloat {
         observations: observations, motionRanges: [2.0...2.5, 4.2...4.7]
     )
     let base = CameraState(x: size.width / 2, y: size.height / 2, logScale: 0)
-    let plan = ProductionPlannerV3.plan(graph: graph, composition: directed, base: base)
+    let plan = ProductionPlanner.plan(graph: graph, composition: directed, base: base)
     let transition = try #require(plan.decisions.first)
 
     #expect(transition.observationIDs == [0])
@@ -1789,7 +1789,7 @@ private func rectArea(_ rect: CGRect) -> CGFloat {
     })
 }
 
-@Test func productionPlannerV3SettlesBeforeSemanticVisibilityBegins() throws {
+@Test func productionPlannerSettlesBeforeSemanticVisibilityBegins() throws {
     let directed = try composition(
         """
         [
@@ -1806,17 +1806,17 @@ private func rectArea(_ rect: CGRect) -> CGFloat {
     // field. The planner must travel, so this exercises the shared boundary
     // rather than passing vacuously at overview.
     let base = CameraState(x: 220, y: size.height / 2, logScale: log(1.5))
-    let plan = ProductionPlannerV3.plan(graph: graph, composition: directed, base: base)
+    let plan = ProductionPlanner.plan(graph: graph, composition: directed, base: base)
 
     #expect(plan.camera.diagnostics.feasible)
     let secondVisibility = try #require(NativeComposition.semanticVisibilityStart(
         for: directed.actions[0]
     ))
-    let secondMove = try #require(plan.camera.moves.first { $0.label == "v3-action-0" })
+    let secondMove = try #require(plan.camera.moves.first { $0.label == "normal-action-0" })
     #expect(secondMove.end <= directed.outputTime(atSourceTime: secondVisibility) + 0.001)
 }
 
-@Test func productionPlannerV3RevealsAnOffscreenFactualCursorDeparture() throws {
+@Test func productionPlannerRevealsAnOffscreenFactualCursorDeparture() throws {
     let directed = try composition(
         """
         [{"action":"click","time":3.0,"coordinates":{"xNorm":0.82,"yNorm":0.82},"targetResolution":{"provenance":"direct","confidence":0.99}}]
@@ -1828,8 +1828,8 @@ private func rectArea(_ rect: CGRect) -> CGFloat {
         observations: [], motionRanges: []
     )
     let base = CameraState(x: 820, y: 650, logScale: log(1.58))
-    let plan = ProductionPlannerV3.plan(graph: graph, composition: directed, base: base)
-    let reveal = try #require(plan.camera.moves.first { $0.label == "v3-action-0" })
+    let plan = ProductionPlanner.plan(graph: graph, composition: directed, base: base)
+    let reveal = try #require(plan.camera.moves.first { $0.label == "normal-action-0" })
     let trip = try #require(directed.pointerTrip(forActionID: 0))
 
     #expect(plan.camera.diagnostics.feasible)
@@ -1925,7 +1925,7 @@ private func rectArea(_ rect: CGRect) -> CGFloat {
             .init(time: 2.0, state: CameraState(x: 620, y: 460, logScale: log(1.2))),
             .init(time: 2.5, state: CameraState(x: 680, y: 490, logScale: log(1.3)))
         ])],
-        diagnostics: CameraPlanDiagnostics(plannerVersion: "v4-test", feasible: true)
+        diagnostics: CameraPlanDiagnostics(plannerVersion: "experimental-test", feasible: true)
     )
     let tracked = cameraState(at: 2.0, plan: plan, base: base)
     #expect(abs(tracked.x - 620) < 0.001)
@@ -2021,6 +2021,54 @@ private func rectArea(_ rect: CGRect) -> CGFloat {
     #expect(retime.contains { $0.sourceStart <= 5 && $0.sourceEnd >= 5 && $0.rate == 1 })
     #expect(retime.contains { $0.sourceStart <= 8 && $0.sourceEnd >= 10 && $0.rate == 6 })
     #expect(retime.reduce(0) { $0 + $1.outputDuration } < 7)
+}
+
+@Test func globalRetimeStartsOneSecondBeforeFirstPointerMovementWhenOpeningIsProvenIdle() {
+    let retime = GlobalRetimePlanner.plan(
+        actions: [],
+        sourceDuration: 10,
+        motionRanges: [],
+        verifiedIdleRanges: [0...5],
+        firstPointerMovementTime: 5,
+        reduceWaiting: true,
+        waitingTime: 0.1,
+        deadTimeRate: 6
+    )
+
+    #expect(abs((retime.first?.sourceStart ?? -1) - 4) < 0.000_001)
+    #expect(retime.first?.sourceEnd ?? 0 >= 5)
+    #expect(retime.first?.rate == 1)
+    let pointerOutputTime = retime.reduce(0.0) { output, segment in
+        guard segment.sourceStart < 5 else { return output }
+        return output + (min(5, segment.sourceEnd) - segment.sourceStart) / segment.rate
+    }
+    #expect(abs(pointerOutputTime - 1) < 0.000_001)
+}
+
+@Test func globalRetimePreservesOpeningWhenLeadingIdleIsNotProven() {
+    let unverified = GlobalRetimePlanner.plan(
+        actions: [], sourceDuration: 10, motionRanges: [],
+        verifiedIdleRanges: [], firstPointerMovementTime: 5,
+        reduceWaiting: true, waitingTime: 0.1, deadTimeRate: 6
+    )
+    let visibleMotion = GlobalRetimePlanner.plan(
+        actions: [], sourceDuration: 10, motionRanges: [2...2.5],
+        verifiedIdleRanges: [0...5], firstPointerMovementTime: 5,
+        reduceWaiting: true, waitingTime: 0.1, deadTimeRate: 6
+    )
+
+    #expect(unverified.first?.sourceStart == 0)
+    #expect(visibleMotion.first?.sourceStart == 0)
+}
+
+@Test func globalRetimeKeepsShortOpeningBeforeEarlyPointerMovement() {
+    let retime = GlobalRetimePlanner.plan(
+        actions: [], sourceDuration: 4, motionRanges: [],
+        verifiedIdleRanges: [0...0.8], firstPointerMovementTime: 0.8,
+        reduceWaiting: true, waitingTime: 0.1, deadTimeRate: 6
+    )
+
+    #expect(retime.first?.sourceStart == 0)
 }
 
 @Test func globalRetimeProtectsSelectedStructuralResponseAndReadingHold() throws {

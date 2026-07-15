@@ -717,6 +717,12 @@ public struct NativeComposition: Sendable {
         }
     }
 
+    /// The first reconstructed pointer departure in source time. This comes
+    /// from the Computer Use action choreography, not the macOS system cursor.
+    public var firstPointerMovementTime: Double? {
+        pointerTravel.map(\.start).min()
+    }
+
     /// Source-time intervals whose continuity is part of the factual pointer
     /// record. Retiming must preserve the complete trip, not merely a generic
     /// shoulder before the activation, or an editorial cut can turn a smooth

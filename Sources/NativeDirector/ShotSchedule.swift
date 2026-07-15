@@ -159,7 +159,7 @@ public enum ShotSchedulePlanner {
                     : nil
                 let arrivalDeadline = semanticDeadline ?? overviewDeadline ?? (start + 0.08)
                 appendMove(
-                    label: "v4-shot-\(subject.id)",
+                    label: "experimental-shot-\(subject.id)",
                     arriveBy: arrivalDeadline,
                     to: pose
                 )
@@ -177,7 +177,7 @@ public enum ShotSchedulePlanner {
             case let .transition(transition):
                 let transitionTime = composition.outputTime(atSourceTime: transition.sourceTime)
                 appendMove(
-                    label: "v4-orient-\(transition.observationID)",
+                    label: "experimental-orient-\(transition.observationID)",
                     arriveBy: transitionTime,
                     to: base
                 )
@@ -210,7 +210,7 @@ public enum ShotSchedulePlanner {
                 // response close-up that would immediately collide with it.
                 guard pushArrival + 0.20 < nextEventTime || eventIndex == events.count - 1 else { continue }
                 appendMove(
-                    label: "v4-response-\(response.id)",
+                    label: "experimental-response-\(response.id)",
                     arriveBy: pushArrival,
                     to: pose
                 )

@@ -39,6 +39,7 @@ nativeArgs.push(keepWaiting ? "--keep-waiting" : "--reduce-waiting");
 if (cliArgs.includes("--director-debug")) nativeArgs.push("--director-debug");
 if (cliArgs.includes("--plan-only")) nativeArgs.push("--plan-only");
 if (cliArgs.includes("--no-analysis-cache")) nativeArgs.push("--no-analysis-cache");
+if (cliArgs.includes("--experimental-camera-planner")) nativeArgs.push("--experimental-camera-planner");
 if (cliArgs.includes("--profile")) {
   const index = cliArgs.indexOf("--profile");
   nativeArgs.push("--profile");
@@ -46,7 +47,7 @@ if (cliArgs.includes("--profile")) {
     nativeArgs.push(path.resolve(cliArgs[index + 1]));
   }
 }
-for (const flag of ["--camera-planner", "--cursor-path", "--cursor-tilt-strength"]) {
+for (const flag of ["--cursor-path", "--cursor-tilt-strength"]) {
   const index = cliArgs.indexOf(flag);
   if (index >= 0 && cliArgs[index + 1] !== undefined) nativeArgs.push(flag, cliArgs[index + 1]);
 }

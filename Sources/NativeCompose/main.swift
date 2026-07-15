@@ -16,7 +16,7 @@ setlinebuf(stdout)
 setlinebuf(stderr)
 
 struct Options {
-    enum CameraPlanner: String { case v3, v4 }
+    enum CameraPlanner { case normal, experimental }
     let source: URL
     let timeline: URL
     let output: URL
@@ -40,7 +40,7 @@ struct Options {
     static func parse() throws -> Options {
         let args = Array(CommandLine.arguments.dropFirst())
         guard args.count >= 3 else {
-            throw Failure("usage: native-compose <source.mov> <timeline.json> <output.mp4> [--camera-planner v3|v4] [--output-scale 1|2] [--fps 60] [--samples 8] [--shutter 0.55] [--cursor-path natural|straight] [--cursor-tilt-strength 0...1.5] [--keep-waiting] [--waiting-time milliseconds] [--experimental-motion-observations study.json | --experimental-scene-plan scene-plan.json] [--plan-only] [--director-debug] [--profile [profile.json]] [--no-analysis-cache]")
+            throw Failure("usage: native-compose <source.mov> <timeline.json> <output.mp4> [--experimental-camera-planner] [--output-scale 1|2] [--fps 60] [--samples 8] [--shutter 0.55] [--cursor-path natural|straight] [--cursor-tilt-strength 0...1.5] [--keep-waiting] [--waiting-time milliseconds] [--experimental-motion-observations study.json | --experimental-scene-plan scene-plan.json] [--plan-only] [--director-debug] [--profile [profile.json]] [--no-analysis-cache]")
         }
         func value(_ flag: String, _ fallback: String) -> String {
             guard let index = args.firstIndex(of: flag), index + 1 < args.count else { return fallback }
@@ -49,6 +49,10 @@ struct Options {
         func optionalValue(_ flag: String) -> String? {
             guard let index = args.firstIndex(of: flag), index + 1 < args.count else { return nil }
             return args[index + 1]
+        }
+        if args.contains("--camera-planner")
+            || ProcessInfo.processInfo.environment["AGENTRECORDER_CAMERA_PLANNER"] != nil {
+            throw Failure("--camera-planner was removed; normal is the default and the replacement is available only through --experimental-camera-planner")
         }
         let cursorPath: CursorPathStyle?
         if let rawPath = optionalValue("--cursor-path") {
@@ -60,12 +64,9 @@ struct Options {
             cursorPath = nil
         }
         let cursorTiltStrength = optionalValue("--cursor-tilt-strength").flatMap(Double.init)
-        let plannerRaw = optionalValue("--camera-planner")
-            ?? ProcessInfo.processInfo.environment["AGENTRECORDER_CAMERA_PLANNER"]
-            ?? "v3"
-        guard let cameraPlanner = CameraPlanner(rawValue: plannerRaw) else {
-            throw Failure("camera planners v1/v2 were removed; use v3 (default) or experimental v4")
-        }
+        let cameraPlanner: CameraPlanner = args.contains("--experimental-camera-planner")
+            || ProcessInfo.processInfo.environment["AGENTRECORDER_EXPERIMENTAL_CAMERA_PLANNER"] == "1"
+            ? .experimental : .normal
         let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
         let experimentalMotionObservations = optionalValue("--experimental-motion-observations").map {
             URL(fileURLWithPath: $0, relativeTo: cwd).standardizedFileURL
@@ -306,6 +307,12 @@ func render(_ options: Options) async throws {
     )
     profiler.complete("cameraPlanning")
     let composition = planned.composition
+    if let first = composition.retime.first, first.sourceStart > 0.000_001 {
+        let sourceStart = String(format: "%.3f", first.sourceStart)
+        let firstPointer = composition.firstPointerMovementTime
+            .map { String(format: "%.3f", $0) } ?? "none"
+        print("native leading-idle-trim source-start=\(sourceStart) first-pointer=\(firstPointer)")
+    }
     if options.directorDebug {
         try writeDirectorDebugReport(composition: composition, motionAnalysis: motionAnalysis, output: options.output)
     }
@@ -356,9 +363,9 @@ func render(_ options: Options) async throws {
         print("native production decisions=\(summary)")
         try writeGlobalProductionPlanReport(global, output: options.output)
     }
-    if let v4 = planned.v4 {
-        print("native v4 subjects=\(v4.subjects.subjects.count) shots=\(v4.schedule.shots.count) factualSamples=\(v4.factualSamples) trackingSamples=\(v4.trackingSamples)")
-        try writeV4ProductionPlanReport(v4, output: options.output)
+    if let experimental = planned.experimental {
+        print("native experimental subjects=\(experimental.subjects.subjects.count) shots=\(experimental.schedule.shots.count) factualSamples=\(experimental.factualSamples) trackingSamples=\(experimental.trackingSamples)")
+        try writeExperimentalProductionPlanReport(experimental, output: options.output)
     }
     profiler.complete("planReporting")
     if options.planOnly {
@@ -780,10 +787,10 @@ private func makeCameraPlan(
     composition: NativeComposition,
     camera: CameraPlan,
     global: GlobalProductionPlan?,
-    v4: V4ProductionPlan?
+    experimental: ExperimentalProductionPlan?
 ) {
     switch planner {
-    case .v3, .v4:
+    case .normal, .experimental:
         var resolvedComposition = composition
         var protectedObservationIDs = Set(
             motionAnalysis.observations.indices.filter {
@@ -804,6 +811,7 @@ private func makeCameraPlan(
             ),
             verifiedIdleRanges: captureTruth.verifiedIdleRanges,
             provenIdleActionIDs: captureTruth.provenIdleActionIDs,
+            firstPointerMovementTime: resolvedComposition.firstPointerMovementTime,
             reduceWaiting: reduceWaiting,
             waitingTime: waitingTime,
             deadTimeRate: resolvedComposition.recipe.deadTimeRate
@@ -823,7 +831,7 @@ private func makeCameraPlan(
                 observations: motionAnalysis.observations,
                 motionRanges: motionAnalysis.ranges
             )
-            let pass = ProductionPlannerV3.plan(
+            let pass = ProductionPlanner.plan(
                 graph: graph, composition: resolvedComposition, base: base
             )
             guard pass.camera.diagnostics.feasible else {
@@ -857,6 +865,7 @@ private func makeCameraPlan(
                 ),
                 verifiedIdleRanges: captureTruth.verifiedIdleRanges,
                 provenIdleActionIDs: captureTruth.provenIdleActionIDs,
+                firstPointerMovementTime: choreography.firstPointerMovementTime,
                 reduceWaiting: reduceWaiting,
                 waitingTime: waitingTime,
                 deadTimeRate: resolvedComposition.recipe.deadTimeRate
@@ -875,26 +884,26 @@ private func makeCameraPlan(
             observations: motionAnalysis.observations,
             motionRanges: motionAnalysis.ranges
         )
-        let global = ProductionPlannerV3.plan(
+        let global = ProductionPlanner.plan(
             graph: finalGraph, composition: resolvedComposition, base: base
         )
         print("native production fixed-point-iterations=\(iterations)")
-        if planner == .v3 {
+        if planner == .normal {
             return (resolvedComposition, global.camera, global, nil)
         }
-        let v4 = CameraPlannerV4.plan(
+        let experimental = ExperimentalCameraPlanner.plan(
             graph: finalGraph,
             composition: resolvedComposition,
             base: base
         )
-        let v4Global = GlobalProductionPlan(
-            camera: v4.camera,
+        let experimentalGlobal = GlobalProductionPlan(
+            camera: experimental.camera,
             decisions: global.decisions,
             hypothesisCount: global.hypothesisCount,
             beamWidth: global.beamWidth,
             searchTrace: global.searchTrace
         )
-        return (resolvedComposition, v4.camera, v4Global, v4)
+        return (resolvedComposition, experimental.camera, experimentalGlobal, experimental)
     }
 }
 
@@ -918,8 +927,8 @@ private func precomputeCameraSamples(
         let sourceTime = composition.sourceTime(atOutputTime: outputTime)
         var state = cameraState(at: outputTime, plan: plan, base: base)
         let unconstrained = state
-        let factualInset: CGFloat = plan.diagnostics.plannerVersion.hasPrefix("v3")
-            || plan.diagnostics.plannerVersion.hasPrefix("v4") ? 28 : 50
+        let factualInset: CGFloat = plan.diagnostics.plannerVersion.hasPrefix("normal")
+            || plan.diagnostics.plannerVersion.hasPrefix("experimental") ? 28 : 50
         state = composition.enforcingFactualActionVisibility(state, at: sourceTime, inset: factualInset)
         let correctedX = abs(state.x - unconstrained.x) > 0.0001
         let correctedY = abs(state.y - unconstrained.y) > 0.0001
@@ -1226,8 +1235,8 @@ private func writeGlobalProductionPlanReport(
     print("native production plan=\(url.path)")
 }
 
-private func writeV4ProductionPlanReport(
-    _ plan: V4ProductionPlan,
+private func writeExperimentalProductionPlanReport(
+    _ plan: ExperimentalProductionPlan,
     output: URL
 ) throws {
     func camera(_ state: CameraState) -> [String: Any] {
@@ -1290,9 +1299,9 @@ private func writeV4ProductionPlanReport(
         }
     ]
     let data = try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])
-    let url = output.deletingPathExtension().appendingPathExtension("v4-plan.json")
+    let url = output.deletingPathExtension().appendingPathExtension("experimental-plan.json")
     try data.write(to: url, options: .atomic)
-    print("native v4 plan=\(url.path)")
+    print("native experimental plan=\(url.path)")
 }
 
 func composeMotionBlurredFrame(

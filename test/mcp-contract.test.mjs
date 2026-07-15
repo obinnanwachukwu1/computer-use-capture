@@ -57,6 +57,9 @@ test("MCP server publishes the reviewed seven-tool contract", async () => {
     assert.equal(result.isError, undefined);
     assert.equal(result.structuredContent.contractVersion, "1.0.0");
     assert.equal(result.structuredContent.limits.maxConcurrentRecordings, 1);
+    assert.deepEqual(result.structuredContent.defaults.waiting, {
+      mode: "reduce", retainMs: 100
+    });
 
     const invalid = await client.callTool({ name: "recorder_get", arguments: { id: "not-an-id" } });
     assert.equal(invalid.isError, true);

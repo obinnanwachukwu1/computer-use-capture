@@ -100,7 +100,7 @@ test("production audit rejects infeasible plans and any renderer visibility corr
   const auditPath = path.join(directory, "probe.camera-audit.json");
   const directorPath = path.join(directory, "probe.director.json");
   await writeFile(auditPath, JSON.stringify({
-    version: 3, planner: "v3-global", planFeasible: false,
+    version: 3, planner: "normal", planFeasible: false,
     planFailure: "no feasible path", emergencyCorrections: 3,
     alignment: [], moves: []
   }));
@@ -108,8 +108,8 @@ test("production audit rejects infeasible plans and any renderer visibility corr
   await assert.rejects(
     execFileAsync(process.execPath, [validator, auditPath, directorPath]),
     error => {
-      assert.match(error.stdout, /v3 camera plan is infeasible: no feasible path/);
-      assert.match(error.stdout, /v3 required 3 emergency visibility correction/);
+      assert.match(error.stdout, /normal camera plan is infeasible: no feasible path/);
+      assert.match(error.stdout, /normal required 3 emergency visibility correction/);
       return true;
     }
   );
@@ -152,7 +152,7 @@ test("alignment audit permits an explicit episode return to base", async () => {
     pathEfficiency: 1, maxLineDeviation: 0
   });
   await writeFile(auditPath, JSON.stringify({
-    version: 3, planner: "v3-global", planFeasible: true, emergencyCorrections: 0,
+    version: 3, planner: "normal", planFeasible: true, emergencyCorrections: 0,
     alignment: [], moves: [
       move("action-1-arrival", 1, 1.4, -180),
       move("episode-0-end", 1.85, 2.25, 180)
@@ -168,7 +168,7 @@ test("alignment audit marks unresolved pointer evidence as a degraded taste fixt
   const auditPath = path.join(directory, "probe.camera-audit.json");
   const directorPath = path.join(directory, "probe.director.json");
   await writeFile(auditPath, JSON.stringify({
-    version: 3, planner: "v3-global", planFeasible: true, emergencyCorrections: 0,
+    version: 3, planner: "normal", planFeasible: true, emergencyCorrections: 0,
     pointerEvidence: { total: 7, factual: 3, inferredRendered: 0, inferredOmitted: 0, unresolved: 4 },
     alignment: [], moves: []
   }));

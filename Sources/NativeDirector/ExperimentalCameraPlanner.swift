@@ -1,7 +1,7 @@
 import CoreGraphics
 import Foundation
 
-public struct V4ProductionPlan: Sendable {
+public struct ExperimentalProductionPlan: Sendable {
     public let camera: CameraPlan
     public let subjects: SubjectGraph
     public let schedule: ShotSchedule
@@ -25,11 +25,11 @@ public struct V4ProductionPlan: Sendable {
 
 /// Subject-first production planner.
 ///
-/// V4 chooses editorial shots over persistent subjects, compiles them into a
+/// The experimental planner chooses editorial shots over persistent subjects, compiles them into a
 /// continuous trajectory, then enforces factual visibility against the whole
 /// trajectory. It never turns a cursor trip into a static-pose eligibility
 /// gate and never inserts a reveal/return pulse as a local repair.
-public enum CameraPlannerV4 {
+public enum ExperimentalCameraPlanner {
     public struct Policy: Sendable {
         public var factualInset: CGFloat = 28
         public var validationRate = 480.0
@@ -45,7 +45,7 @@ public enum CameraPlannerV4 {
         composition: NativeComposition,
         base: CameraState,
         policy: Policy = .default
-    ) -> V4ProductionPlan {
+    ) -> ExperimentalProductionPlan {
         let subjects = SubjectGraph.make(graph: graph, composition: composition)
         let schedule = ShotSchedulePlanner.plan(
             subjects: subjects,
@@ -60,13 +60,13 @@ public enum CameraPlannerV4 {
             policy: policy
         )
         let diagnostics = CameraPlanDiagnostics(
-            plannerVersion: "v4-subject-schedule",
+            plannerVersion: "experimental-subject-schedule",
             feasible: compiled.violations == 0,
             failure: compiled.violations == 0
                 ? nil
                 : "compiled trajectory has \(compiled.violations) factual visibility violations"
         )
-        return V4ProductionPlan(
+        return ExperimentalProductionPlan(
             camera: CameraPlan(
                 moves: schedule.moves,
                 tracks: compiled.tracks,
@@ -91,7 +91,7 @@ private func compileTrajectory(
     moves: [CameraMove],
     composition: NativeComposition,
     base: CameraState,
-    policy: CameraPlannerV4.Policy
+    policy: ExperimentalCameraPlanner.Policy
 ) -> CompiledTracking {
     let rate = max(60, policy.validationRate)
     let count = max(1, Int(ceil(composition.outputDuration * rate)))
@@ -157,7 +157,7 @@ private func compileTrajectory(
 
     let tracks = expanded.enumerated().map { trackIndex, range in
         CameraTrack(
-            label: "v4-track-\(trackIndex)",
+            label: "experimental-track-\(trackIndex)",
             keyframes: range.map { index in
                 CameraTrack.Keyframe(time: times[index], state: recoveredStates[index])
             }
@@ -166,7 +166,7 @@ private func compileTrajectory(
     let plan = CameraPlan(
         moves: moves,
         tracks: tracks,
-        diagnostics: CameraPlanDiagnostics(plannerVersion: "v4-validation", feasible: true)
+        diagnostics: CameraPlanDiagnostics(plannerVersion: "experimental-validation", feasible: true)
     )
     var violations = 0
     var factualSamples = 0

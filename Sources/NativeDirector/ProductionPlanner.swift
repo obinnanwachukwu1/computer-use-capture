@@ -52,7 +52,7 @@ public struct GlobalProductionPlan: Sendable {
 /// forced return-to-base state. It ranks timing, causal/attention, and camera
 /// alternatives together across the full action sequence. Rendering facts are
 /// hard constraints; editorial taste is expressed only as additive cost.
-public enum ProductionPlannerV3 {
+public enum ProductionPlanner {
     public struct Policy: Sendable {
         public var beamWidth = 160
         public var maximumPosePool = 72
@@ -95,7 +95,7 @@ public enum ProductionPlannerV3 {
         guard !candidatesByAction.contains(where: { $0.isEmpty }) else {
             return GlobalProductionPlan(
                 camera: CameraPlan(moves: [], diagnostics: CameraPlanDiagnostics(
-                    plannerVersion: "v3-global", feasible: false,
+                    plannerVersion: "normal", feasible: false,
                     failure: "one or more actions have no factual-visibility-feasible hypothesis"
                 )),
                 decisions: [], hypothesisCount: hypothesisCount, beamWidth: policy.beamWidth,
@@ -173,7 +173,7 @@ public enum ProductionPlannerV3 {
         }) else {
             return GlobalProductionPlan(
                 camera: CameraPlan(moves: [], diagnostics: CameraPlanDiagnostics(
-                    plannerVersion: "v3-global", feasible: false,
+                    plannerVersion: "normal", feasible: false,
                     failure: searchTrace.last?.outputPathCount == 0
                         ? "global production search exhausted at action \(searchTrace.last!.actionID)"
                         : "no globally feasible production path covers every required context transition"
@@ -185,7 +185,7 @@ public enum ProductionPlannerV3 {
         return GlobalProductionPlan(
             camera: CameraPlan(
                 moves: winner.moves,
-                diagnostics: CameraPlanDiagnostics(plannerVersion: "v3-global", feasible: true)
+                diagnostics: CameraPlanDiagnostics(plannerVersion: "normal", feasible: true)
             ),
             decisions: winner.decisions,
             hypothesisCount: hypothesisCount,
@@ -195,7 +195,7 @@ public enum ProductionPlannerV3 {
     }
 }
 
-private struct V3ActionCandidate: Sendable {
+private struct ActionCandidate: Sendable {
     let action: DirectedAction
     let timing: ProductionPlanGraph.TimingHypothesis
     let attention: ProductionPlanGraph.AttentionHypothesis
@@ -272,7 +272,7 @@ private final class FeasibilityTrace: @unchecked Sendable {
         let scale = String(format: "%.3f", exp(state.logScale))
         let requiredScale = String(format: "%.3f", exp(adjusted.logScale))
         print(
-            "native v3 infeasible action=\(actionID) move=\(label) output=\(output) source=\(source)"
+            "native normal infeasible action=\(actionID) move=\(label) output=\(output) source=\(source)"
             + " camera=(\(Int(state.x)),\(Int(state.y)),\(scale))"
             + " required=(\(Int(adjusted.x)),\(Int(adjusted.y)),\(requiredScale))"
         )
@@ -281,12 +281,12 @@ private final class FeasibilityTrace: @unchecked Sendable {
 
 private func propose(
     path: Path,
-    candidates: [V3ActionCandidate],
+    candidates: [ActionCandidate],
     actionIndex: Int,
     graph: ProductionPlanGraph,
     composition: NativeComposition,
     diagonal: CGFloat,
-    policy: ProductionPlannerV3.Policy
+    policy: ProductionPlanner.Policy
 ) -> [PathProposal] {
     var proposals: [PathProposal] = []
     proposals.reserveCapacity(candidates.count)
@@ -306,7 +306,7 @@ private func propose(
             let routeResponse = candidate.attention.observationIDs.isEmpty
                 ? routePose : candidate.responsePose
             if !transitionVariants.contains(where: {
-                v3PoseEqual($0.arrival, routePose) && v3PoseEqual($0.response, routeResponse)
+                poseEqual($0.arrival, routePose) && poseEqual($0.response, routeResponse)
             }) {
                 transitionVariants.append((
                     routePose,
@@ -377,7 +377,7 @@ private func propose(
                 previous: priorPose,
                 current: nextPose,
                 diagonal: diagonal,
-                moved: !v3PoseEqual(priorPose, nextPose),
+                moved: !poseEqual(priorPose, nextPose),
                 policy: policy
             )
             priorPriorPose = priorPose
@@ -493,7 +493,7 @@ private func buildPosePool(
         return $0.x < $1.x
     }
     var unique: [CameraState] = []
-    for pose in poses where !unique.contains(where: { v3PoseEqual($0, pose) }) {
+    for pose in poses where !unique.contains(where: { poseEqual($0, pose) }) {
         unique.append(pose)
         if unique.count >= maximumCount { break }
     }
@@ -505,9 +505,9 @@ private func actionCandidates(
     poses: [CameraState],
     size: CGSize,
     composition: NativeComposition,
-    policy: ProductionPlannerV3.Policy
-) -> [V3ActionCandidate] {
-    var result: [V3ActionCandidate] = []
+    policy: ProductionPlanner.Policy
+) -> [ActionCandidate] {
+    var result: [ActionCandidate] = []
     let timingByID = Dictionary(uniqueKeysWithValues: node.timings.map { ($0.id, $0) })
     for attention in node.attention {
         guard let timing = timingByID[attention.timingID] else { continue }
@@ -519,7 +519,7 @@ private func actionCandidates(
         }.sorted { $0.1 < $1.1 }
         var arrivalPoses = Array(rankedArrivalPoses.prefix(5))
         if let broadest = rankedArrivalPoses.min(by: { $0.0.logScale < $1.0.logScale }),
-           !arrivalPoses.contains(where: { v3PoseEqual($0.0, broadest.0) }) {
+           !arrivalPoses.contains(where: { poseEqual($0.0, broadest.0) }) {
             // The path solver must be able to hold an already established
             // broad shot. A cost-only top-K pose prefix otherwise makes
             // continuity impossible before the global objective can score it.
@@ -538,7 +538,7 @@ private func actionCandidates(
         }.sorted { $0.1 < $1.1 }
         var responsePoses = Array(rankedResponsePoses.prefix(5))
         if let broadest = rankedResponsePoses.min(by: { $0.0.logScale < $1.0.logScale }),
-           !responsePoses.contains(where: { v3PoseEqual($0.0, broadest.0) }) {
+           !responsePoses.contains(where: { poseEqual($0.0, broadest.0) }) {
             responsePoses.append(broadest)
         }
         let responseTime = attention.evidence
@@ -561,10 +561,10 @@ private func actionCandidates(
             for response in responsePoses {
                 let internalTravel = hypot(response.0.x - arrival.0.x, response.0.y - arrival.0.y) / max(1, hypot(size.width, size.height))
                 let internalZoom = abs(response.0.logScale - arrival.0.logScale)
-                let internalCost = v3PoseEqual(arrival.0, response.0) ? 0
+                let internalCost = poseEqual(arrival.0, response.0) ? 0
                     : Double(internalTravel) * policy.panWeight
                         + Double(internalZoom) * policy.zoomWeight + policy.moveWeight
-                result.append(V3ActionCandidate(
+                result.append(ActionCandidate(
                     action: node.action, timing: timing, attention: attention,
                     arrivalPose: arrival.0, responsePose: response.0,
                     responseTime: max(timing.activation + 0.08, responseTime),
@@ -588,7 +588,7 @@ private func actionCandidates(
     // erase a structurally important response hypothesis before global search
     // can compare them. Keep the best pose realizations of every attention
     // interpretation, then use cost only to order the retained lattice.
-    var diverse: [V3ActionCandidate] = []
+    var diverse: [ActionCandidate] = []
     for group in Dictionary(grouping: ordered, by: { $0.attention.id }).values {
         diverse += group.prefix(4)
         if let broadHold = group.min(by: {
@@ -598,8 +598,8 @@ private func actionCandidates(
         }), !diverse.contains(where: {
             $0.timing.id == broadHold.timing.id
                 && $0.attention.id == broadHold.attention.id
-                && v3PoseEqual($0.arrivalPose, broadHold.arrivalPose)
-                && v3PoseEqual($0.responsePose, broadHold.responsePose)
+                && poseEqual($0.arrivalPose, broadHold.arrivalPose)
+                && poseEqual($0.responsePose, broadHold.responsePose)
         }) {
             diverse.append(broadHold)
         }
@@ -624,7 +624,7 @@ private func activationHypothesis(
         actionID: hypothesis.actionID,
         timingID: hypothesis.timingID,
         bounds: bounds?.isNull == false ? bounds : nil,
-        behavior: factual.isEmpty ? nil : factualBehaviorV3(for: action),
+        behavior: factual.isEmpty ? nil : factualBehavior(for: action),
         evidence: factual,
         observationIDs: [],
         cost: 0
@@ -658,7 +658,7 @@ private func responseHypothesis(
     )
 }
 
-private func factualBehaviorV3(for action: DirectedAction) -> CameraBehavior {
+private func factualBehavior(for action: DirectedAction) -> CameraBehavior {
     action.semanticBounds != nil || action.kind == "drag" ? .region : .point
 }
 
@@ -666,7 +666,7 @@ private func attentionPoseCost(
     attention: ProductionPlanGraph.AttentionHypothesis,
     pose: CameraState,
     size: CGSize,
-    policy: ProductionPlannerV3.Policy
+    policy: ProductionPlanner.Policy
 ) -> Double {
     guard let bounds = attention.bounds, let behavior = attention.behavior else {
         return exp(pose.logScale) > 1.01 ? 1.2 : 0
@@ -722,9 +722,9 @@ private func moveSchedule(
     previousMoveEnd: Double,
     boundaryRole: String?,
     establishBeforePointer: Bool = false,
-    policy: ProductionPlannerV3.Policy
+    policy: ProductionPlanner.Policy
 ) -> MoveSchedule {
-    guard !v3PoseEqual(from, to) else { return MoveSchedule(feasible: true, moves: [], poses: []) }
+    guard !poseEqual(from, to) else { return MoveSchedule(feasible: true, moves: [], poses: []) }
     let actionID = action.id
     let actionOut = composition.outputTime(atSourceTime: activation)
     let trip = composition.pointerTrip(forActionID: actionID)
@@ -754,7 +754,7 @@ private func moveSchedule(
         desiredStart = max(0, actionOut - 0.72)
         desiredEnd = max(desiredStart + policy.minimumMoveDuration, actionOut + 0.08)
     }
-    if v3PoseEqual(transitionFrom, to) {
+    if poseEqual(transitionFrom, to) {
         return MoveSchedule(feasible: true, moves: [], poses: [])
     }
     let tastefulDuration = transitionDuration(
@@ -770,7 +770,7 @@ private func moveSchedule(
         return MoveSchedule(feasible: false, moves: [], poses: [])
     }
     let move = CameraMove(
-        label: boundaryRole.map { "v3-\($0)-\(actionID)" } ?? "v3-action-\(actionID)",
+        label: boundaryRole.map { "normal-\($0)-\(actionID)" } ?? "normal-action-\(actionID)",
         start: start, end: desiredEnd,
         from: transitionFrom, to: to
     )
@@ -785,17 +785,17 @@ private func responseMoveSchedule(
     composition: NativeComposition,
     previousMoveEnd: Double,
     boundaryRole: String?,
-    policy: ProductionPlannerV3.Policy
+    policy: ProductionPlanner.Policy
 ) -> MoveSchedule {
-    guard !v3PoseEqual(from, to) else { return MoveSchedule(feasible: true, moves: [], poses: []) }
+    guard !poseEqual(from, to) else { return MoveSchedule(feasible: true, moves: [], poses: []) }
     let responseOut = composition.outputTime(atSourceTime: responseTime)
     let start = max(previousMoveEnd, responseOut + policy.responseSettleHold)
     let spatial = hypot(to.x - from.x, to.y - from.y) / max(1, hypot(composition.size.width, composition.size.height))
     let zoom = abs(to.logScale - from.logScale)
     let duration = min(0.72, max(policy.minimumMoveDuration, 0.26 + Double(spatial) * 0.45 + Double(zoom) * 0.35))
     let move = CameraMove(
-        label: boundaryRole.map { "v3-\($0)-\(actionID)-response" }
-            ?? "v3-action-\(actionID)-response",
+        label: boundaryRole.map { "normal-\($0)-\(actionID)-response" }
+            ?? "normal-action-\(actionID)-response",
         start: start, end: start + duration, from: from, to: to
     )
     return MoveSchedule(feasible: true, moves: [move], poses: [to])
@@ -813,7 +813,7 @@ private func pointIsSafelyVisible(
 
 private func transitionDuration(
     from: CameraState, to: CameraState, size: CGSize,
-    policy: ProductionPlannerV3.Policy
+    policy: ProductionPlanner.Policy
 ) -> Double {
     let spatial = hypot(to.x - from.x, to.y - from.y) / max(1, hypot(size.width, size.height))
     let zoom = abs(to.logScale - from.logScale)
@@ -897,7 +897,7 @@ private func edgeCost(
     current: CameraState,
     diagonal: CGFloat,
     moved: Bool,
-    policy: ProductionPlannerV3.Policy
+    policy: ProductionPlanner.Policy
 ) -> Double {
     guard moved else { return 0 }
     let pan = hypot(current.x - previous.x, current.y - previous.y) / diagonal
@@ -991,7 +991,7 @@ private func pathPrecedes(_ left: Path, _ right: Path) -> Bool {
     return leftIDs.lexicographicallyPrecedes(rightIDs)
 }
 
-private func v3PoseEqual(_ left: CameraState, _ right: CameraState) -> Bool {
+private func poseEqual(_ left: CameraState, _ right: CameraState) -> Bool {
     abs(left.x - right.x) <= 0.5
         && abs(left.y - right.y) <= 0.5
         && abs(left.logScale - right.logScale) <= 0.001
