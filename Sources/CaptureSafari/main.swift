@@ -4,15 +4,21 @@ import CoreMedia
 import CaptureTruth
 import Darwin
 import Foundation
+import ImageIO
 import ScreenCaptureKit
+import UniformTypeIdentifiers
 
 struct CaptureOptions {
     let outputURL: URL
     let duration: TimeInterval
     let bundleIdentifier: String
+    let targetWindowTitle: String?
     let framesPerSecond: Int32
     let mode: CaptureMode
     let codec: CaptureCodec
+    let diagnosticCheckpointInterval: TimeInterval?
+    let diagnosticCheckpointDirectory: URL?
+    let diagnosticCheckpointLimit: Int
 
     static func parse() throws -> CaptureOptions {
         let arguments = CommandLine.arguments
@@ -30,10 +36,10 @@ struct CaptureOptions {
             throw CaptureError.usage("The target app must be a macOS bundle identifier")
         }
 
-        let modeName = ProcessInfo.processInfo.environment["COMPUTER_USE_CAPTURE_CAPTURE_MODE"] ?? "application"
+        let modeName = ProcessInfo.processInfo.environment["COMPUTER_USE_CAPTURE_CAPTURE_MODE"] ?? "window-crop"
         guard let mode = CaptureMode(rawValue: modeName) else {
             throw CaptureError.usage(
-                "COMPUTER_USE_CAPTURE_CAPTURE_MODE must be 'application' or 'window'"
+                "COMPUTER_USE_CAPTURE_CAPTURE_MODE must be 'application', 'window', 'window-crop', or 'display-crop'"
             )
         }
         let codecName = ProcessInfo.processInfo.environment["COMPUTER_USE_CAPTURE_CAPTURE_CODEC"] ?? "hevc"
@@ -42,14 +48,50 @@ struct CaptureOptions {
                 "COMPUTER_USE_CAPTURE_CAPTURE_CODEC must be 'hevc', 'h264', 'prores422lt', or 'prores4444'"
             )
         }
+        let checkpointInterval: TimeInterval?
+        if let raw = ProcessInfo.processInfo.environment[
+            "COMPUTER_USE_CAPTURE_DIAGNOSTIC_CHECKPOINT_INTERVAL_SECONDS"
+        ] {
+            guard let value = TimeInterval(raw), value > 0 else {
+                throw CaptureError.usage(
+                    "COMPUTER_USE_CAPTURE_DIAGNOSTIC_CHECKPOINT_INTERVAL_SECONDS must be positive"
+                )
+            }
+            checkpointInterval = value
+        } else {
+            checkpointInterval = nil
+        }
+        let checkpointDirectory = ProcessInfo.processInfo.environment[
+            "COMPUTER_USE_CAPTURE_DIAGNOSTIC_CHECKPOINT_DIRECTORY"
+        ].map { URL(fileURLWithPath: $0).standardizedFileURL }
+        let checkpointLimit: Int
+        if let raw = ProcessInfo.processInfo.environment[
+            "COMPUTER_USE_CAPTURE_DIAGNOSTIC_CHECKPOINT_LIMIT"
+        ] {
+            guard let value = Int(raw), value > 0 else {
+                throw CaptureError.usage(
+                    "COMPUTER_USE_CAPTURE_DIAGNOSTIC_CHECKPOINT_LIMIT must be a positive integer"
+                )
+            }
+            checkpointLimit = value
+        } else {
+            checkpointLimit = 120
+        }
+        let targetWindowTitle = ProcessInfo.processInfo.environment[
+            "COMPUTER_USE_CAPTURE_TARGET_WINDOW_TITLE"
+        ]
 
         return CaptureOptions(
             outputURL: outputURL,
             duration: duration,
             bundleIdentifier: bundleIdentifier,
+            targetWindowTitle: targetWindowTitle,
             framesPerSecond: 60,
             mode: mode,
-            codec: codec
+            codec: codec,
+            diagnosticCheckpointInterval: checkpointInterval,
+            diagnosticCheckpointDirectory: checkpointDirectory,
+            diagnosticCheckpointLimit: checkpointLimit
         )
     }
 }
@@ -57,6 +99,13 @@ struct CaptureOptions {
 enum CaptureMode: String {
     case application
     case window
+    case windowCrop = "window-crop"
+    case displayCrop = "display-crop"
+}
+
+private func capturePixelDimension(_ value: CGFloat) -> Int {
+    let rounded = max(2, Int(ceil(value)))
+    return rounded.isMultiple(of: 2) ? rounded : rounded + 1
 }
 
 enum CaptureCodec: String {
@@ -116,7 +165,202 @@ enum CaptureError: LocalizedError {
     }
 }
 
-final class MovieWriter: NSObject, SCStreamOutput, @unchecked Sendable {
+private struct DiagnosticCheckpointRecord: Codable, Sendable {
+    let sequence: Int
+    let sourceTime: Double
+    let file: String
+    let geometry: CaptureFrameGeometry
+    let pixelComparison: CapturedPixelComparison
+}
+
+private struct DiagnosticCheckpointManifest: Codable, Sendable {
+    let version: Int
+    let sourceTimebase: String
+    let intervalSeconds: Double
+    let checkpoints: [DiagnosticCheckpointRecord]
+    let skippedBusy: Int
+    let errors: [String]
+}
+
+private struct DiagnosticCheckpointSummary: Sendable {
+    let written: Int
+    let skippedBusy: Int
+    let errors: Int
+}
+
+/// Diagnostic-only, bounded raw-frame checkpoints. Pixel bytes are copied on
+/// the capture queue before AVAssetWriter sees them, then PNG compression runs
+/// on a separate serial queue so codec analysis cannot alter production timing.
+private final class DiagnosticCheckpointWriter: @unchecked Sendable {
+    let directory: URL
+    private let interval: Double
+    private let limit: Int
+    private let queue = DispatchQueue(
+        label: "computerusecapture.capture.checkpoints", qos: .utility
+    )
+    private let stateLock = NSLock()
+    private var nextSourceTime = 0.0
+    private var reserved = 0
+    private var pending = 0
+    private var skippedBusy = 0
+    private var records: [DiagnosticCheckpointRecord] = []
+    private var errors: [String] = []
+
+    init(directory: URL, interval: Double, limit: Int) throws {
+        self.directory = directory
+        self.interval = interval
+        self.limit = limit
+        try FileManager.default.removeItemIfPresent(at: directory)
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true
+        )
+    }
+
+    func captureIfDue(
+        _ pixelBuffer: CVPixelBuffer,
+        sourceTime: Double,
+        geometry: CaptureFrameGeometry,
+        pixelComparison: CapturedPixelComparison
+    ) {
+        let sequence: Int? = stateLock.withLock {
+            guard sourceTime + 0.000_001 >= nextSourceTime, reserved < limit else { return nil }
+            nextSourceTime = sourceTime + interval
+            guard pending < 2 else {
+                skippedBusy += 1
+                return nil
+            }
+            let result = reserved
+            reserved += 1
+            pending += 1
+            return result
+        }
+        guard let sequence else { return }
+        guard let pixels = Self.copyBGRA(pixelBuffer) else {
+            stateLock.withLock { pending -= 1 }
+            queue.async { self.errors.append("Could not copy checkpoint \(sequence) pixels") }
+            return
+        }
+        let filename = String(format: "frame-%04d-t%010.3f.png", sequence, sourceTime)
+        queue.async {
+            defer { self.stateLock.withLock { self.pending -= 1 } }
+            do {
+                try Self.writePNG(
+                    pixels: pixels.data,
+                    width: pixels.width,
+                    height: pixels.height,
+                    bytesPerRow: pixels.bytesPerRow,
+                    to: self.directory.appendingPathComponent(filename)
+                )
+                self.records.append(DiagnosticCheckpointRecord(
+                    sequence: sequence,
+                    sourceTime: sourceTime,
+                    file: filename,
+                    geometry: geometry,
+                    pixelComparison: pixelComparison
+                ))
+            } catch {
+                self.errors.append("Checkpoint \(sequence): \(error.localizedDescription)")
+            }
+        }
+    }
+
+    func finish() throws -> DiagnosticCheckpointSummary {
+        try queue.sync {
+            records.sort { $0.sequence < $1.sequence }
+            let manifest = DiagnosticCheckpointManifest(
+                version: 1,
+                sourceTimebase: "first-complete-frame-presentation-time",
+                intervalSeconds: interval,
+                checkpoints: records,
+                skippedBusy: stateLock.withLock { skippedBusy },
+                errors: errors
+            )
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            try encoder.encode(manifest).write(
+                to: directory.appendingPathComponent("checkpoints.json"), options: .atomic
+            )
+            return DiagnosticCheckpointSummary(
+                written: records.count,
+                skippedBusy: manifest.skippedBusy,
+                errors: errors.count
+            )
+        }
+    }
+
+    private static func copyBGRA(
+        _ pixelBuffer: CVPixelBuffer
+    ) -> (data: Data, width: Int, height: Int, bytesPerRow: Int)? {
+        guard CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly) == kCVReturnSuccess else {
+            return nil
+        }
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else { return nil }
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        let sourceRowBytes = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        let destinationRowBytes = width * 4
+        guard width > 0, height > 0, sourceRowBytes >= destinationRowBytes else { return nil }
+        var data = Data(count: destinationRowBytes * height)
+        data.withUnsafeMutableBytes { destination in
+            guard let destinationBase = destination.baseAddress else { return }
+            for row in 0..<height {
+                memcpy(
+                    destinationBase.advanced(by: row * destinationRowBytes),
+                    base.advanced(by: row * sourceRowBytes),
+                    destinationRowBytes
+                )
+            }
+        }
+        return (data, width, height, destinationRowBytes)
+    }
+
+    private static func writePNG(
+        pixels: Data,
+        width: Int,
+        height: Int,
+        bytesPerRow: Int,
+        to url: URL
+    ) throws {
+        guard let provider = CGDataProvider(data: pixels as CFData),
+              let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else {
+            throw CaptureError.writerSetup("Could not create checkpoint image provider")
+        }
+        let bitmapInfo = CGBitmapInfo.byteOrder32Little.union(
+            CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue)
+        )
+        guard let image = CGImage(
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bitsPerPixel: 32,
+            bytesPerRow: bytesPerRow,
+            space: colorSpace,
+            bitmapInfo: bitmapInfo,
+            provider: provider,
+            decode: nil,
+            shouldInterpolate: false,
+            intent: .defaultIntent
+        ), let destination = CGImageDestinationCreateWithURL(
+            url as CFURL, UTType.png.identifier as CFString, 1, nil
+        ) else {
+            throw CaptureError.writerSetup("Could not create checkpoint PNG")
+        }
+        CGImageDestinationAddImage(destination, image, nil)
+        guard CGImageDestinationFinalize(destination) else {
+            throw CaptureError.writerSetup("Could not write checkpoint PNG")
+        }
+    }
+}
+
+private extension FileManager {
+    func removeItemIfPresent(at url: URL) throws {
+        guard fileExists(atPath: url.path) else { return }
+        try removeItem(at: url)
+    }
+}
+
+private final class MovieWriter: NSObject, SCStreamOutput, @unchecked Sendable {
     private let writer: AVAssetWriter
     private let input: AVAssetWriterInput
     private let provenanceURL: URL
@@ -128,11 +372,16 @@ final class MovieWriter: NSObject, SCStreamOutput, @unchecked Sendable {
     private var droppedNonMonotonicFrameCount = 0
     private var droppedBackpressureFrameCount = 0
     private var appendFailedFrameCount = 0
+    private var geometryDiscontinuityFrameCount = 0
+    private var geometryMetadataIncompleteFrameCount = 0
     private var invalidMetadataSampleCount = 0
     private var preRollSampleCount = 0
     private var provenanceSamples: [CapturedFrameSample] = []
     private var previousFramePixels: [UInt8]?
     private var appendError: Error?
+    private var geometryMonitor = CaptureGeometryMonitor()
+    private let geometryContract: CaptureGeometryContract
+    private let diagnosticCheckpointWriter: DiagnosticCheckpointWriter?
 
     init(
         outputURL: URL,
@@ -140,9 +389,13 @@ final class MovieWriter: NSObject, SCStreamOutput, @unchecked Sendable {
         width: Int,
         height: Int,
         codec: CaptureCodec,
-        framesPerSecond: Int32
+        framesPerSecond: Int32,
+        geometryContract: CaptureGeometryContract,
+        diagnosticCheckpointWriter: DiagnosticCheckpointWriter?
     ) throws {
         self.provenanceURL = provenanceURL
+        self.geometryContract = geometryContract
+        self.diagnosticCheckpointWriter = diagnosticCheckpointWriter
         expectedFrameInterval = 1 / Double(framesPerSecond)
         try? FileManager.default.removeItem(at: outputURL)
         try FileManager.default.createDirectory(
@@ -190,6 +443,7 @@ final class MovieWriter: NSObject, SCStreamOutput, @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard appendError == nil else { return }
+        let geometry = frameGeometry(sampleBuffer, metadata: metadata)
         if firstPresentationTime == nil, metadata.status != .complete {
             preRollSampleCount += 1
             return
@@ -199,6 +453,19 @@ final class MovieWriter: NSObject, SCStreamOutput, @unchecked Sendable {
             // that backpressure prevented from entering the source movie.
             droppedBackpressureFrameCount += 1
             return
+        }
+        let geometryDiscontinuities: [CaptureGeometryDiscontinuity]
+        if metadata.status == .complete {
+            if metadata.contentRect == nil || metadata.boundingRect == nil
+                || metadata.scaleFactor == nil || metadata.contentScale == nil {
+                geometryMetadataIncompleteFrameCount += 1
+            }
+            geometryDiscontinuities = geometryMonitor.inspect(geometry)
+            if !geometryDiscontinuities.isEmpty {
+                geometryDiscontinuityFrameCount += 1
+            }
+        } else {
+            geometryDiscontinuities = []
         }
         var firstFrameMessage: String?
         if firstPresentationTime == nil {
@@ -216,7 +483,9 @@ final class MovieWriter: NSObject, SCStreamOutput, @unchecked Sendable {
             let wallTime = formatter.string(from: Date().addingTimeInterval(-displayDelay))
             firstFrameMessage =
                 "CAPTURE_FRAME buffer=\(bufferWidth)x\(bufferHeight) " +
-                    "scaleFactor=\(metadata.scaleFactor) contentScale=\(metadata.contentScale) " +
+                    "scaleFactor=\(format(metadata.scaleFactor)) contentScale=\(format(metadata.contentScale)) " +
+                    "contentRect=\(format(metadata.contentRect)) " +
+                    "boundingRect=\(format(metadata.boundingRect)) " +
                     "wallTime=\(wallTime) ptsSeconds=\(presentationTime.seconds)\n"
             writer.startSession(atSourceTime: presentationTime)
         }
@@ -236,15 +505,25 @@ final class MovieWriter: NSObject, SCStreamOutput, @unchecked Sendable {
             } else if !input.isReadyForMoreMediaData {
                 droppedBackpressureFrameCount += 1
                 disposition = .droppedBackpressure
-            } else if input.append(sampleBuffer) {
-                lastPresentationTime = presentationTime
-                frameCount += 1
-                disposition = .appended
-                if let firstFrameMessage { writeStandardOutput(firstFrameMessage) }
             } else {
-                appendFailedFrameCount += 1
-                disposition = .appendFailed
-                appendError = writer.error ?? CaptureError.writerSetup("Failed to append a video frame")
+                if let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) {
+                    diagnosticCheckpointWriter?.captureIfDue(
+                        pixelBuffer,
+                        sourceTime: sourceTime,
+                        geometry: geometry,
+                        pixelComparison: pixelComparison
+                    )
+                }
+                if input.append(sampleBuffer) {
+                    lastPresentationTime = presentationTime
+                    frameCount += 1
+                    disposition = .appended
+                    if let firstFrameMessage { writeStandardOutput(firstFrameMessage) }
+                } else {
+                    appendFailedFrameCount += 1
+                    disposition = .appendFailed
+                    appendError = writer.error ?? CaptureError.writerSetup("Failed to append a video frame")
+                }
             }
         }
         provenanceSamples.append(CapturedFrameSample(
@@ -253,19 +532,25 @@ final class MovieWriter: NSObject, SCStreamOutput, @unchecked Sendable {
             status: metadata.status,
             dirtyRects: metadata.dirtyRects,
             writerDisposition: disposition,
-            pixelComparison: pixelComparison
+            pixelComparison: pixelComparison,
+            geometry: geometry,
+            geometryDiscontinuities: geometryDiscontinuities.isEmpty ? nil : geometryDiscontinuities
         ))
     }
 
     func finish() async throws -> (
         frameCount: Int,
         droppedNonMonotonicFrameCount: Int,
-        droppedBackpressureFrameCount: Int
+        droppedBackpressureFrameCount: Int,
+        geometryDiscontinuityFrameCount: Int,
+        geometryMetadataIncompleteFrameCount: Int
     ) {
         let result: (
             count: Int,
             nonMonotonic: Int,
             backpressure: Int,
+            geometryDiscontinuities: Int,
+            geometryMetadataIncomplete: Int,
             ledger: CaptureFrameLedger,
             error: Error?
         ) = lock.withLock {
@@ -274,6 +559,8 @@ final class MovieWriter: NSObject, SCStreamOutput, @unchecked Sendable {
                 frameCount,
                 droppedNonMonotonicFrameCount,
                 droppedBackpressureFrameCount,
+                geometryDiscontinuityFrameCount,
+                geometryMetadataIncompleteFrameCount,
                 CaptureFrameLedger(
                     expectedFrameInterval: expectedFrameInterval,
                     samples: provenanceSamples,
@@ -282,8 +569,12 @@ final class MovieWriter: NSObject, SCStreamOutput, @unchecked Sendable {
                         preRollSamples: preRollSampleCount,
                         droppedBackpressureFrames: droppedBackpressureFrameCount,
                         droppedNonMonotonicFrames: droppedNonMonotonicFrameCount,
-                        appendFailedFrames: appendFailedFrameCount
-                    )
+                        appendFailedFrames: appendFailedFrameCount,
+                        geometryDiscontinuityFrames: geometryDiscontinuityFrameCount,
+                        geometryMetadataIncompleteFrames: geometryMetadataIncompleteFrameCount
+                    ),
+                    geometryContract: geometryContract,
+                    geometryBaseline: geometryMonitor.baseline
                 ),
                 appendError
             )
@@ -302,15 +593,29 @@ final class MovieWriter: NSObject, SCStreamOutput, @unchecked Sendable {
             throw error
         }
         try writeProvenance(result.ledger)
-        return (result.count, result.nonMonotonic, result.backpressure)
+        if let diagnosticCheckpointWriter {
+            let summary = try diagnosticCheckpointWriter.finish()
+            writeStandardOutput(
+                "CAPTURE_CHECKPOINTS written=\(summary.written) " +
+                    "skippedBusy=\(summary.skippedBusy) errors=\(summary.errors) " +
+                    "directory=\(diagnosticCheckpointWriter.directory.path)\n"
+            )
+        }
+        return (
+            result.count, result.nonMonotonic, result.backpressure,
+            result.geometryDiscontinuities, result.geometryMetadataIncomplete
+        )
     }
 
     private struct FrameMetadata {
         let status: CapturedFrameStatus
         let displayTime: UInt64?
         let dirtyRects: [CaptureDamageRect]
-        let scaleFactor: Double
-        let contentScale: Double
+        let scaleFactor: Double?
+        let contentScale: Double?
+        let contentRect: CaptureFrameRect?
+        let boundingRect: CaptureFrameRect?
+        let screenRect: CaptureFrameRect?
     }
 
     private func frameMetadata(_ sampleBuffer: CMSampleBuffer) -> FrameMetadata? {
@@ -335,8 +640,67 @@ final class MovieWriter: NSObject, SCStreamOutput, @unchecked Sendable {
             status: capturedStatus(status),
             displayTime: (info[.displayTime] as? NSNumber)?.uint64Value,
             dirtyRects: dirtyRects,
-            scaleFactor: (info[.scaleFactor] as? NSNumber)?.doubleValue ?? .nan,
-            contentScale: (info[.contentScale] as? NSNumber)?.doubleValue ?? .nan
+            scaleFactor: finiteDouble(info[.scaleFactor]),
+            contentScale: finiteDouble(info[.contentScale]),
+            contentRect: frameRect(info[.contentRect]),
+            boundingRect: frameRect(info[.boundingRect]),
+            screenRect: frameRect(info[.screenRect])
+        )
+    }
+
+    private func frameGeometry(
+        _ sampleBuffer: CMSampleBuffer,
+        metadata: FrameMetadata
+    ) -> CaptureFrameGeometry {
+        let buffer = CMSampleBufferGetImageBuffer(sampleBuffer)
+        return CaptureFrameGeometry(
+            bufferWidth: buffer.map(CVPixelBufferGetWidth) ?? 0,
+            bufferHeight: buffer.map(CVPixelBufferGetHeight) ?? 0,
+            contentRect: metadata.contentRect,
+            boundingRect: metadata.boundingRect,
+            screenRect: metadata.screenRect,
+            scaleFactor: metadata.scaleFactor,
+            contentScale: metadata.contentScale
+        )
+    }
+
+    private func finiteDouble(_ value: Any?) -> Double? {
+        guard let value = value as? NSNumber else { return nil }
+        let result = value.doubleValue
+        return result.isFinite ? result : nil
+    }
+
+    private func frameRect(_ value: Any?) -> CaptureFrameRect? {
+        guard let value else { return nil }
+        let rect: CGRect
+        if let value = value as? NSValue {
+            rect = value.rectValue
+        } else if CFGetTypeID(value as CFTypeRef) == CFDictionaryGetTypeID(),
+                  let decoded = CGRect(
+                    dictionaryRepresentation: unsafeBitCast(value as CFTypeRef, to: CFDictionary.self)
+                  ) {
+            // ScreenCaptureKit's frame attachments use Core Foundation
+            // dictionary representations for rectangles. Accept NSValue as
+            // well so the ledger remains compatible across macOS releases.
+            rect = decoded
+        } else {
+            return nil
+        }
+        guard rect.origin.x.isFinite, rect.origin.y.isFinite,
+              rect.width.isFinite, rect.height.isFinite else { return nil }
+        return CaptureFrameRect(
+            x: rect.minX, y: rect.minY, width: rect.width, height: rect.height
+        )
+    }
+
+    private func format(_ value: Double?) -> String {
+        value.map { String(format: "%.6f", $0) } ?? "unavailable"
+    }
+
+    private func format(_ rect: CaptureFrameRect?) -> String {
+        guard let rect else { return "unavailable" }
+        return String(
+            format: "%.3f,%.3f,%.3f,%.3f", rect.x, rect.y, rect.width, rect.height
         )
     }
 
@@ -430,6 +794,7 @@ struct CaptureApp {
             let targetWindows = content.windows
                 .filter({ $0.owningApplication?.bundleIdentifier == options.bundleIdentifier })
                 .filter({ $0.frame.width >= 320 && $0.frame.height >= 240 })
+                .filter({ options.targetWindowTitle == nil || $0.title == options.targetWindowTitle })
             guard !targetWindows.isEmpty else {
                 throw CaptureError.targetWindowNotFound(options.bundleIdentifier)
             }
@@ -456,10 +821,20 @@ struct CaptureApp {
                 )
             case .window:
                 filter = SCContentFilter(desktopIndependentWindow: targetWindow)
+            case .windowCrop:
+                filter = SCContentFilter(display: display, including: [targetWindow])
+            case .displayCrop:
+                // A true region recording: preserve the display's composed pixels
+                // (including transient and overlapping surfaces), then crop the
+                // stream to the target window's initial bounds below.
+                filter = SCContentFilter(display: display, excludingWindows: [])
             }
             let pointPixelScale = CGFloat(filter.pointPixelScale)
-            let width = max(2, Int(ceil(targetWindow.frame.width * pointPixelScale))) & ~1
-            let height = max(2, Int(ceil(targetWindow.frame.height * pointPixelScale))) & ~1
+            // The 4:2:0 production codecs require even visible dimensions.
+            // Expand the crop by at most one physical pixel below instead of
+            // shrinking or stretching the target window to make it even.
+            let width = capturePixelDimension(targetWindow.frame.width * pointPixelScale)
+            let height = capturePixelDimension(targetWindow.frame.height * pointPixelScale)
             let configuration = SCStreamConfiguration()
             configuration.width = width
             configuration.height = height
@@ -474,13 +849,30 @@ struct CaptureApp {
             configuration.ignoreShadowsSingleWindow = true
             configuration.scalesToFit = false
             configuration.preservesAspectRatio = true
-            if options.mode == .application {
+            if #available(macOS 14.2, *) {
+                configuration.includeChildWindows = true
+            }
+            if options.mode != .window {
                 configuration.sourceRect = CGRect(
                     x: targetWindow.frame.minX - display.frame.minX,
                     y: targetWindow.frame.minY - display.frame.minY,
-                    width: targetWindow.frame.width,
-                    height: targetWindow.frame.height
+                    width: CGFloat(width) / pointPixelScale,
+                    height: CGFloat(height) / pointPixelScale
                 )
+            }
+            let checkpointWriter: DiagnosticCheckpointWriter?
+            if let interval = options.diagnosticCheckpointInterval {
+                let directory = options.diagnosticCheckpointDirectory
+                    ?? options.outputURL.deletingPathExtension().appendingPathExtension(
+                        "capture-checkpoints"
+                    )
+                checkpointWriter = try DiagnosticCheckpointWriter(
+                    directory: directory,
+                    interval: interval,
+                    limit: options.diagnosticCheckpointLimit
+                )
+            } else {
+                checkpointWriter = nil
             }
             let movieWriter = try MovieWriter(
                 outputURL: options.outputURL,
@@ -488,7 +880,17 @@ struct CaptureApp {
                 width: width,
                 height: height,
                 codec: options.codec,
-                framesPerSecond: options.framesPerSecond
+                framesPerSecond: options.framesPerSecond,
+                geometryContract: CaptureGeometryContract(
+                    configuredWidth: width,
+                    configuredHeight: height,
+                    pointPixelScale: Double(pointPixelScale),
+                    pixelFormat: "32BGRA",
+                    captureResolution: "best",
+                    scalesToFit: configuration.scalesToFit,
+                    preservesAspectRatio: configuration.preservesAspectRatio
+                ),
+                diagnosticCheckpointWriter: checkpointWriter
             )
             let stream = SCStream(filter: filter, configuration: configuration, delegate: nil)
             let outputQueue = DispatchQueue(label: "computerusecapture.capture.video", qos: .userInteractive)
@@ -498,7 +900,11 @@ struct CaptureApp {
             writeStandardOutput(
                 "CAPTURE_READY app=\(options.bundleIdentifier) window=\(targetWindow.title ?? "Untitled") " +
                     "size=\(width)x\(height) scale=\(pointPixelScale) " +
-                    "mode=\(options.mode.rawValue) codec=\(options.codec.rawValue)\n"
+                    "windowFrame=\(targetWindow.frame) displayFrame=\(display.frame) " +
+                    "filterContentRect=\(filter.contentRect) filterStyle=\(filter.style.rawValue) " +
+                    "scalesToFit=\(configuration.scalesToFit) " +
+                    "mode=\(options.mode.rawValue) codec=\(options.codec.rawValue) " +
+                    "checkpoints=\(checkpointWriter == nil ? "disabled" : "enabled")\n"
             )
             let stopReason = await waitForStopOrTimeout(seconds: options.duration)
             try await stream.stopCapture()
@@ -507,6 +913,8 @@ struct CaptureApp {
                 "CAPTURE_COMPLETE reason=\(stopReason.rawValue) frames=\(result.frameCount) " +
                     "droppedNonMonotonicFrames=\(result.droppedNonMonotonicFrameCount) " +
                     "droppedBackpressureFrames=\(result.droppedBackpressureFrameCount) " +
+                    "geometryDiscontinuityFrames=\(result.geometryDiscontinuityFrameCount) " +
+                    "geometryMetadataIncompleteFrames=\(result.geometryMetadataIncompleteFrameCount) " +
                     "output=\(options.outputURL.path) " +
                     "provenance=\(options.outputURL.deletingPathExtension().appendingPathExtension("capture.json").path)\n"
             )

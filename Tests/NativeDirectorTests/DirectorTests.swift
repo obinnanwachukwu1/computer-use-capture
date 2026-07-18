@@ -490,9 +490,460 @@ private struct TimelineFixture: Encodable {
         width: width,
         height: height
     )
+    #expect(field.denseEvidence == nil)
     let material = field.structural.filter { $0.changedFraction > 0.01 }
     #expect(material.count == 2)
     #expect(material.allSatisfy { rectArea($0.normalizedBounds) < 0.10 })
+}
+
+@Test func motionFieldDenseEvidencePreservesPixelsBeforeObjectGrouping() throws {
+    let width = 160, height = 120
+    let before = texturedFrame(width: width, height: height)
+    var after = before
+    paintRGBA(&after, imageWidth: width, x: 12, y: 18, width: 24, height: 20, value: 245)
+    paintRGBA(&after, imageWidth: width, x: 118, y: 78, width: 28, height: 22, value: 20)
+
+    let field = SpatialMotion.motionField(
+        previous: before,
+        current: after,
+        width: width,
+        height: height,
+        configuration: MotionFieldConfiguration(tileSize: 4, retainDenseEvidence: true)
+    )
+    let evidence = try #require(field.denseEvidence)
+    #expect(evidence.rawDelta.count == width * height)
+    #expect(evidence.tiles.count == evidence.tileColumns * evidence.tileRows)
+
+    for pixel in 0..<(width * height) {
+        let offset = pixel * 4
+        let red = abs(Int(after[offset]) - Int(before[offset]))
+        let green = abs(Int(after[offset + 1]) - Int(before[offset + 1]))
+        let blue = abs(Int(after[offset + 2]) - Int(before[offset + 2]))
+        let expected = UInt8(max(red, max(green, blue)))
+        #expect(evidence.rawDelta[pixel] == expected)
+    }
+
+    let structural = evidence.tiles.filter { $0.channel == .structural }
+    #expect(structural.contains { $0.normalizedBounds.maxX < 0.30 })
+    #expect(structural.contains { $0.normalizedBounds.minX > 0.65 })
+    #expect(!structural.contains { $0.normalizedBounds.midX > 0.35 && $0.normalizedBounds.midX < 0.65 })
+}
+
+@Test func motionFieldDenseEvidenceKeepsBackdropAndForegroundSeparate() throws {
+    let width = 180, height = 140
+    let before = texturedFrame(width: width, height: height)
+    var after = blurAndTransform(before, width: width, height: height, radius: 3, gain: 0.58, offset: 3)
+    paintRGBA(&after, imageWidth: width, x: 52, y: 30, width: 78, height: 76, value: 224)
+    paintRGBA(&after, imageWidth: width, x: 62, y: 46, width: 56, height: 5, value: 34)
+
+    let field = SpatialMotion.motionField(
+        previous: before,
+        current: after,
+        width: width,
+        height: height,
+        configuration: MotionFieldConfiguration(retainDenseEvidence: true)
+    )
+    let tiles = try #require(field.denseEvidence).tiles
+    #expect(tiles.contains { $0.channel == .backdrop || $0.channel == .photometric })
+    #expect(tiles.contains {
+        $0.channel == .structural
+            && $0.normalizedBounds.midX > 0.25 && $0.normalizedBounds.midX < 0.75
+            && $0.normalizedBounds.midY > 0.15 && $0.normalizedBounds.midY < 0.85
+    })
+}
+
+@Test func denseMotionTracksReconnectHeldObjectToLaterExitMotion() throws {
+    let columns = 20, rows = 12
+    let samples = [
+        denseSample(time: 1.0, columns: columns, rows: rows, indices: [34, 35, 54, 55]),
+        denseSample(time: 1.2, columns: columns, rows: rows, indices: [35, 36, 55, 56]),
+        // The object is visually static for several seconds, so there is no
+        // intervening change evidence. Its exit animation occupies the same
+        // region and should extend the original lifecycle globally.
+        denseSample(time: 5.4, columns: columns, rows: rows, indices: [34, 35, 54, 55]),
+    ]
+    let graph = DenseMotionTrackGraph.make(samples: samples)
+    let lifecycle = try #require(graph.tracks.first { $0.componentIDs.count == 3 })
+    #expect(lifecycle.startTime == 1.0)
+    #expect(lifecycle.endTime == 5.4)
+    #expect(lifecycle.maximumGap > 4.0)
+    #expect(lifecycle.continuityConfidence > 0.45)
+}
+
+@Test func denseMotionTracksDoNotMergeRemoteConcurrentChanges() {
+    let columns = 20, rows = 12
+    let samples = [
+        denseSample(time: 1.0, columns: columns, rows: rows, indices: [21, 22, 41, 42]),
+        denseSample(time: 1.2, columns: columns, rows: rows, indices: [22, 23, 42, 43]),
+        denseSample(time: 1.2, columns: columns, rows: rows, indices: [176, 177, 196, 197]),
+        denseSample(time: 1.4, columns: columns, rows: rows, indices: [175, 176, 195, 196]),
+    ]
+    let graph = DenseMotionTrackGraph.make(samples: samples)
+    let persistent = graph.tracks.filter { $0.componentIDs.count >= 2 }
+    #expect(persistent.count == 2)
+    #expect(persistent.contains { $0.normalizedBounds.maxX < 0.35 })
+    #expect(persistent.contains { $0.normalizedBounds.minX > 0.65 })
+}
+
+@Test func denseMotionTracksAreDeterministicAndPreserveTileMasks() {
+    let columns = 20, rows = 12
+    let samples = [
+        denseSample(time: 2.0, columns: columns, rows: rows, indices: [63, 64, 83, 84]),
+        denseSample(time: 2.2, columns: columns, rows: rows, indices: [64, 65, 84, 85]),
+        denseSample(time: 2.4, columns: columns, rows: rows, indices: [65, 66, 85, 86]),
+    ]
+    let first = DenseMotionTrackGraph.make(samples: samples)
+    let second = DenseMotionTrackGraph.make(samples: samples.reversed())
+    #expect(first.tracks.map(\.componentIDs) == second.tracks.map(\.componentIDs))
+    #expect(first.components.flatMap(\.tileIndices).sorted() == samples.flatMap { $0.tiles.map(\.index) }.sorted())
+}
+
+@Test func denseMotionObjectsGroupSynchronizedDisconnectedToastPieces() throws {
+    let columns = 40, rows = 24
+    let samples = [1.0, 1.2, 4.8, 5.0].map { time in
+        denseSample(
+            time: time,
+            columns: columns,
+            rows: rows,
+            indices: [84, 85, 124, 125, 94, 95, 134, 135]
+        )
+    }
+    let tracks = DenseMotionTrackGraph.make(samples: samples)
+    #expect(tracks.tracks.count == 2)
+    let objects = DenseMotionObjectGraph.make(tracks: tracks)
+    let toast = try #require(objects.ensembles.first { $0.trackIDs.count == 2 })
+    #expect(toast.kind == .compactObject)
+    #expect(toast.lifecycleConfidence > 0.95)
+}
+
+@Test func denseMotionObjectsClassifySynchronizedRemoteChangesAsBroadContext() throws {
+    let columns = 40, rows = 24
+    let samples = [2.0, 2.2].map { time in
+        denseSample(
+            time: time,
+            columns: columns,
+            rows: rows,
+            indices: [41, 42, 81, 82, 878, 879, 918, 919]
+        )
+    }
+    let tracks = DenseMotionTrackGraph.make(samples: samples)
+    let objects = DenseMotionObjectGraph.make(tracks: tracks)
+    let transition = try #require(objects.ensembles.first { $0.trackIDs.count == 2 })
+    #expect(transition.kind == .broadContext)
+    #expect(!objects.ensembles.contains { $0.kind == .compactObject })
+}
+
+@Test func denseMotionObjectsDoNotCallSparseSynchronizedFragmentsAnObject() throws {
+    let columns = 40, rows = 24
+    let samples = [2.0, 2.2].map { time in
+        denseSample(
+            time: time,
+            columns: columns,
+            rows: rows,
+            indices: [82, 83, 122, 123, 258, 259, 298, 299]
+        )
+    }
+    let tracks = DenseMotionTrackGraph.make(samples: samples)
+    let objects = DenseMotionObjectGraph.make(tracks: tracks)
+    let event = try #require(objects.ensembles.first { $0.trackIDs.count == 2 })
+    #expect(event.kind == .correlatedChange)
+    #expect(event.spatialOccupancy < 0.25)
+}
+
+@Test func denseMotionObjectsDoNotMergeNestedAnimationWithContainingLifecycle() {
+    let columns = 40, rows = 24
+    let samples = [
+        denseSample(time: 1.0, columns: columns, rows: rows, indices: [84, 85, 124, 125]),
+        denseSample(time: 1.2, columns: columns, rows: rows, indices: [84, 85, 124, 125]),
+        denseSample(time: 2.0, columns: columns, rows: rows, indices: [94, 95, 134, 135]),
+        denseSample(time: 2.2, columns: columns, rows: rows, indices: [94, 95, 134, 135]),
+        denseSample(time: 4.8, columns: columns, rows: rows, indices: [84, 85, 124, 125]),
+        denseSample(time: 5.0, columns: columns, rows: rows, indices: [84, 85, 124, 125]),
+    ]
+    let tracks = DenseMotionTrackGraph.make(samples: samples)
+    let objects = DenseMotionObjectGraph.make(tracks: tracks)
+    #expect(objects.ensembles.allSatisfy { $0.trackIDs.count == 1 })
+}
+
+@Test func denseMotionObjectPartitionIsDeterministic() {
+    let columns = 40, rows = 24
+    let samples = [1.0, 1.2, 4.8, 5.0].map { time in
+        denseSample(
+            time: time,
+            columns: columns,
+            rows: rows,
+            indices: [84, 85, 124, 125, 94, 95, 134, 135]
+        )
+    }
+    let firstTracks = DenseMotionTrackGraph.make(samples: samples)
+    let secondTracks = DenseMotionTrackGraph.make(samples: samples.reversed())
+    let first = DenseMotionObjectGraph.make(tracks: firstTracks)
+    let second = DenseMotionObjectGraph.make(tracks: secondTracks)
+    #expect(first.ensembles.map(\.trackIDs) == second.ensembles.map(\.trackIDs))
+    #expect(firstTracks.components.flatMap(\.tileIndices).sorted()
+        == secondTracks.components.flatMap(\.tileIndices).sorted())
+}
+
+@Test func denseMotionSurfaceUsesBothLifecycleBoundariesAndRejectsOneSidedChange() throws {
+    let width = 80, height = 60, columns = 20, rows = 12
+    let samples = [1.0, 1.2, 4.8, 5.0].map { time in
+        denseSample(
+            time: time,
+            columns: columns,
+            rows: rows,
+            indices: [105, 106, 125, 126]
+        )
+    }
+    let tracks = DenseMotionTrackGraph.make(samples: samples)
+    let objects = DenseMotionObjectGraph.make(tracks: tracks)
+    let object = try #require(objects.ensembles.first { $0.kind == .compactObject })
+
+    let before = solidRGBA(width: width, height: height, value: 20)
+    var held = before
+    var after = before
+    paintRGBA(&held, imageWidth: width, x: 20, y: 14, width: 34, height: 20, value: 92)
+    // This unrelated lower-right update exists only across the birth side.
+    // A one-way diff would absorb it; the release-side intersection must not.
+    paintRGBA(&held, imageWidth: width, x: 62, y: 44, width: 12, height: 10, value: 150)
+    paintRGBA(&after, imageWidth: width, x: 62, y: 44, width: 12, height: 10, value: 150)
+    let frames = [
+        DenseMotionRasterFrame(time: 0.8, width: width, height: height, pixels: before),
+        DenseMotionRasterFrame(time: 3.0, width: width, height: height, pixels: held),
+        DenseMotionRasterFrame(time: 5.2, width: width, height: height, pixels: after),
+    ]
+    let surfaces = DenseMotionSurfaceGraph.make(
+        tracks: tracks,
+        objects: objects,
+        frames: frames,
+        tileColumns: columns,
+        tileRows: rows
+    )
+    let surface = try #require(surfaces.surfaces.first { $0.objectID == object.id })
+    #expect(abs(surface.normalizedBounds.minX - 0.25) < 0.03)
+    #expect(abs(surface.normalizedBounds.minY - (14.0 / 60.0)) < 0.03)
+    #expect(abs(surface.normalizedBounds.width - (34.0 / 80.0)) < 0.04)
+    #expect(surface.normalizedBounds.maxX < 0.72)
+    #expect(surface.confidence > 0.6)
+}
+
+@Test func denseMotionTransportRecoversLowContrastCardDespiteChangingLabel() throws {
+    let width = 96, height = 64
+    let frames = (0..<7).map { index -> DenseTransportFrame in
+        var pixels = solidRGBA(width: width, height: height, value: 10)
+        // A same-colored stationary lookalike must not be reported as moving.
+        paintRGBA(&pixels, imageWidth: width, x: 4, y: 4, width: 20, height: 10, value: 22)
+        let x = 12 + index * 4
+        paintRGBA(&pixels, imageWidth: width, x: x, y: 22, width: 26, height: 28, value: 22)
+        // Interior content mutates while the enclosing low-contrast surface
+        // translates. Transport must treat this as an outlier, not identity.
+        paintRGBA(
+            &pixels,
+            imageWidth: width,
+            x: x + 10 + index % 3,
+            y: 32,
+            width: 4,
+            height: 7,
+            value: 238
+        )
+        return DenseTransportFrame(
+            time: Double(index) / 24,
+            width: width,
+            height: height,
+            pixels: pixels
+        )
+    }
+    let graph = DenseMotionTransportGraph.make(frames: frames)
+    let track = try #require(graph.tracks.max { $0.normalizedTravel < $1.normalizedTravel })
+    #expect(track.dominantAxis == .horizontal)
+    #expect(track.componentIDs.count == frames.count)
+    #expect(track.directionalCoherence > 0.95)
+    #expect(track.confidence > 0.75)
+    let byID = Dictionary(uniqueKeysWithValues: graph.components.map { ($0.id, $0) })
+    let samples = track.componentIDs.compactMap { byID[$0] }
+    #expect(samples.allSatisfy { abs($0.normalizedBounds.width - 26.0 / 96.0) < 0.03 })
+    #expect(zip(samples, samples.dropFirst()).allSatisfy {
+        $1.normalizedBounds.midX > $0.normalizedBounds.midX
+    })
+}
+
+@Test func denseMotionTransportRejectsStationaryAppearanceSurface() {
+    let width = 80, height = 60
+    let frames = (0..<6).map { index -> DenseTransportFrame in
+        var pixels = solidRGBA(width: width, height: height, value: 10)
+        paintRGBA(&pixels, imageWidth: width, x: 20, y: 16, width: 30, height: 24, value: 22)
+        return DenseTransportFrame(
+            time: Double(index) / 24,
+            width: width,
+            height: height,
+            pixels: pixels
+        )
+    }
+    #expect(DenseMotionTransportGraph.make(frames: frames).tracks.isEmpty)
+}
+
+@Test func denseMotionTransportIsDeterministicUnderInputOrdering() {
+    let width = 80, height = 60
+    let frames = (0..<6).map { index -> DenseTransportFrame in
+        var pixels = solidRGBA(width: width, height: height, value: 10)
+        paintRGBA(&pixels, imageWidth: width, x: 8 + index * 4, y: 18, width: 24, height: 22, value: 22)
+        return DenseTransportFrame(
+            time: Double(index) / 24,
+            width: width,
+            height: height,
+            pixels: pixels
+        )
+    }
+    let first = DenseMotionTransportGraph.make(frames: frames)
+    let second = DenseMotionTransportGraph.make(frames: frames.reversed())
+    #expect(first.tracks.map(\.componentIDs) == second.tracks.map(\.componentIDs))
+    #expect(first.tracks.map(\.normalizedTravel) == second.tracks.map(\.normalizedTravel))
+}
+
+@Test func foregroundOwnershipPreservesProvenanceAndAbstainsFromUnrelatedMotion() throws {
+    let columns = 40, rows = 24
+    let samples = [1.0, 1.2, 4.8, 5.0].map { time in
+        denseSample(
+            time: time,
+            columns: columns,
+            rows: rows,
+            indices: [84, 85, 124, 125, 670, 671, 710, 711]
+        )
+    }
+    let motion = DenseMotionTrackGraph.make(samples: samples)
+    let owned = try #require(motion.tracks.first { $0.normalizedBounds.minX < 0.2 })
+    let unrelated = try #require(motion.tracks.first { $0.normalizedBounds.minX > 0.6 })
+    let seed = ForegroundSupportSeed(
+        id: 7,
+        normalizedBounds: owned.normalizedBounds,
+        tileIndices: owned.componentIDs.flatMap { id in
+            motion.components.first { $0.id == id }?.tileIndices ?? []
+        },
+        birthTime: 1.0,
+        heldTime: 3.0,
+        releaseTime: 5.0,
+        supportConfidence: 0.9,
+        provenanceMotionTrackIDs: [owned.id]
+    )
+    let graph = DenseMotionOwnershipGraph.make(
+        seeds: [seed],
+        motion: motion,
+        transport: DenseMotionTransportGraph.make(frames: [])
+    )
+    let direct = try #require(graph.motionAssignments.first { $0.trackID == owned.id })
+    let rejected = try #require(graph.motionAssignments.first { $0.trackID == unrelated.id })
+    #expect(direct.status == .provenance)
+    #expect(direct.lifecycleID == seed.id)
+    #expect(rejected.status == .unowned)
+    #expect(rejected.lifecycleID == nil)
+}
+
+@Test func foregroundOwnershipAbstainsWhenTwoSupportsExplainTheSameEvidence() throws {
+    let columns = 40, rows = 24
+    let motion = DenseMotionTrackGraph.make(samples: [1.0, 1.2, 4.8, 5.0].map { time in
+        denseSample(time: time, columns: columns, rows: rows, indices: [84, 85, 124, 125])
+    })
+    let track = try #require(motion.tracks.first)
+    let tiles = track.componentIDs.flatMap { id in
+        motion.components.first { $0.id == id }?.tileIndices ?? []
+    }
+    let seeds = [10, 11].map { id in
+        ForegroundSupportSeed(
+            id: id,
+            normalizedBounds: track.normalizedBounds,
+            tileIndices: tiles,
+            birthTime: 1.0,
+            heldTime: 3.0,
+            releaseTime: 5.0,
+            supportConfidence: 0.9,
+            provenanceMotionTrackIDs: []
+        )
+    }
+    let graph = DenseMotionOwnershipGraph.make(
+        seeds: seeds,
+        motion: motion,
+        transport: DenseMotionTransportGraph.make(frames: [])
+    )
+    let assignment = try #require(graph.motionAssignments.first)
+    #expect(assignment.status == .ambiguous)
+    #expect(assignment.lifecycleID == nil)
+    #expect(assignment.candidates.map(\.lifecycleID) == [10, 11])
+}
+
+@Test func foregroundOwnershipCanAssociateTransportWithoutRewritingLifecycleBirth() throws {
+    let width = 96, height = 64
+    let frames = (0..<8).map { index -> DenseTransportFrame in
+        var pixels = solidRGBA(width: width, height: height, value: 10)
+        paintRGBA(&pixels, imageWidth: width, x: 12 + index * 3, y: 22, width: 28, height: 24, value: 22)
+        return DenseTransportFrame(
+            time: 0.7 + Double(index) / 24,
+            width: width,
+            height: height,
+            pixels: pixels
+        )
+    }
+    let transport = DenseMotionTransportGraph.make(frames: frames)
+    let track = try #require(transport.tracks.first)
+    let seed = ForegroundSupportSeed(
+        id: 4,
+        normalizedBounds: CGRect(x: 0.24, y: 0.32, width: 0.42, height: 0.45),
+        tileIndices: [],
+        birthTime: 1.0,
+        heldTime: 2.0,
+        releaseTime: 4.0,
+        supportConfidence: 0.85,
+        provenanceMotionTrackIDs: []
+    )
+    let graph = DenseMotionOwnershipGraph.make(
+        seeds: [seed],
+        motion: DenseMotionTrackGraph.make(samples: []),
+        transport: transport
+    )
+    let assignment = try #require(graph.transportAssignments.first { $0.trackID == track.id })
+    #expect(assignment.status == .inferred)
+    #expect(assignment.lifecycleID == seed.id)
+    let lifecycle = try #require(graph.lifecycles.first)
+    #expect(lifecycle.birthTime == seed.birthTime)
+    #expect(lifecycle.supportingEvidenceStart < lifecycle.birthTime)
+}
+
+private func solidRGBA(width: Int, height: Int, value: UInt8) -> [UInt8] {
+    var pixels = [UInt8](repeating: value, count: width * height * 4)
+    for pixel in 0..<(width * height) { pixels[pixel * 4 + 3] = 255 }
+    return pixels
+}
+
+private func denseSample(
+    time: Double,
+    columns: Int,
+    rows: Int,
+    indices: [Int],
+    channel: MotionEvidenceChannel = .structural
+) -> DenseMotionSample {
+    DenseMotionSample(
+        time: time,
+        tileColumns: columns,
+        tileRows: rows,
+        tiles: indices.map { index in
+            let x = index % columns, y = index / columns
+            return MotionEvidenceTile(
+                index: index,
+                normalizedBounds: CGRect(
+                    x: Double(x) / Double(columns),
+                    y: Double(y) / Double(rows),
+                    width: 1 / Double(columns),
+                    height: 1 / Double(rows)
+                ),
+                channel: channel,
+                changedFraction: 0.7,
+                energy: 0.8,
+                meanLuminanceDelta: 20,
+                beforeDetail: 2,
+                afterDetail: 12,
+                confidence: 0.9,
+                normalizedVector: .zero
+            )
+        }
+    )
 }
 
 @Test func motionFieldIsSymmetricUnderFrameReversal() throws {
@@ -1031,6 +1482,16 @@ private func rectArea(_ rect: CGRect) -> CGFloat {
     #expect(phases.pointerArrivalSource == "target-visual-hover")
 }
 
+@Test func activationFrameCannotBecomeItsOwnCausalBaseline() {
+    let times = [36.266, 36.451, 36.535, 36.735]
+    let index = CausalFrameOrdering.preActivationSampleIndex(
+        in: times, activationBoundary: 36.535
+    )
+
+    #expect(index == 1)
+    if let index { #expect(times[index] == 36.451) }
+}
+
 @Test func interactionTimingTargetUsesPointForBroadAccessibilityContainers() throws {
     let broadTextArea = CGRect(x: 0, y: 0.2, width: 0.97, height: 0.75)
     let point = CGPoint(x: 0.49, y: 0.58)
@@ -1180,6 +1641,35 @@ private func rectArea(_ rect: CGRect) -> CGFloat {
     )
     #expect(abs(phases.activation - 35.80) < 0.001)
     #expect(phases.source == "target-visual-raw-span")
+}
+
+@Test func batchedActionsCannotReuseALaterActionsVisualActivation() {
+    let samples = [
+        InteractionActivitySample(time: 57.10, magnitude: 8.0),
+        InteractionActivitySample(time: 57.16, magnitude: 7.0)
+    ]
+    let earlier = InteractionPhaseDetector.detect(
+        samples: samples,
+        rawEstimate: 53.49,
+        toolStart: 53.05,
+        toolEnd: 58.23,
+        finalActionInToolCall: false,
+        actionWindow: 53.00...54.35
+    )
+    let later = InteractionPhaseDetector.detect(
+        samples: samples,
+        rawEstimate: 56.94,
+        toolStart: 53.05,
+        toolEnd: 58.23,
+        finalActionInToolCall: true,
+        actionWindow: 56.08...58.41
+    )
+
+    #expect(abs(earlier.activation - 53.49) < 0.001)
+    #expect(earlier.source == "telemetry-estimate")
+    #expect(earlier.responseOnset == nil)
+    #expect(abs(later.activation - 57.10) < 0.001)
+    #expect(later.source == "target-visual")
 }
 
 @Test func cameraFollowsPointerDepartureBeforeMeasuredActivation() throws {
@@ -1460,6 +1950,36 @@ private func rectArea(_ rect: CGRect) -> CGFloat {
     #expect(idle.logScale == laggingCamera.logScale)
 }
 
+@Test func unresolvedPointerGapProtectsArrivalButNotInventedTravel() throws {
+    let directed = try composition("""
+    [
+      {"action":"click","time":1,"coordinates":{"xNorm":0.90,"yNorm":0.50}},
+      {"action":"click","time":2},
+      {"action":"click","time":4,"coordinates":{"xNorm":0.10,"yNorm":0.50}}
+    ]
+    """, duration: 6)
+    #expect(!directed.actions[1].rendersCursor)
+    let trip = try #require(directed.pointerTrip(forActionID: 2))
+
+    // The visual interpolation crosses an unresolved action and therefore is
+    // not factual camera authority before the next measured arrival.
+    let inventedTravelTime = (trip.start + trip.end) / 2
+    let leftCamera = CameraState(x: 180, y: size.height / 2, logScale: log(1.6))
+    let unchanged = directed.enforcingFactualActionVisibility(
+        leftCamera, at: inventedTravelTime
+    )
+    #expect(unchanged == leftCamera)
+
+    // The known destination and activation remain non-negotiable.
+    let rightCamera = CameraState(
+        x: size.width - 180, y: size.height / 2, logScale: log(1.6)
+    )
+    let arrival = directed.enforcingFactualActionVisibility(
+        rightCamera, at: trip.end - 0.05
+    )
+    #expect(arrival != rightCamera)
+}
+
 @Test func semanticInputTargetCorrectsCameraLagTowardSafeFrame() throws {
     let directed = try composition("""
     [{"action":"type_text","time":4,"semanticTarget":{"bounds":{"xNorm":0.25,"yNorm":0.84,"widthNorm":0.5,"heightNorm":0.06}}}]
@@ -1667,6 +2187,48 @@ private func rectArea(_ rect: CGRect) -> CGFloat {
     #expect(abs(decision.activation - 3.20) < 0.001)
 }
 
+@Test func factualTimingFallbackAbstainsFromAnImpossibleEarlierResponse() throws {
+    let phase = InteractionPhases(
+        rawEstimate: 5,
+        toolStart: 4,
+        toolEnd: 5.5,
+        pointerArrival: 4.8,
+        activation: 5,
+        responseOnset: 4,
+        source: "telemetry-order-fallback",
+        activityThreshold: 0.5,
+        activityClusters: []
+    )
+    let directed = try composition(
+        """
+        [{"action":"click","time":5,"coordinates":{"xNorm":0.5,"yNorm":0.5}}]
+        """,
+        duration: 8,
+        interactionPhases: [0: phase]
+    )
+    let graph = ProductionPlanGraph.make(
+        from: directed,
+        contentRect: rect,
+        sourceDuration: 8,
+        observations: [],
+        motionRanges: [],
+        freezeResolvedTiming: true
+    )
+    let plan = ProductionPlanner.plan(
+        graph: graph,
+        composition: directed,
+        base: CameraState(x: size.width / 2, y: size.height / 2, logScale: 0)
+    )
+    let resolved = graph.resolvedInteractionPhases(
+        from: plan.decisions,
+        existing: directed.interactionPhases
+    )
+
+    #expect(plan.decisions.count == 1)
+    #expect(resolved[0]?.activation == 5)
+    #expect(resolved[0]?.responseOnset == nil)
+}
+
 @Test func batchedComputerUseActionsCannotShareOrReverseAVisualCluster() throws {
     let sharedStart = 53.057
     let sharedEnd = 58.232
@@ -1728,6 +2290,53 @@ private func rectArea(_ rect: CGRect) -> CGFloat {
     let plan = ProductionPlanner.plan(graph: graph, composition: directed, base: base)
     #expect(plan.camera.diagnostics.feasible)
     #expect(plan.decisions.count == 3)
+}
+
+@Test func visualTimingCannotReverseActionsAcrossToolEnvelopes() throws {
+    let clickPhase = InteractionPhases(
+        rawEstimate: 8.0,
+        toolStart: 7.0,
+        toolEnd: 9.0,
+        pointerArrival: 7.8,
+        activation: 8.0,
+        responseOnset: nil,
+        source: "target-visual",
+        activityThreshold: 0.55
+    )
+    let directed = try composition(
+        """
+        [
+          {"action":"select_text","time":7.5,"semanticTarget":{"bounds":{"xNorm":0.1,"yNorm":0.2,"widthNorm":0.8,"heightNorm":0.6}}},
+          {"action":"click","time":8.0,"coordinates":{"xNorm":0.85,"yNorm":0.82},"targetResolution":{"provenance":"direct","confidence":0.99}}
+        ]
+        """,
+        duration: 11,
+        interactionPhases: [1: clickPhase]
+    )
+    // This is strong enough to become the click's causal-response candidate,
+    // but its onset predates the preceding recorded action. It may inform the
+    // response; it may not reverse the Computer Use total order.
+    let response = VisualMotionObservation(
+        time: 8.1,
+        normalizedBounds: CGRect(x: 0.55, y: 0.2, width: 0.35, height: 0.5),
+        changedFraction: 0.18,
+        magnitude: 0.9,
+        kind: .transformation,
+        startTime: 7.0
+    )
+    let graph = ProductionPlanGraph.make(
+        from: directed,
+        contentRect: rect,
+        sourceDuration: 11,
+        observations: [response],
+        motionRanges: [7.0...8.1]
+    )
+    let firstActivation = graph.actions[0].timings[0].activation
+    let secondTimings = graph.actions[1].timings
+
+    #expect(secondTimings.allSatisfy { $0.activation > firstActivation })
+    #expect(secondTimings.contains { abs($0.activation - 8.0) < 0.001 })
+    #expect(secondTimings.contains { $0.source == "causal-response-onset" } == false)
 }
 
 @Test func productionPlannerUsesSeparateActivationAndResponsePoses() throws {
@@ -1972,6 +2581,2446 @@ private func rectArea(_ rect: CGRect) -> CGFloat {
     #expect(exp(formShots[0].pose.logScale) >= 1.2)
 }
 
+@Test func waitingReductionPreservesMultiActionReadabilityEvidence() throws {
+    let directed = try composition(
+        """
+        [
+          {"action":"click","time":3.0,"coordinates":{"xNorm":0.55,"yNorm":0.46},"timing":{"toolCallDurationMs":600}},
+          {"action":"click","time":10.0,"coordinates":{"xNorm":0.51,"yNorm":0.68},"timing":{"toolCallDurationMs":600}},
+          {"action":"click","time":11.5,"coordinates":{"xNorm":0.08,"yNorm":0.45}}
+        ]
+        """,
+        duration: 14,
+        reduceWaiting: true,
+        waitingTime: 0.65,
+        verifiedIdleRanges: [0...14]
+    )
+    let compactWorkflow = SubjectGraph.Subject(
+        id: 0, kind: .surface,
+        bounds: CGRect(x: 470, y: 230, width: 110, height: 215),
+        sourceRange: 3...10.55, actionIDs: [0, 1], confidence: 0.9
+    )
+    let nextRegion = SubjectGraph.Subject(
+        id: 1, kind: .target,
+        bounds: CGRect(x: 40, y: 330, width: 80, height: 70),
+        sourceRange: 11.5...12.05, actionIDs: [2], confidence: 0.9,
+        requiresOverview: true
+    )
+    let graph = SubjectGraph(
+        size: size, subjects: [compactWorkflow, nextRegion], transitions: []
+    )
+    let base = CameraState(x: size.width / 2, y: size.height / 2, logScale: 0)
+
+    var durationOnlyPolicy = ShotSchedulePlanner.Policy.default
+    durationOnlyPolicy.additionalActionReadabilitySeconds = 0
+    let durationOnly = ShotSchedulePlanner.plan(
+        subjects: graph, composition: directed, base: base,
+        policy: durationOnlyPolicy
+    )
+    let durationOnlyShot = try #require(durationOnly.shots.first {
+        $0.subjectID == compactWorkflow.id
+    })
+    #expect(durationOnlyShot.intent == .overview)
+
+    let preserved = ShotSchedulePlanner.plan(
+        subjects: graph, composition: directed, base: base
+    )
+    let preservedShot = try #require(preserved.shots.first {
+        $0.subjectID == compactWorkflow.id
+    })
+    #expect(preservedShot.intent == .frame)
+    #expect(preservedShot.readabilityValue > 0)
+    #expect(preserved.moves.contains { $0.label == "experimental-shot-0" })
+}
+
+@Test func clipGlobalShotSearchCanAmortizeOneEntryAcrossNearbyShortSubjects() throws {
+    let directed = try composition(
+        """
+        [
+          {"action":"click","time":2.0,"coordinates":{"xNorm":0.50,"yNorm":0.50}},
+          {"action":"click","time":3.0,"coordinates":{"xNorm":0.51,"yNorm":0.51}},
+          {"action":"click","time":4.0,"coordinates":{"xNorm":0.52,"yNorm":0.50}}
+        ]
+        """,
+        duration: 7
+    )
+    let bounds = CGRect(x: 430, y: 320, width: 140, height: 110)
+    let graph = SubjectGraph(
+        size: size,
+        subjects: [
+            .init(id: 0, kind: .target, bounds: bounds,
+                  sourceRange: 2...2.55, actionIDs: [0], confidence: 0.9),
+            .init(id: 1, kind: .target, bounds: bounds.offsetBy(dx: 8, dy: 6),
+                  sourceRange: 3...3.55, actionIDs: [1], confidence: 0.9),
+            .init(id: 2, kind: .target, bounds: bounds.offsetBy(dx: 16, dy: 0),
+                  sourceRange: 4...4.55, actionIDs: [2], confidence: 0.9)
+        ],
+        transitions: []
+    )
+    var policy = ShotSchedulePlanner.Policy.default
+    policy.moveCost = 1.50
+    policy.scaleCost = 0
+    policy.translationCost = 0
+    policy.additionalActionReadabilitySeconds = 0
+    let schedule = ShotSchedulePlanner.plan(
+        subjects: graph,
+        composition: directed,
+        base: CameraState(x: size.width / 2, y: size.height / 2, logScale: 0),
+        policy: policy
+    )
+
+    #expect(schedule.objectiveValue > 0)
+    #expect(schedule.moves.count == 1)
+    #expect(schedule.shots.filter { $0.intent == .frame }.count == 3)
+    #expect(schedule.moves[0].label == "experimental-shot-0")
+}
+
+@Test func clipGlobalShotSearchRejectsUnrelatedShortSubjectsThatNeedSeparateMoves() throws {
+    let directed = try composition(
+        """
+        [
+          {"action":"click","time":2.0,"coordinates":{"xNorm":0.10,"yNorm":0.15}},
+          {"action":"click","time":4.0,"coordinates":{"xNorm":0.90,"yNorm":0.85}}
+        ]
+        """,
+        duration: 7
+    )
+    let graph = SubjectGraph(
+        size: size,
+        subjects: [
+            .init(id: 0, kind: .target,
+                  bounds: CGRect(x: 40, y: 60, width: 100, height: 90),
+                  sourceRange: 2...2.55, actionIDs: [0], confidence: 0.9),
+            .init(id: 1, kind: .target,
+                  bounds: CGRect(x: 860, y: 650, width: 100, height: 90),
+                  sourceRange: 4...4.55, actionIDs: [1], confidence: 0.9)
+        ],
+        transitions: []
+    )
+    var policy = ShotSchedulePlanner.Policy.default
+    policy.moveCost = 1.50
+    policy.scaleCost = 0
+    policy.translationCost = 3
+    policy.additionalActionReadabilitySeconds = 0
+    let schedule = ShotSchedulePlanner.plan(
+        subjects: graph,
+        composition: directed,
+        base: CameraState(x: size.width / 2, y: size.height / 2, logScale: 0),
+        policy: policy
+    )
+
+    #expect(schedule.moves.isEmpty)
+    #expect(schedule.shots.allSatisfy { $0.intent == .overview })
+}
+
+@Test func laterLocalizedRevealCanEstablishAnEarlierActionInTheSameSurface() throws {
+    let directed = try composition("""
+    [
+      {"action":"click","time":2.0,"coordinates":{"xNorm":0.50,"yNorm":0.55},"semanticTarget":{"bounds":{"xNorm":0.46,"yNorm":0.52,"widthNorm":0.08,"heightNorm":0.06}}},
+      {"action":"click","time":16.0,"coordinates":{"xNorm":0.58,"yNorm":0.66},"semanticTarget":{"bounds":{"xNorm":0.54,"yNorm":0.63,"widthNorm":0.10,"heightNorm":0.06}}}
+    ]
+    """, duration: 20)
+    let reveal = VisualMotionObservation(
+        time: 16.45,
+        normalizedBounds: CGRect(x: 0.32, y: 0.28, width: 0.38, height: 0.48),
+        changedFraction: 0.14,
+        magnitude: 0.95,
+        kind: .appearance,
+        startTime: 16.08
+    )
+    let graph = ProductionPlanGraph.make(
+        from: directed, contentRect: rect, sourceDuration: 20,
+        observations: [reveal], motionRanges: [16.08...16.45]
+    )
+    let subjects = SubjectGraph.make(graph: graph, composition: directed)
+    let surface = try #require(subjects.subjects.first { $0.actionIDs == [0, 1] })
+
+    #expect(surface.kind == .surface)
+    #expect(surface.observationIDs == [0])
+    #expect(surface.sourceRange.lowerBound == 2)
+    #expect(surface.bounds.width > rect.width * 0.35)
+    #expect(surface.requiresOverview == false)
+
+    let schedule = ShotSchedulePlanner.plan(
+        subjects: subjects, composition: directed,
+        base: CameraState(x: size.width / 2, y: size.height / 2, logScale: 0)
+    )
+    let shot = try #require(schedule.shots.first { $0.subjectID == surface.id })
+    #expect(shot.intent == .frame)
+    #expect(shot.interval.lowerBound <= directed.outputTime(atSourceTime: 2) + 0.001)
+}
+
+@Test func unresolvedBroadResponseConstrainsTheWholeSubjectToOverview() throws {
+    let directed = try composition("""
+    [
+      {"action":"click","time":2.0,"coordinates":{"xNorm":0.48,"yNorm":0.58}},
+      {"action":"click","time":3.0,"coordinates":{"xNorm":0.55,"yNorm":0.58}}
+    ]
+    """, duration: 7)
+    let broad = VisualMotionObservation(
+        time: 3.5,
+        normalizedBounds: CGRect(x: 0, y: 0, width: 1, height: 1),
+        changedFraction: 0.30,
+        magnitude: 1,
+        kind: .transformation,
+        startTime: 1.98
+    )
+    let graph = ProductionPlanGraph.make(
+        from: directed, contentRect: rect, sourceDuration: 7,
+        observations: [broad], motionRanges: [1.98...3.5]
+    )
+    let subjects = SubjectGraph.make(graph: graph, composition: directed)
+    let surface = try #require(subjects.subjects.first { $0.actionIDs == [0, 1] })
+    #expect(surface.requiresOverview)
+    let blame = try #require(surface.overviewBlame)
+    let evidence = try #require(blame.actions.first)
+    #expect(evidence.actionID == 0)
+    #expect(evidence.broadObservationIDs == [0])
+    #expect(evidence.preexistingBroadObservationIDs.isEmpty)
+    #expect(evidence.localizedObservationIDs.isEmpty)
+    #expect(evidence.broadWeight > evidence.localizedWeight)
+    #expect(evidence.reason == "localized-weight-below-action-aligned-broad-weight-without-verified-release")
+
+    var policy = ShotSchedulePlanner.Policy.default
+    policy.moveCost = 0
+    policy.scaleCost = 0
+    policy.translationCost = 0
+    let schedule = ShotSchedulePlanner.plan(
+        subjects: subjects, composition: directed,
+        base: CameraState(x: size.width / 2, y: size.height / 2, logScale: 0),
+        policy: policy
+    )
+    let shot = try #require(schedule.shots.first { $0.subjectID == surface.id })
+    #expect(shot.intent == .overview)
+    #expect(exp(shot.pose.logScale) == 1)
+    #expect(schedule.moves.isEmpty)
+}
+
+@Test func broadMotionAlreadyUnderwayCannotConstrainTheNextActionToOverview() throws {
+    let directed = try composition("""
+    [
+      {"action":"click","time":2.0,"coordinates":{"xNorm":0.08,"yNorm":0.50}},
+      {"action":"click","time":3.0,"coordinates":{"xNorm":0.48,"yNorm":0.58}},
+      {"action":"click","time":4.0,"coordinates":{"xNorm":0.55,"yNorm":0.58}}
+    ]
+    """, duration: 7)
+    let broad = VisualMotionObservation(
+        time: 3.5,
+        normalizedBounds: CGRect(x: 0, y: 0, width: 1, height: 1),
+        changedFraction: 0.30,
+        magnitude: 1,
+        kind: .transformation,
+        startTime: 2.80
+    )
+    let graph = ProductionPlanGraph.make(
+        from: directed, contentRect: rect, sourceDuration: 7,
+        observations: [broad], motionRanges: [2.80...3.5]
+    )
+    let subjects = SubjectGraph.make(graph: graph, composition: directed)
+    let laterSurface = try #require(subjects.subjects.first { $0.actionIDs == [1, 2] })
+
+    #expect(laterSurface.requiresOverview == false)
+    #expect(laterSurface.overviewBlame == nil)
+
+    var policy = ShotSchedulePlanner.Policy.default
+    policy.moveCost = 0
+    policy.scaleCost = 0
+    policy.translationCost = 0
+    let schedule = ShotSchedulePlanner.plan(
+        subjects: subjects, composition: directed,
+        base: CameraState(x: size.width / 2, y: size.height / 2, logScale: 0),
+        policy: policy
+    )
+    let shot = try #require(schedule.shots.first { $0.subjectID == laterSurface.id })
+    #expect(shot.intent == .frame)
+}
+
+@Test func overviewBlameSeparatesPreexistingBroadMotionFromTheAlignedVeto() throws {
+    let directed = try composition(
+        """
+        [{"action":"click","time":2.0,"coordinates":{"xNorm":0.50,"yNorm":0.50}}]
+        """,
+        duration: 6
+    )
+    let observations = [
+        VisualMotionObservation(
+            time: 2.4,
+            normalizedBounds: CGRect(x: 0, y: 0, width: 1, height: 1),
+            changedFraction: 0.22,
+            magnitude: 0.8,
+            kind: .transformation,
+            startTime: 1.0
+        ),
+        VisualMotionObservation(
+            time: 2.5,
+            normalizedBounds: CGRect(x: 0, y: 0, width: 1, height: 1),
+            changedFraction: 0.18,
+            magnitude: 0.9,
+            kind: .appearance,
+            startTime: 2.05
+        )
+    ]
+    let graph = ProductionPlanGraph.make(
+        from: directed,
+        contentRect: rect,
+        sourceDuration: 6,
+        observations: observations,
+        motionRanges: [1...2.5]
+    )
+    let subjects = SubjectGraph.make(graph: graph, composition: directed)
+    let subject = try #require(subjects.subjects.first { $0.actionIDs == [0] })
+    let evidence = try #require(subject.overviewBlame?.actions.first)
+
+    #expect(subject.requiresOverview)
+    #expect(evidence.broadObservationIDs == [1])
+    #expect(evidence.preexistingBroadObservationIDs == [0])
+}
+
+@Test func actionResponseSlicesNeverAssignCrossBoundaryEvidenceToEitherAction() throws {
+    let directed = try composition("""
+    [
+      {"action":"click","time":2.0,"coordinates":{"xNorm":0.42,"yNorm":0.45}},
+      {"action":"click","time":2.5,"coordinates":{"xNorm":0.58,"yNorm":0.45}}
+    ]
+    """, duration: 6)
+    let evidence = [
+        EpisodeVisualEvidence(
+            actionID: 0, startTime: 1.92, endTime: 2.24,
+            normalizedBounds: CGRect(x: 0, y: 0, width: 1, height: 1),
+            changedFraction: 0.20, confidence: 0.9
+        ),
+        EpisodeVisualEvidence(
+            actionID: -1, startTime: 2.40, endTime: 2.60,
+            normalizedBounds: CGRect(x: 0, y: 0, width: 1, height: 1),
+            changedFraction: 0.18, confidence: 0.8
+        ),
+        EpisodeVisualEvidence(
+            actionID: 1, startTime: 2.44, endTime: 2.78,
+            normalizedBounds: CGRect(x: 0.25, y: 0.25, width: 0.5, height: 0.5),
+            changedFraction: 0.12, confidence: 0.9
+        ),
+        EpisodeVisualEvidence(
+            actionID: -1, startTime: 2.62, endTime: 2.88,
+            normalizedBounds: CGRect(x: 0.30, y: 0.30, width: 0.4, height: 0.4),
+            changedFraction: 0.10, confidence: 0.8
+        )
+    ]
+    let slices = ActionResponseSlicer.make(
+        actions: directed.actions,
+        phases: directed.interactionPhases,
+        evidence: evidence,
+        sourceDuration: 6
+    )
+    let first = try #require(slices.first { $0.actionID == 0 })
+    let second = try #require(slices.first { $0.actionID == 1 })
+
+    #expect(first.exclusiveEvidence.map(\.id) == [0])
+    #expect(first.crossBoundaryEvidence.map(\.id) == [1])
+    #expect(second.exclusiveEvidence.map(\.id) == [2, 3])
+    #expect(second.preexistingEvidence.map(\.id) == [1])
+    let exclusiveOwners = Dictionary(grouping: slices.flatMap { slice in
+        slice.exclusiveEvidence.map { ($0.id, slice.actionID) }
+    }, by: \.0)
+    #expect(exclusiveOwners.values.allSatisfy { $0.count == 1 })
+}
+
+@Test func crossActionAggregateCannotCreateAnOverviewVetoWhenSlicesAreLocalized() throws {
+    let directed = try composition("""
+    [
+      {"action":"click","time":2.0,"coordinates":{"xNorm":0.48,"yNorm":0.58}},
+      {"action":"click","time":3.0,"coordinates":{"xNorm":0.55,"yNorm":0.58}}
+    ]
+    """, duration: 7)
+    let aggregate = VisualMotionObservation(
+        time: 4.4,
+        normalizedBounds: CGRect(x: 0, y: 0, width: 1, height: 1),
+        changedFraction: 0.30, magnitude: 1, kind: .transformation,
+        startTime: 2.05
+    )
+    let slicedEvidence = [
+        EpisodeVisualEvidence(
+            actionID: 0, startTime: 2.02, endTime: 2.32,
+            normalizedBounds: CGRect(x: 0.40, y: 0.45, width: 0.20, height: 0.20),
+            changedFraction: 0.08, confidence: 0.9
+        ),
+        EpisodeVisualEvidence(
+            actionID: -1, startTime: 2.90, endTime: 3.12,
+            normalizedBounds: CGRect(x: 0, y: 0, width: 1, height: 1),
+            changedFraction: 0.20, confidence: 0.9
+        )
+    ]
+    let graph = ProductionPlanGraph.make(
+        from: directed, contentRect: rect, sourceDuration: 7,
+        observations: [aggregate], episodeVisualEvidence: slicedEvidence,
+        motionRanges: [2.05...4.4]
+    )
+    let subjects = SubjectGraph.make(graph: graph, composition: directed)
+
+    #expect(Set(subjects.subjects.flatMap(\.actionIDs)).isSuperset(of: [0, 1]))
+    #expect(subjects.subjects.allSatisfy { $0.requiresOverview == false })
+    #expect(subjects.subjects.allSatisfy { $0.overviewBlame == nil })
+}
+
+@Test func exclusivelySlicedBroadResponseStillConstrainsFraming() throws {
+    let directed = try composition("""
+    [{"action":"click","time":2.0,"coordinates":{"xNorm":0.50,"yNorm":0.50}}]
+    """, duration: 6)
+    let broad = EpisodeVisualEvidence(
+        actionID: 0, startTime: 1.94, endTime: 2.36,
+        normalizedBounds: CGRect(x: 0, y: 0, width: 1, height: 1),
+        changedFraction: 0.24, confidence: 0.95
+    )
+    let graph = ProductionPlanGraph.make(
+        from: directed, contentRect: rect, sourceDuration: 6,
+        observations: [], episodeVisualEvidence: [broad], motionRanges: [1.94...2.36]
+    )
+    let subjects = SubjectGraph.make(graph: graph, composition: directed)
+    let subject = try #require(subjects.subjects.first { $0.actionIDs == [0] })
+    let blame = try #require(subject.overviewBlame?.actions.first)
+
+    #expect(subject.requiresOverview)
+    #expect(blame.broadObservationIDs.isEmpty)
+    #expect(blame.broadResponseEvidence.map(\.id) == [0])
+    #expect(blame.causalBasis == "exclusive-action-response-slice")
+}
+
+@Test func synchronousDistributedComponentsReaggregateOnlyInsideOneActionSlice() throws {
+    let directed = try composition("""
+    [{"action":"click","time":2.0,"coordinates":{"xNorm":0.50,"yNorm":0.50}}]
+    """, duration: 6)
+    let evidence = [
+        EpisodeVisualEvidence(
+            actionID: 0, startTime: 1.96, endTime: 2.28,
+            normalizedBounds: CGRect(x: 0.02, y: 0.05, width: 0.42, height: 0.88),
+            changedFraction: 0.12, confidence: 0.9
+        ),
+        EpisodeVisualEvidence(
+            actionID: 0, startTime: 1.96, endTime: 2.28,
+            normalizedBounds: CGRect(x: 0.56, y: 0.08, width: 0.42, height: 0.84),
+            changedFraction: 0.13, confidence: 0.9
+        )
+    ]
+    let graph = ProductionPlanGraph.make(
+        from: directed, contentRect: rect, sourceDuration: 6,
+        observations: [], episodeVisualEvidence: evidence, motionRanges: [1.96...2.28]
+    )
+    let subjects = SubjectGraph.make(graph: graph, composition: directed)
+    let subject = try #require(subjects.subjects.first { $0.actionIDs == [0] })
+    let blame = try #require(subject.overviewBlame?.actions.first)
+
+    #expect(subject.requiresOverview)
+    #expect(blame.broadResponseEvidence.map(\.id) == [0, 1])
+}
+
+@Test func sceneScaleResponseDoesNotReplaceCompactInteractionGeometry() throws {
+    let directed = try composition("""
+    [
+      {"action":"click","time":2.0,"coordinates":{"xNorm":0.48,"yNorm":0.42},"semanticTarget":{"bounds":{"xNorm":0.45,"yNorm":0.39,"widthNorm":0.08,"heightNorm":0.06}}},
+      {"action":"click","time":3.0,"coordinates":{"xNorm":0.52,"yNorm":0.54},"semanticTarget":{"bounds":{"xNorm":0.48,"yNorm":0.51,"widthNorm":0.10,"heightNorm":0.06}}}
+    ]
+    """, duration: 7)
+    let sceneResponse = VisualMotionObservation(
+        time: 3.45,
+        normalizedBounds: CGRect(x: 0.40, y: 0.03, width: 0.58, height: 0.94),
+        changedFraction: 0.24,
+        magnitude: 1,
+        kind: .transformation,
+        startTime: 3.08
+    )
+    let graph = ProductionPlanGraph.make(
+        from: directed, contentRect: rect, sourceDuration: 7,
+        observations: [sceneResponse], motionRanges: [3.08...3.45]
+    )
+    let subjects = SubjectGraph.make(graph: graph, composition: directed)
+    let surface = try #require(subjects.subjects.first { $0.actionIDs == [0, 1] })
+
+    #expect(surface.kind == .surface)
+    #expect(surface.observationIDs.isEmpty)
+    #expect(surface.bounds.width < rect.width * 0.25)
+    #expect(surface.bounds.height < rect.height * 0.25)
+}
+
+@Test func sparseDistributedExtentCannotBecomeASceneTransitionOrSubject() throws {
+    let sparse = VisualMotionObservation(
+        time: 4.10,
+        normalizedBounds: CGRect(x: 0, y: 0, width: 0.775, height: 1),
+        changedFraction: 0.010,
+        magnitude: 0.58,
+        kind: .transformation,
+        startTime: 3.10
+    )
+    let compact = VisualMotionObservation(
+        time: 3.80,
+        normalizedBounds: CGRect(x: 0.43, y: 0.54, width: 0.14, height: 0.26),
+        changedFraction: 0.045,
+        magnitude: 0.85,
+        kind: .appearance,
+        startTime: 3.20
+    )
+    let directed = try composition(
+        """
+        [
+          {"action":"click","time":3.0},
+          {"action":"click","time":6.0,"coordinates":{"xNorm":0.53,"yNorm":0.66}}
+        ]
+        """,
+        duration: 9,
+        motion: [sparse, compact]
+    )
+    let graph = ProductionPlanGraph.make(
+        from: directed, contentRect: rect, sourceDuration: 9,
+        observations: [sparse, compact], motionRanges: [3.10...4.10]
+    )
+    let subjects = SubjectGraph.make(graph: graph, composition: directed)
+    let surface = try #require(subjects.subjects.first { $0.actionIDs == [0, 1] })
+
+    #expect(subjects.transitions.isEmpty)
+    #expect(surface.requiresOverview == false)
+    #expect(surface.bounds.width < size.width * 0.35)
+    #expect(surface.bounds.height < size.height * 0.40)
+}
+
+@Test func sustainedActionAlignedSceneResponseCreatesAnOrientationBoundary() throws {
+    let directed = try composition("""
+    [
+      {"action":"click","time":2.0,"coordinates":{"xNorm":0.48,"yNorm":0.42}},
+      {"action":"click","time":3.0,"coordinates":{"xNorm":0.52,"yNorm":0.54}}
+    ]
+    """, duration: 7)
+    let sceneResponse = VisualMotionObservation(
+        time: 3.70,
+        normalizedBounds: CGRect(x: 0.40, y: 0.03, width: 0.58, height: 0.94),
+        changedFraction: 0.24,
+        magnitude: 1,
+        kind: .transformation,
+        startTime: 3.05
+    )
+    let graph = ProductionPlanGraph.make(
+        from: directed, contentRect: rect, sourceDuration: 7,
+        observations: [sceneResponse], motionRanges: [3.05...3.70]
+    )
+    let subjects = SubjectGraph.make(graph: graph, composition: directed)
+    let transition = try #require(subjects.transitions.first)
+
+    #expect(transition.causalActionID == 1)
+    #expect(abs(transition.sourceTime - 3.05) < 0.001)
+    #expect(transition.responseSubjectID == nil)
+
+    var policy = ShotSchedulePlanner.Policy.default
+    policy.moveCost = 0
+    policy.scaleCost = 0
+    policy.translationCost = 0
+    let schedule = ShotSchedulePlanner.plan(
+        subjects: subjects, composition: directed,
+        base: CameraState(x: size.width / 2, y: size.height / 2, logScale: 0),
+        policy: policy
+    )
+    let orient = try #require(schedule.moves.first {
+        $0.label == "experimental-orient-0"
+    })
+    #expect(orient.end <= directed.outputTime(atSourceTime: 3.05) + 0.001)
+    #expect(abs(orient.to.logScale) < 0.001)
+}
+
+@Test func singleFrameWideResponseCannotVetoReadableFactualFraming() throws {
+    let directed = try composition("""
+    [
+      {"action":"drag","time":3.0,"coordinates":{"from":{"xNorm":0.40,"yNorm":0.50},"to":{"xNorm":0.62,"yNorm":0.50}}},
+      {"action":"drag","time":3.8,"coordinates":{"from":{"xNorm":0.62,"yNorm":0.50},"to":{"xNorm":0.55,"yNorm":0.50}}}
+    ]
+    """, duration: 7)
+    let oneFrame = VisualMotionObservation(
+        time: 3.20,
+        normalizedBounds: CGRect(x: 0, y: 0, width: 0.78, height: 0.96),
+        changedFraction: 0.01,
+        magnitude: 0.44,
+        kind: .appearance,
+        startTime: 3.20
+    )
+    let graph = ProductionPlanGraph.make(
+        from: directed, contentRect: rect, sourceDuration: 7,
+        observations: [oneFrame], motionRanges: [3.20...3.20]
+    )
+    let subjects = SubjectGraph.make(graph: graph, composition: directed)
+    let surface = try #require(subjects.subjects.first { $0.actionIDs == [0, 1] })
+
+    #expect(surface.requiresOverview == false)
+    #expect(subjects.transitions.isEmpty)
+}
+
+@Test func inferredSurfaceReleasesBeforeTheNextFactualPointerDeparture() throws {
+    let directed = try composition("""
+    [
+      {"action":"click","time":2.0,"coordinates":{"xNorm":0.50,"yNorm":0.55}},
+      {"action":"click","time":10.0,"coordinates":{"xNorm":0.58,"yNorm":0.66}},
+      {"action":"click","time":12.0,"coordinates":{"xNorm":0.06,"yNorm":0.50}}
+    ]
+    """, duration: 15)
+    let reveal = VisualMotionObservation(
+        time: 10.45,
+        normalizedBounds: CGRect(x: 0.32, y: 0.28, width: 0.38, height: 0.48),
+        changedFraction: 0.14,
+        magnitude: 0.95,
+        kind: .appearance,
+        startTime: 10.08
+    )
+    let graph = ProductionPlanGraph.make(
+        from: directed, contentRect: rect, sourceDuration: 15,
+        observations: [reveal], motionRanges: [10.08...10.45]
+    )
+    let subjects = SubjectGraph.make(graph: graph, composition: directed)
+    let surface = try #require(subjects.subjects.first { $0.actionIDs == [0, 1] })
+    let departure = try #require(directed.pointerTrip(forActionID: 2)).start
+    #expect(surface.sourceRange.upperBound <= departure + 0.001)
+}
+
+@Test func interactionObjectsPreferARepeatedStableContainerOverItsStationaryTrigger() throws {
+    let directed = try composition(
+        """
+        [
+          {
+            "action":"click","time":3.0,"coordinates":{"xNorm":0.72,"yNorm":0.52},
+            "semanticTarget":{
+              "bounds":{"xNorm":0.70,"yNorm":0.50,"widthNorm":0.04,"heightNorm":0.04},
+              "interactionContainer":{
+                "source":"macos-accessibility-stable-container","confidence":0.9,
+                "bounds":{"xNorm":0.35,"yNorm":0.25,"widthNorm":0.42,"heightNorm":0.50},
+                "verifiedThroughOffsetMs":5000
+              }
+            }
+          },
+          {
+            "action":"click","time":4.2,"coordinates":{"xNorm":0.72,"yNorm":0.52},
+            "semanticTarget":{
+              "bounds":{"xNorm":0.70,"yNorm":0.50,"widthNorm":0.04,"heightNorm":0.04},
+              "interactionContainer":{
+                "source":"macos-accessibility-stable-container","confidence":0.9,
+                "bounds":{"xNorm":0.35,"yNorm":0.25,"widthNorm":0.42,"heightNorm":0.50},
+                "verifiedThroughOffsetMs":5000
+              }
+            }
+          }
+        ]
+        """,
+        duration: 8
+    )
+    let graph = ProductionPlanGraph.make(
+        from: directed, contentRect: rect, sourceDuration: 8,
+        observations: [], motionRanges: []
+    )
+    let objects = InteractionObjectGraph.make(graph: graph, composition: directed)
+    let episode = try #require(objects.episodes.first { $0.actionIDs == [0, 1] })
+    let selectedID = try #require(episode.selectedResponseCandidateID)
+    let selected = try #require(objects.candidates.first { $0.id == selectedID })
+
+    #expect(selected.source == .semanticContainer)
+    #expect(selected.bounds.width > 400)
+    #expect(selected.bounds.height > 390)
+}
+
+@Test func interactionObjectsRetainALocalizedVisualBirthDespitePageWideNoise() throws {
+    let directed = try composition(
+        """
+        [{"action":"click","time":3.0,"coordinates":{"xNorm":0.52,"yNorm":0.55},"semanticTarget":{"bounds":{"xNorm":0.48,"yNorm":0.52,"widthNorm":0.08,"heightNorm":0.06}}}]
+        """,
+        duration: 8
+    )
+    let localized = CGRect(x: 0.20, y: 0.78, width: 0.32, height: 0.12)
+    let observations = [
+        VisualMotionObservation(
+            time: 4.0, normalizedBounds: CGRect(x: 0.02, y: 0.02, width: 0.96, height: 0.96),
+            changedFraction: 0.12, magnitude: 0.9, kind: .transformation, startTime: 3.1
+        ),
+        VisualMotionObservation(
+            time: 4.1, normalizedBounds: localized,
+            changedFraction: 0.03, magnitude: 0.9, kind: .focus,
+            focusTransition: .gained, startTime: 4.1
+        ),
+        VisualMotionObservation(
+            time: 6.0, normalizedBounds: localized,
+            changedFraction: 0.03, magnitude: 0.9, kind: .focus,
+            focusTransition: .released, startTime: 6.0
+        )
+    ]
+    let graph = ProductionPlanGraph.make(
+        from: directed, contentRect: rect, sourceDuration: 8,
+        observations: observations, motionRanges: [3.1...6]
+    )
+    let objects = InteractionObjectGraph.make(graph: graph, composition: directed)
+    let episode = try #require(objects.episodes.first)
+    let selectedID = try #require(episode.selectedResponseCandidateID)
+    let selected = try #require(objects.candidates.first { $0.id == selectedID })
+
+    #expect(selected.source == .visualLifecycle)
+    #expect(selected.bounds.width < 400)
+    #expect(!objects.candidates.contains {
+        $0.source == .visualResidual && $0.bounds.width > 800 && $0.bounds.height > 600
+    })
+}
+
+@Test func interactionObjectsPreferACoherentMultiFrameResponseOverAWrongLifecycle() throws {
+    let directed = try composition(
+        """
+        [{
+          "action":"click","time":3.0,"coordinates":{"xNorm":0.78,"yNorm":0.72},
+          "semanticTarget":{
+            "bounds":{"xNorm":0.75,"yNorm":0.69,"widthNorm":0.06,"heightNorm":0.06},
+            "interactionContainer":{
+              "source":"macos-accessibility-stable-container","confidence":0.9,
+              "bounds":{"xNorm":0.18,"yNorm":0.28,"widthNorm":0.64,"heightNorm":0.58},
+              "verifiedThroughOffsetMs":5000
+            }
+          }
+        }]
+        """,
+        duration: 8
+    )
+    // This plausible lifecycle is deliberately in the wrong part of the page.
+    // It models a detector joining unrelated lower-page motion after a click.
+    let wrongLifecycle = CGRect(x: 0.18, y: 0.10, width: 0.38, height: 0.24)
+    let observations = [
+        VisualMotionObservation(
+            time: 3.35, normalizedBounds: wrongLifecycle,
+            changedFraction: 0.05, magnitude: 0.9, kind: .focus,
+            focusTransition: .gained, startTime: 3.35
+        ),
+        VisualMotionObservation(
+            time: 6.0, normalizedBounds: wrongLifecycle,
+            changedFraction: 0.05, magnitude: 0.9, kind: .focus,
+            focusTransition: .released, startTime: 6.0
+        )
+    ]
+    let graph = ProductionPlanGraph.make(
+        from: directed, contentRect: rect, sourceDuration: 8,
+        observations: observations, motionRanges: [3.2...6.0]
+    )
+    let response = CGRect(x: 0.36, y: 0.82, width: 0.26, height: 0.07)
+    let evidence = [
+        EpisodeVisualEvidence(
+            actionID: 0, startTime: 3.20, endTime: 3.40,
+            normalizedBounds: response, changedFraction: 0.018, confidence: 0.8
+        ),
+        EpisodeVisualEvidence(
+            actionID: 0, startTime: 3.40, endTime: 3.62,
+            normalizedBounds: response.offsetBy(dx: 0.006, dy: 0),
+            changedFraction: 0.017, confidence: 0.82
+        ),
+        EpisodeVisualEvidence(
+            actionID: 0, startTime: 3.62, endTime: 3.86,
+            normalizedBounds: response.offsetBy(dx: -0.004, dy: 0),
+            changedFraction: 0.015, confidence: 0.78
+        )
+    ]
+    let objects = InteractionObjectGraph.make(
+        graph: graph,
+        composition: directed,
+        episodeVisualEvidence: evidence
+    )
+    let episode = try #require(objects.episodes.first)
+    let selectedID = try #require(episode.selectedResponseCandidateID)
+    let selected = try #require(objects.candidates.first { $0.id == selectedID })
+
+    #expect(selected.source == .visualResidual)
+    #expect(selected.bounds.midY < size.height * 0.25)
+    #expect(selected.bounds.width < size.width * 0.35)
+}
+
+@Test func interactionObjectsRetainAVisualOnlyEpisodeWithoutInventingAnAction() throws {
+    let directed = try composition("[]", duration: 8)
+    let graph = ProductionPlanGraph.make(
+        from: directed, contentRect: rect, sourceDuration: 8,
+        observations: [], motionRanges: [3.0...4.0]
+    )
+    let object = CGRect(x: 0.32, y: 0.70, width: 0.30, height: 0.16)
+    let evidence = [
+        EpisodeVisualEvidence(
+            actionID: -1, startTime: 3.0, endTime: 3.28,
+            normalizedBounds: object, changedFraction: 0.025, confidence: 0.8
+        ),
+        EpisodeVisualEvidence(
+            actionID: -1, startTime: 3.18, endTime: 3.46,
+            normalizedBounds: object.offsetBy(dx: 0.004, dy: 0),
+            changedFraction: 0.024, confidence: 0.84
+        ),
+        EpisodeVisualEvidence(
+            actionID: -1, startTime: 3.36, endTime: 3.64,
+            normalizedBounds: object.offsetBy(dx: -0.003, dy: 0),
+            changedFraction: 0.020, confidence: 0.78
+        )
+    ]
+    let objects = InteractionObjectGraph.make(
+        graph: graph,
+        composition: directed,
+        episodeVisualEvidence: evidence
+    )
+    let episode = try #require(objects.episodes.first)
+    let selectedID = try #require(episode.selectedResponseCandidateID)
+    let selected = try #require(objects.candidates.first { $0.id == selectedID })
+
+    #expect(episode.actionIDs.isEmpty)
+    #expect(episode.triggerCandidateID == nil)
+    #expect(selected.actionIDs.isEmpty)
+    #expect(selected.source == .visualResidual)
+    #expect(selected.bounds.width > 290)
+}
+
+@Test func visualOnlyEvidenceCannotRetroactivelyHijackAnOrderedActionEpisode() throws {
+    let directed = try composition(
+        """
+        [{
+          "action":"click","time":3.0,"coordinates":{"xNorm":0.72,"yNorm":0.52},
+          "semanticTarget":{
+            "bounds":{"xNorm":0.69,"yNorm":0.49,"widthNorm":0.06,"heightNorm":0.06},
+            "interactionContainer":{
+              "source":"macos-accessibility-stable-container","confidence":0.9,
+              "bounds":{"xNorm":0.34,"yNorm":0.25,"widthNorm":0.44,"heightNorm":0.50},
+              "verifiedThroughOffsetMs":5000
+            }
+          }
+        },{
+          "action":"click","time":4.0,"coordinates":{"xNorm":0.72,"yNorm":0.52},
+          "semanticTarget":{
+            "bounds":{"xNorm":0.69,"yNorm":0.49,"widthNorm":0.06,"heightNorm":0.06},
+            "interactionContainer":{
+              "source":"macos-accessibility-stable-container","confidence":0.9,
+              "bounds":{"xNorm":0.34,"yNorm":0.25,"widthNorm":0.44,"heightNorm":0.50},
+              "verifiedThroughOffsetMs":5000
+            }
+          }
+        }]
+        """,
+        duration: 8
+    )
+    let graph = ProductionPlanGraph.make(
+        from: directed, contentRect: rect, sourceDuration: 8,
+        observations: [], motionRanges: [3.0...4.0]
+    )
+    let remote = CGRect(x: 0.02, y: 0.18, width: 0.18, height: 0.45)
+    let evidence = (0..<5).map { index in
+        EpisodeVisualEvidence(
+            actionID: -1,
+            startTime: 3.1 + Double(index) * 0.18,
+            endTime: 3.38 + Double(index) * 0.18,
+            normalizedBounds: remote,
+            changedFraction: 0.04,
+            confidence: 0.9
+        )
+    }
+    let objects = InteractionObjectGraph.make(
+        graph: graph,
+        composition: directed,
+        episodeVisualEvidence: evidence
+    )
+    let actionEpisode = try #require(objects.episodes.first { $0.actionIDs == [0, 1] })
+    let actionSelectedID = try #require(actionEpisode.selectedResponseCandidateID)
+    let actionSelected = try #require(objects.candidates.first { $0.id == actionSelectedID })
+    let visualEpisode = try #require(objects.episodes.first { $0.actionIDs.isEmpty })
+
+    #expect(actionSelected.source == .semanticContainer)
+    #expect(visualEpisode.selectedResponseCandidateID != actionSelectedID)
+}
+
+@Test func objectDiagnosticCannotDisplayACandidateBeforeItsOwnEvidenceRange() {
+    let early = InteractionObjectGraph.Candidate(
+        id: 0,
+        source: .semanticContainer,
+        bounds: CGRect(x: 100, y: 100, width: 300, height: 240),
+        sourceRange: 3.0...6.0,
+        actionIDs: [0],
+        observationIDs: [],
+        confidence: 0.9,
+        causalScore: 2
+    )
+    let late = InteractionObjectGraph.Candidate(
+        id: 1,
+        source: .visualResidual,
+        bounds: CGRect(x: 500, y: 100, width: 240, height: 100),
+        sourceRange: 5.0...5.6,
+        actionIDs: [0],
+        observationIDs: [],
+        confidence: 0.9,
+        causalScore: 3
+    )
+    let episode = InteractionObjectGraph.Episode(
+        id: 0,
+        actionIDs: [0],
+        sourceRange: 3.0...6.0,
+        triggerCandidateID: nil,
+        candidateIDs: [0, 1],
+        selectedResponseCandidateID: 1
+    )
+    let objects = InteractionObjectGraph(candidates: [early, late], episodes: [episode])
+
+    #expect(objects.activeCandidates(at: 4.0).map(\.id) == [0])
+    #expect(objects.selectedCandidateIDs(at: 4.0).isEmpty)
+    #expect(objects.activeCandidates(at: 5.2).map(\.id) == [0, 1])
+    #expect(objects.selectedCandidateIDs(at: 5.2) == [1])
+}
+
+@Test func objectBirthAuditBlamesAVisualCandidateWithoutLocalBirthMotion() {
+    let unsupported = InteractionObjectGraph.Candidate(
+        id: 0,
+        source: .visualResidual,
+        bounds: CGRect(x: 400, y: 120, width: 260, height: 90),
+        sourceRange: 4.0...4.6,
+        actionIDs: [],
+        observationIDs: [],
+        confidence: 0.8,
+        causalScore: 2
+    )
+    let objects = InteractionObjectGraph(
+        candidates: [unsupported],
+        episodes: [InteractionObjectGraph.Episode(
+            id: 0,
+            actionIDs: [],
+            sourceRange: 4.0...4.6,
+            triggerCandidateID: nil,
+            candidateIDs: [0],
+            selectedResponseCandidateID: 0
+        )]
+    )
+    let unrelated = EpisodeVisualEvidence(
+        actionID: -1,
+        startTime: 4.0,
+        endTime: 4.3,
+        normalizedBounds: CGRect(x: 0.02, y: 0.02, width: 0.08, height: 0.08),
+        changedFraction: 0.01,
+        confidence: 0.9
+    )
+    let audit = ObjectBirthAudit.make(
+        objects: objects,
+        evidence: [unrelated],
+        contentRect: rect
+    )
+
+    #expect(audit.entries.first?.status == .unsupported)
+    #expect(audit.unsupportedVisualBirths.map(\.candidateID) == [0])
+}
+
+@Test func remoteActionAfterEstablishedRunStartsANewSubject() throws {
+    let directed = try composition(
+        """
+        [
+          {"action":"click","time":3.0,"coordinates":{"xNorm":0.46,"yNorm":0.53},"semanticTarget":{"bounds":{"xNorm":0.44,"yNorm":0.51,"widthNorm":0.04,"heightNorm":0.04}}},
+          {"action":"click","time":4.0,"coordinates":{"xNorm":0.60,"yNorm":0.57},"semanticTarget":{"bounds":{"xNorm":0.58,"yNorm":0.55,"widthNorm":0.04,"heightNorm":0.04}}},
+          {"action":"click","time":5.0,"coordinates":{"xNorm":0.60,"yNorm":0.68},"semanticTarget":{"bounds":{"xNorm":0.58,"yNorm":0.66,"widthNorm":0.04,"heightNorm":0.04}}},
+          {"action":"click","time":6.0,"coordinates":{"xNorm":0.04,"yNorm":0.44},"semanticTarget":{"bounds":{"xNorm":0.02,"yNorm":0.42,"widthNorm":0.04,"heightNorm":0.04}}}
+        ]
+        """,
+        duration: 9
+    )
+    let graph = ProductionPlanGraph.make(
+        from: directed,
+        contentRect: rect,
+        sourceDuration: 9,
+        observations: [],
+        motionRanges: []
+    )
+    let subjects = SubjectGraph.make(graph: graph, composition: directed)
+
+    #expect(subjects.subjects.contains { $0.actionIDs == [0, 1, 2] })
+    #expect(subjects.subjects.contains { $0.actionIDs == [3] })
+    #expect(!subjects.subjects.contains { $0.actionIDs == [0, 1, 2, 3] })
+}
+
+@Test func laterFactualInteractionGroundsAnEarlierUnresolvedEpisodeWithoutSemanticRules() throws {
+    let directed = try composition(
+        """
+        [
+          {"action":"click","time":2.0},
+          {"action":"type_text","time":2.4},
+          {
+            "action":"click","time":11.5,
+            "coordinates":{"xNorm":0.52,"yNorm":0.56},
+            "semanticTarget":{"bounds":{"xNorm":0.50,"yNorm":0.54,"widthNorm":0.06,"heightNorm":0.05}}
+          }
+        ]
+        """,
+        duration: 15
+    )
+    let localRegion = CGRect(x: 0.44, y: 0.50, width: 0.16, height: 0.12)
+    let observations = [
+        // Scene-wide change is retained as context, but cannot supply the
+        // compact subject geometry.
+        VisualMotionObservation(
+            time: 2.05,
+            normalizedBounds: CGRect(x: 0.02, y: 0.03, width: 0.96, height: 0.92),
+            changedFraction: 0.04,
+            magnitude: 0.8,
+            kind: .transformation,
+            startTime: 2.05
+        ),
+        VisualMotionObservation(
+            time: 2.30,
+            normalizedBounds: localRegion,
+            changedFraction: 0.018,
+            magnitude: 0.8,
+            kind: .appearance,
+            startTime: 2.06
+        ),
+        VisualMotionObservation(
+            time: 2.68,
+            normalizedBounds: localRegion.offsetBy(dx: 0.004, dy: 0),
+            changedFraction: 0.014,
+            magnitude: 0.72,
+            kind: .transformation,
+            startTime: 2.43
+        )
+    ]
+    let graph = ProductionPlanGraph.make(
+        from: directed,
+        contentRect: rect,
+        sourceDuration: 15,
+        observations: observations,
+        motionRanges: [2.05...2.68]
+    )
+    let subjects = SubjectGraph.make(graph: graph, composition: directed)
+    let interaction = try #require(subjects.subjects.first { $0.actionIDs == [0, 1, 2] })
+
+    #expect(interaction.bounds.width < size.width * 0.30)
+    #expect(interaction.bounds.height < size.height * 0.30)
+    #expect(interaction.observationIDs.contains(1))
+    #expect(interaction.observationIDs.contains(2))
+    #expect(interaction.requiresOverview == false)
+
+    let schedule = ShotSchedulePlanner.plan(
+        subjects: subjects,
+        composition: directed,
+        base: CameraState(x: size.width / 2, y: size.height / 2, logScale: 0)
+    )
+    let shot = try #require(schedule.shots.first { $0.subjectID == interaction.id })
+    #expect(shot.intent == .frame)
+    #expect(exp(shot.pose.logScale) >= ShotSchedulePlanner.Policy.default.minimumReadableScale)
+}
+
+@Test func unanchoredActionResponseSurvivesOnlyAsAFramingHypothesis() throws {
+    let directed = try composition(
+        """
+        [{"action":"click","time":2.0}]
+        """,
+        duration: 7
+    )
+    let response = VisualMotionObservation(
+        time: 2.35,
+        normalizedBounds: CGRect(x: 0.41, y: 0.43, width: 0.18, height: 0.14),
+        changedFraction: 0.025,
+        magnitude: 0.82,
+        kind: .appearance,
+        startTime: 2.06
+    )
+    let graph = ProductionPlanGraph.make(
+        from: directed,
+        contentRect: rect,
+        sourceDuration: 7,
+        observations: [response],
+        motionRanges: [2.06...2.35]
+    )
+    let subjects = SubjectGraph.make(graph: graph, composition: directed)
+    let subject = try #require(subjects.subjects.first { $0.actionIDs == [0] })
+
+    #expect(subject.observationIDs == [0])
+    #expect(!subject.isForegroundSupport)
+    #expect(subject.framingHypotheses.contains { $0.observationIDs == [0] })
+    #expect(subject.sourceRange.upperBound < 3)
+}
+
+@Test func motionAlreadyUnderwayCannotBecomeAnActionsResponseHypothesis() throws {
+    let directed = try composition(
+        """
+        [{"action":"click","time":2.0}]
+        """,
+        duration: 6
+    )
+    let priorMotion = VisualMotionObservation(
+        time: 2.2,
+        normalizedBounds: CGRect(x: 0.41, y: 0.43, width: 0.18, height: 0.14),
+        changedFraction: 0.025,
+        magnitude: 0.82,
+        kind: .appearance,
+        startTime: 1.4
+    )
+    let graph = ProductionPlanGraph.make(
+        from: directed,
+        contentRect: rect,
+        sourceDuration: 6,
+        observations: [priorMotion],
+        motionRanges: [1.4...2.2]
+    )
+    let subjects = SubjectGraph.make(graph: graph, composition: directed)
+
+    #expect(!subjects.subjects.contains {
+        $0.actionIDs == [0] && $0.observationIDs.contains(0)
+    })
+}
+
+@Test func disconnectedActionResponsesRemainCompetingFramingHypotheses() throws {
+    let directed = try composition(
+        """
+        [{"action":"click","time":2.0,"coordinates":{"xNorm":0.39,"yNorm":0.52},"semanticTarget":{"bounds":{"xNorm":0.36,"yNorm":0.49,"widthNorm":0.06,"heightNorm":0.06}}}]
+        """,
+        duration: 8
+    )
+    let observations = [
+        VisualMotionObservation(
+            time: 2.35,
+            normalizedBounds: CGRect(x: 0.33, y: 0.44, width: 0.14, height: 0.16),
+            changedFraction: 0.02,
+            magnitude: 0.8,
+            kind: .appearance,
+            startTime: 2.06
+        ),
+        VisualMotionObservation(
+            time: 2.40,
+            normalizedBounds: CGRect(x: 0.65, y: 0.44, width: 0.14, height: 0.16),
+            changedFraction: 0.02,
+            magnitude: 0.8,
+            kind: .appearance,
+            startTime: 2.08
+        )
+    ]
+    let graph = ProductionPlanGraph.make(
+        from: directed,
+        contentRect: rect,
+        sourceDuration: 8,
+        observations: observations,
+        motionRanges: [2.06...2.40]
+    )
+    let subjects = SubjectGraph.make(graph: graph, composition: directed)
+    let subject = try #require(subjects.subjects.first { $0.actionIDs == [0] })
+
+    #expect(subject.observationIDs == [0, 1])
+    #expect(subject.framingHypotheses.count >= 3)
+    #expect(subject.framingHypotheses.contains { $0.evidenceCoverage < 1 })
+    #expect(subject.framingHypotheses.contains { $0.evidenceCoverage == 1 })
+}
+
+@Test func globalSubjectInferenceKeepsEquivalentForwardGroundedEpisodesIndependentOfPriorActivity() throws {
+    let directed = try composition(
+        """
+        [
+          {"action":"click","time":2.0},
+          {"action":"type_text","time":2.4},
+          {
+            "action":"click","time":11.5,
+            "coordinates":{"xNorm":0.35,"yNorm":0.36},
+            "semanticTarget":{"bounds":{"xNorm":0.32,"yNorm":0.33,"widthNorm":0.06,"heightNorm":0.05}}
+          },
+          {
+            "action":"scroll","time":20.0,
+            "coordinates":{"xNorm":0.67,"yNorm":0.62}
+          },
+          {"action":"click","time":22.0},
+          {"action":"type_text","time":22.4},
+          {
+            "action":"click","time":31.5,
+            "coordinates":{"xNorm":0.70,"yNorm":0.66},
+            "semanticTarget":{"bounds":{"xNorm":0.67,"yNorm":0.63,"widthNorm":0.06,"heightNorm":0.05}}
+          }
+        ]
+        """,
+        duration: 35
+    )
+    let firstRegion = CGRect(x: 0.27, y: 0.29, width: 0.16, height: 0.12)
+    let secondRegion = CGRect(x: 0.62, y: 0.59, width: 0.16, height: 0.12)
+    let observations = [
+        VisualMotionObservation(
+            time: 2.30,
+            normalizedBounds: firstRegion,
+            changedFraction: 0.018,
+            magnitude: 0.8,
+            kind: .appearance,
+            startTime: 2.06
+        ),
+        VisualMotionObservation(
+            time: 2.68,
+            normalizedBounds: firstRegion.offsetBy(dx: 0.004, dy: 0),
+            changedFraction: 0.014,
+            magnitude: 0.72,
+            kind: .transformation,
+            startTime: 2.43
+        ),
+        // The translated interaction deliberately has no typing-aligned
+        // visual observation. A previous factual action may be spatially
+        // nearby, but the completed future anchor still supplies the same
+        // action-independent evidence as the first episode.
+        VisualMotionObservation(
+            time: 22.30,
+            normalizedBounds: secondRegion,
+            changedFraction: 0.018,
+            magnitude: 0.8,
+            kind: .appearance,
+            startTime: 22.06
+        )
+    ]
+    let graph = ProductionPlanGraph.make(
+        from: directed,
+        contentRect: rect,
+        sourceDuration: 35,
+        observations: observations,
+        motionRanges: [2.06...2.68, 22.06...22.30]
+    )
+    let subjects = SubjectGraph.make(graph: graph, composition: directed)
+    let first = try #require(subjects.subjects.first { $0.actionIDs == [0, 1, 2] })
+    let second = try #require(subjects.subjects.first { $0.actionIDs == [4, 5, 6] })
+
+    #expect(first.bounds.width < size.width * 0.30)
+    #expect(first.bounds.height < size.height * 0.30)
+    #expect(second.bounds.width < size.width * 0.30)
+    #expect(second.bounds.height < size.height * 0.30)
+    #expect(!subjects.subjects.contains { $0.actionIDs.contains(3) && $0.actionIDs.contains(4) })
+
+    let schedule = ShotSchedulePlanner.plan(
+        subjects: subjects,
+        composition: directed,
+        base: CameraState(x: size.width / 2, y: size.height / 2, logScale: 0)
+    )
+    let firstShot = try #require(schedule.shots.first { $0.subjectID == first.id })
+    let secondShot = try #require(schedule.shots.first { $0.subjectID == second.id })
+    #expect(firstShot.intent == .frame)
+    #expect(secondShot.intent == .frame)
+    #expect(abs(firstShot.pose.logScale - secondShot.pose.logScale) < 0.20)
+}
+
+@Test func subjectPartitionIsTranslationInvariantForForwardGroundedInteraction() throws {
+    func subject(offsetX: Double, offsetY: Double) throws -> SubjectGraph.Subject {
+        let targetX = 0.42 + offsetX
+        let targetY = 0.48 + offsetY
+        let directed = try composition(
+            """
+            [
+              {"action":"click","time":2.0},
+              {"action":"type_text","time":2.4},
+              {
+                "action":"click","time":11.5,
+                "coordinates":{"xNorm":\(targetX + 0.03),"yNorm":\(targetY + 0.03)},
+                "semanticTarget":{"bounds":{"xNorm":\(targetX),"yNorm":\(targetY),"widthNorm":0.06,"heightNorm":0.05}}
+              }
+            ]
+            """,
+            duration: 15
+        )
+        let local = VisualMotionObservation(
+            time: 2.30,
+            normalizedBounds: CGRect(
+                x: targetX - 0.05,
+                y: targetY - 0.04,
+                width: 0.16,
+                height: 0.12
+            ),
+            changedFraction: 0.018,
+            magnitude: 0.8,
+            kind: .appearance,
+            startTime: 2.06
+        )
+        let graph = ProductionPlanGraph.make(
+            from: directed,
+            contentRect: rect,
+            sourceDuration: 15,
+            observations: [local],
+            motionRanges: [2.06...2.30]
+        )
+        let subjects = SubjectGraph.make(graph: graph, composition: directed)
+        return try #require(subjects.subjects.first { $0.actionIDs == [0, 1, 2] })
+    }
+
+    let upperLeft = try subject(offsetX: -0.18, offsetY: -0.16)
+    let lowerRight = try subject(offsetX: 0.18, offsetY: 0.16)
+
+    #expect(abs(upperLeft.bounds.width - lowerRight.bounds.width) < 0.001)
+    #expect(abs(upperLeft.bounds.height - lowerRight.bounds.height) < 0.001)
+    #expect(abs((lowerRight.bounds.midX - upperLeft.bounds.midX) - rect.width * 0.36) < 0.001)
+    #expect(abs((upperLeft.bounds.midY - lowerRight.bounds.midY) - rect.height * 0.32) < 0.001)
+}
+
+@Test func forwardGroundedSubjectCannotAnticipateAnOrderedViewportScroll() throws {
+    let directed = try composition(
+        """
+        [
+          {
+            "action":"scroll","time":2.0,
+            "coordinates":{"xNorm":0.52,"yNorm":0.52}
+          },
+          {"action":"click","time":3.0},
+          {"action":"type_text","time":3.4},
+          {
+            "action":"click","time":8.0,
+            "coordinates":{"xNorm":0.56,"yNorm":0.58},
+            "semanticTarget":{"bounds":{"xNorm":0.53,"yNorm":0.55,"widthNorm":0.06,"heightNorm":0.05}}
+          }
+        ]
+        """,
+        duration: 11
+    )
+    let local = VisualMotionObservation(
+        time: 3.30,
+        normalizedBounds: CGRect(x: 0.48, y: 0.51, width: 0.16, height: 0.12),
+        changedFraction: 0.018,
+        magnitude: 0.8,
+        kind: .appearance,
+        startTime: 3.06
+    )
+    let graph = ProductionPlanGraph.make(
+        from: directed,
+        contentRect: rect,
+        sourceDuration: 11,
+        observations: [local],
+        motionRanges: [3.06...3.30]
+    )
+    let subjects = SubjectGraph.make(graph: graph, composition: directed)
+    let interaction = try #require(subjects.subjects.first { $0.actionIDs == [1, 2, 3] })
+
+    #expect(interaction.framingEligibleAt == directed.actions[1].time)
+
+    let schedule = ShotSchedulePlanner.plan(
+        subjects: subjects,
+        composition: directed,
+        base: CameraState(x: size.width / 2, y: size.height / 2, logScale: 0)
+    )
+    let move = try #require(schedule.moves.first {
+        $0.label == "experimental-shot-\(interaction.id)"
+    })
+    #expect(move.start >= directed.outputTime(atSourceTime: directed.actions[1].time))
+}
+
+@Test func forwardGroundingCannotSkipANearerRemoteFactualAction() throws {
+    let directed = try composition(
+        """
+        [
+          {"action":"click","time":2.0},
+          {
+            "action":"click","time":4.0,
+            "coordinates":{"xNorm":0.10,"yNorm":0.12},
+            "semanticTarget":{"bounds":{"xNorm":0.08,"yNorm":0.10,"widthNorm":0.05,"heightNorm":0.05}}
+          },
+          {
+            "action":"click","time":6.0,
+            "coordinates":{"xNorm":0.52,"yNorm":0.56},
+            "semanticTarget":{"bounds":{"xNorm":0.50,"yNorm":0.54,"widthNorm":0.06,"heightNorm":0.05}}
+          }
+        ]
+        """,
+        duration: 9
+    )
+    let local = VisualMotionObservation(
+        time: 2.3,
+        normalizedBounds: CGRect(x: 0.44, y: 0.50, width: 0.16, height: 0.12),
+        changedFraction: 0.018,
+        magnitude: 0.8,
+        kind: .appearance,
+        startTime: 2.05
+    )
+    let graph = ProductionPlanGraph.make(
+        from: directed,
+        contentRect: rect,
+        sourceDuration: 9,
+        observations: [local],
+        motionRanges: [2.05...2.3]
+    )
+    let subjects = SubjectGraph.make(graph: graph, composition: directed)
+
+    #expect(!subjects.subjects.contains {
+        $0.actionIDs.contains(0)
+            && $0.observationIDs.contains(0)
+            && $0.bounds.midX > size.width * 0.35
+    })
+    #expect(!subjects.subjects.contains { $0.actionIDs == [0, 1, 2] })
+}
+
+@Test func forwardGroundingAbstainsAcrossAnObservedSceneTransition() throws {
+    let directed = try composition(
+        """
+        [
+          {"action":"type_text","time":2.0},
+          {
+            "action":"click","time":6.0,
+            "coordinates":{"xNorm":0.52,"yNorm":0.56},
+            "semanticTarget":{"bounds":{"xNorm":0.50,"yNorm":0.54,"widthNorm":0.06,"heightNorm":0.05}}
+          }
+        ]
+        """,
+        duration: 9
+    )
+    let observations = [
+        VisualMotionObservation(
+            time: 2.3,
+            normalizedBounds: CGRect(x: 0.44, y: 0.50, width: 0.16, height: 0.12),
+            changedFraction: 0.018,
+            magnitude: 0.8,
+            kind: .transformation,
+            startTime: 2.05
+        ),
+        VisualMotionObservation(
+            time: 4.0,
+            normalizedBounds: CGRect(x: 0, y: 0, width: 1, height: 1),
+            changedFraction: 0.5,
+            magnitude: 1,
+            kind: .contextTransition,
+            startTime: 3.8
+        )
+    ]
+    let graph = ProductionPlanGraph.make(
+        from: directed,
+        contentRect: rect,
+        sourceDuration: 9,
+        observations: observations,
+        motionRanges: [2.05...4.0]
+    )
+    let subjects = SubjectGraph.make(graph: graph, composition: directed)
+
+    #expect(!subjects.subjects.contains {
+        $0.actionIDs.contains(0) && $0.observationIDs.contains(0)
+    })
+}
+
+@Test func remoteSecondActionCannotSeedACrossCanvasSubject() throws {
+    let directed = try composition(
+        """
+        [
+          {"action":"click","time":3.0,"coordinates":{"xNorm":0.04,"yNorm":0.44},"semanticTarget":{"bounds":{"xNorm":0.02,"yNorm":0.42,"widthNorm":0.04,"heightNorm":0.04}}},
+          {"action":"click","time":4.0,"coordinates":{"xNorm":0.60,"yNorm":0.57},"semanticTarget":{"bounds":{"xNorm":0.58,"yNorm":0.55,"widthNorm":0.04,"heightNorm":0.04}}},
+          {"action":"click","time":5.0,"coordinates":{"xNorm":0.60,"yNorm":0.68},"semanticTarget":{"bounds":{"xNorm":0.58,"yNorm":0.66,"widthNorm":0.04,"heightNorm":0.04}}}
+        ]
+        """,
+        duration: 8
+    )
+    let graph = ProductionPlanGraph.make(
+        from: directed,
+        contentRect: rect,
+        sourceDuration: 8,
+        observations: [],
+        motionRanges: []
+    )
+    let subjects = SubjectGraph.make(graph: graph, composition: directed)
+
+    #expect(subjects.subjects.contains { $0.actionIDs == [0] })
+    #expect(subjects.subjects.contains { $0.actionIDs == [1, 2] })
+    #expect(!subjects.subjects.contains { $0.actionIDs == [0, 1, 2] })
+}
+
+@Test func stableInteractionContainerFramesDirectDragSubjectWithoutMovingItsPath() throws {
+    let directed = try composition(
+        """
+        [
+          {
+            "action":"drag","time":3.0,
+            "coordinates":{"from":{"xNorm":0.45,"yNorm":0.51},"to":{"xNorm":0.58,"yNorm":0.51}},
+            "semanticTarget":{
+              "role":"AXSlider",
+              "bounds":{"xNorm":0.54,"yNorm":0.50,"widthNorm":0.01,"heightNorm":0.02},
+              "interactionContainer":{
+                "source":"macos-accessibility-stable-container","confidence":0.9,
+                "bounds":{"xNorm":0.27,"yNorm":0.36,"widthNorm":0.45,"heightNorm":0.30},
+                "verifiedThroughOffsetMs":5000
+              }
+            },
+            "targetResolution":{"provenance":"direct","confidence":0.99}
+          },
+          {
+            "action":"drag","time":5.5,
+            "coordinates":{"from":{"xNorm":0.58,"yNorm":0.51},"to":{"xNorm":0.49,"yNorm":0.51}},
+            "semanticTarget":{
+              "role":"AXSlider",
+              "bounds":{"xNorm":0.49,"yNorm":0.50,"widthNorm":0.01,"heightNorm":0.02},
+              "interactionContainer":{
+                "source":"macos-accessibility-stable-container","confidence":0.9,
+                "bounds":{"xNorm":0.27,"yNorm":0.36,"widthNorm":0.45,"heightNorm":0.30},
+                "verifiedThroughOffsetMs":3000
+              }
+            },
+            "targetResolution":{"provenance":"direct","confidence":0.99}
+          }
+        ]
+        """,
+        duration: 8
+    )
+    #expect(directed.actions[0].from == CGPoint(x: 450, y: 392))
+    #expect(directed.actions[0].to == CGPoint(x: 580, y: 392))
+    #expect(directed.actions[0].interactionContainerBounds?.width == 450)
+
+    let graph = ProductionPlanGraph.make(
+        from: directed,
+        contentRect: rect,
+        sourceDuration: 8,
+        observations: [],
+        motionRanges: []
+    )
+    let subjects = SubjectGraph.make(graph: graph, composition: directed)
+    let dragSubject = try #require(subjects.subjects.first { $0.actionIDs == [0, 1] })
+    #expect(dragSubject.bounds.width >= 450)
+    #expect(dragSubject.bounds.height >= 240)
+
+    let schedule = ShotSchedulePlanner.plan(
+        subjects: subjects,
+        composition: directed,
+        base: CameraState(x: size.width / 2, y: size.height / 2, logScale: 0)
+    )
+    let shot = try #require(schedule.shots.first { $0.subjectID == dragSubject.id })
+    #expect(shot.intent == .frame)
+}
+
+@Test func subjectGraphKeepsMeasuredReleaseActionInsideItsForegroundSurface() throws {
+    let directed = try composition(
+        """
+        [
+          {"action":"click","time":2.2,"coordinates":{"xNorm":0.5,"yNorm":0.5}},
+          {"action":"click","time":6.12,"coordinates":{"xNorm":0.52,"yNorm":0.56}},
+          {"action":"click","time":7.0,"coordinates":{"xNorm":0.08,"yNorm":0.7}}
+        ]
+        """,
+        duration: 10
+    )
+    let focus = CGRect(x: 0.35, y: 0.25, width: 0.3, height: 0.45)
+    let observations = [
+        VisualMotionObservation(
+            time: 2,
+            normalizedBounds: focus,
+            changedFraction: 0.1,
+            magnitude: 1,
+            kind: .focus,
+            focusTransition: .gained,
+            startTime: 2
+        ),
+        VisualMotionObservation(
+            time: 6,
+            normalizedBounds: focus,
+            changedFraction: 0.1,
+            magnitude: 1,
+            kind: .focus,
+            focusTransition: .released,
+            startTime: 6
+        )
+    ]
+    let graph = ProductionPlanGraph.make(
+        from: directed,
+        contentRect: rect,
+        sourceDuration: 10,
+        observations: observations,
+        motionRanges: [2...6],
+        evaluationCondition: .dOracleGated,
+        supportObservationIDs: [0, 1],
+        oracleSupportLifecycles: [OracleForegroundSupportLifecycle(
+            bounds: focus,
+            gainedAt: 2,
+            releasedAt: 6,
+            gainedObservationID: 0,
+            releasedObservationID: 1
+        )]
+    )
+    let subjects = SubjectGraph.make(graph: graph, composition: directed)
+    let foreground = try #require(subjects.subjects.first {
+        $0.kind == .surface && $0.observationIDs == [0, 1]
+    })
+
+    #expect(foreground.actionIDs == [0, 1])
+    #expect(!foreground.actionIDs.contains(2))
+}
+
+@Test func subjectGraphAssignsAnExternalTriggerToTheSurfaceItCausallyCreates() throws {
+    let phase = InteractionPhases(
+        rawEstimate: 3,
+        toolStart: 2.5,
+        toolEnd: 3.6,
+        pointerArrival: 2.9,
+        activation: 3,
+        responseOnset: 3.2,
+        source: "causal-response-onset"
+    )
+    let directed = try composition(
+        """
+        [{"action":"click","time":3,"coordinates":{"xNorm":0.8,"yNorm":0.8}}]
+        """,
+        duration: 8,
+        interactionPhases: [0: phase]
+    )
+    let support = CGRect(x: 0.1, y: 0.1, width: 0.25, height: 0.4)
+    let observations = [
+        VisualMotionObservation(
+            time: 3.2,
+            normalizedBounds: support,
+            changedFraction: 0.1,
+            magnitude: 1,
+            kind: .focus,
+            focusTransition: .gained,
+            startTime: 3.2
+        ),
+        VisualMotionObservation(
+            time: 6,
+            normalizedBounds: support,
+            changedFraction: 0.1,
+            magnitude: 1,
+            kind: .focus,
+            focusTransition: .released,
+            startTime: 6
+        )
+    ]
+    let graph = ProductionPlanGraph.make(
+        from: directed,
+        contentRect: rect,
+        sourceDuration: 8,
+        observations: observations,
+        motionRanges: [3.2...6],
+        evaluationCondition: .dOracleGated,
+        supportObservationIDs: [0, 1],
+        oracleSupportLifecycles: [OracleForegroundSupportLifecycle(
+            bounds: support,
+            gainedAt: 3.2,
+            releasedAt: 6,
+            gainedObservationID: 0,
+            releasedObservationID: 1
+        )]
+    )
+    let subjects = SubjectGraph.make(graph: graph, composition: directed)
+    let foreground = try #require(subjects.subjects.first {
+        $0.kind == .surface && $0.observationIDs == [0, 1]
+    })
+
+    #expect(foreground.actionIDs == [0])
+    #expect(foreground.isForegroundSupport)
+    #expect(foreground.verifiedReleaseTime == 6)
+    #expect(abs(foreground.bounds.midX - 225) < 0.001)
+    #expect(foreground.framingEligibleAt == 3.2)
+}
+
+@Test func subjectGraphPreservesSmallVerifiedSupportForGlobalScheduling() throws {
+    let directed = try composition(
+        """
+        [{"action":"click","time":2.0,"coordinates":{"xNorm":0.75,"yNorm":0.75}}]
+        """,
+        duration: 7
+    )
+    // This is deliberately below the old output-area cutoff. A verified fact
+    // must reach ShotSchedule, which owns the readability/travel decision.
+    let support = CGRect(x: 0.08, y: 0.82, width: 0.08, height: 0.05)
+    let observations = [
+        VisualMotionObservation(
+            time: 2.2, normalizedBounds: support, changedFraction: 0.01,
+            magnitude: 1, kind: .focus, focusTransition: .gained, startTime: 2.2
+        ),
+        VisualMotionObservation(
+            time: 4.4, normalizedBounds: support, changedFraction: 0.01,
+            magnitude: 1, kind: .focus, focusTransition: .released, startTime: 4.4
+        )
+    ]
+    let graph = ProductionPlanGraph.make(
+        from: directed, contentRect: rect, sourceDuration: 7,
+        observations: observations, motionRanges: [2.2...4.4],
+        evaluationCondition: .dOracleGated,
+        supportObservationIDs: [0, 1],
+        oracleSupportLifecycles: [.init(
+            bounds: support, gainedAt: 2.2, releasedAt: 4.4,
+            gainedObservationID: 0, releasedObservationID: 1
+        )]
+    )
+    let subjects = SubjectGraph.make(graph: graph, composition: directed)
+    let foreground = try #require(subjects.subjects.first { $0.isForegroundSupport })
+
+    #expect(foreground.actionIDs == [0])
+    #expect(foreground.framingEligibleAt == 2.2)
+}
+
+@Test func nestedVerifiedLifecyclesMayShareTheirFactualAction() throws {
+    let directed = try composition(
+        """
+        [
+          {"action":"click","time":2.0,"coordinates":{"xNorm":0.2,"yNorm":0.5}},
+          {"action":"click","time":4.0,"coordinates":{"xNorm":0.5,"yNorm":0.5}},
+          {"action":"click","time":6.0,"coordinates":{"xNorm":0.52,"yNorm":0.52}}
+        ]
+        """,
+        duration: 9
+    )
+    let parent = CGRect(x: 0.3, y: 0.25, width: 0.4, height: 0.5)
+    let child = CGRect(x: 0.44, y: 0.4, width: 0.2, height: 0.2)
+    let observations = [
+        VisualMotionObservation(
+            time: 2.2, normalizedBounds: parent, changedFraction: 0.1,
+            magnitude: 1, kind: .focus, focusTransition: .gained, startTime: 2.2
+        ),
+        VisualMotionObservation(
+            time: 7.0, normalizedBounds: parent, changedFraction: 0.1,
+            magnitude: 1, kind: .focus, focusTransition: .released, startTime: 7.0
+        ),
+        VisualMotionObservation(
+            time: 3.8, normalizedBounds: child, changedFraction: 0.05,
+            magnitude: 1, kind: .focus, focusTransition: .gained, startTime: 3.8
+        ),
+        VisualMotionObservation(
+            time: 5.5, normalizedBounds: child, changedFraction: 0.05,
+            magnitude: 1, kind: .focus, focusTransition: .released, startTime: 5.5
+        )
+    ]
+    let graph = ProductionPlanGraph.make(
+        from: directed, contentRect: rect, sourceDuration: 9,
+        observations: observations, motionRanges: [2.2...7.0],
+        evaluationCondition: .dOracleGated,
+        supportObservationIDs: [0, 1, 2, 3],
+        oracleSupportLifecycles: [
+            .init(
+                bounds: parent, gainedAt: 2.2, releasedAt: 7,
+                gainedObservationID: 0, releasedObservationID: 1
+            ),
+            .init(
+                bounds: child, gainedAt: 3.8, releasedAt: 5.5,
+                gainedObservationID: 2, releasedObservationID: 3
+            )
+        ]
+    )
+    let subjects = SubjectGraph.make(graph: graph, composition: directed)
+    let foreground = subjects.subjects.filter(\.isForegroundSupport)
+
+    #expect(foreground.count == 2)
+    #expect(foreground.allSatisfy { $0.actionIDs.contains(1) })
+}
+
+@Test func foregroundShotWaitsForTheFactualCursorToEnterAnOutsideTriggeredSurface() throws {
+    let directed = try composition(
+        """
+        [
+          {"action":"click","time":2.0,"coordinates":{"xNorm":0.85,"yNorm":0.2}},
+          {"action":"click","time":5.0,"coordinates":{"xNorm":0.5,"yNorm":0.5}},
+          {"action":"click","time":6.0,"coordinates":{"xNorm":0.52,"yNorm":0.52}},
+          {"action":"click","time":7.0,"coordinates":{"xNorm":0.54,"yNorm":0.54}}
+        ]
+        """,
+        duration: 9
+    )
+    let support = CGRect(x: 0.35, y: 0.25, width: 0.3, height: 0.5)
+    let observations = [
+        VisualMotionObservation(
+            time: 2, normalizedBounds: support, changedFraction: 0.1,
+            magnitude: 1, kind: .focus, focusTransition: .gained, startTime: 2
+        ),
+        VisualMotionObservation(
+            time: 8, normalizedBounds: support, changedFraction: 0.1,
+            magnitude: 1, kind: .focus, focusTransition: .released, startTime: 8
+        )
+    ]
+    let graph = ProductionPlanGraph.make(
+        from: directed, contentRect: rect, sourceDuration: 9,
+        observations: observations, motionRanges: [2...8],
+        evaluationCondition: .dOracleGated,
+        supportObservationIDs: [0, 1],
+        oracleSupportLifecycles: [.init(
+            bounds: support, gainedAt: 2, releasedAt: 8,
+            gainedObservationID: 0, releasedObservationID: 1
+        )]
+    )
+    let subjects = SubjectGraph.make(graph: graph, composition: directed)
+    let foreground = try #require(subjects.subjects.first { $0.isForegroundSupport })
+    let entry = try #require(foreground.framingEligibleAt)
+    let trip = try #require(directed.pointerTrip(forActionID: 1))
+
+    #expect(entry > trip.start)
+    #expect(entry < trip.end)
+
+    var policy = ShotSchedulePlanner.Policy.default
+    policy.moveCost = 0
+    policy.minimumReadableScale = 1.01
+    let schedule = ShotSchedulePlanner.plan(
+        subjects: subjects, composition: directed,
+        base: CameraState(x: size.width / 2, y: size.height / 2, logScale: 0),
+        policy: policy
+    )
+    let move = try #require(schedule.moves.first { $0.label.hasPrefix("experimental-shot-") })
+    #expect(move.start >= directed.outputTime(atSourceTime: entry))
+}
+
+@Test func verifiedTransientForegroundCanProduceAReadableCursorLedShotWhenValuable() throws {
+    let directed = try composition(
+        """
+        [
+          {"action":"click","time":2.0,"coordinates":{"xNorm":0.8,"yNorm":0.2}},
+          {"action":"click","time":4.8,"coordinates":{"xNorm":0.55,"yNorm":0.55}}
+        ]
+        """,
+        duration: 6
+    )
+    let support = CGRect(x: 0.42, y: 0.35, width: 0.25, height: 0.35)
+    let observations = [
+        VisualMotionObservation(
+            time: 2, normalizedBounds: support, changedFraction: 0.1,
+            magnitude: 1, kind: .focus, focusTransition: .gained, startTime: 2
+        ),
+        VisualMotionObservation(
+            time: 5, normalizedBounds: support, changedFraction: 0.1,
+            magnitude: 1, kind: .focus, focusTransition: .released, startTime: 5
+        )
+    ]
+    let graph = ProductionPlanGraph.make(
+        from: directed, contentRect: rect, sourceDuration: 6,
+        observations: observations, motionRanges: [2...5],
+        evaluationCondition: .dOracleGated,
+        supportObservationIDs: [0, 1],
+        oracleSupportLifecycles: [.init(
+            bounds: support, gainedAt: 2, releasedAt: 5,
+            gainedObservationID: 0, releasedObservationID: 1
+        )]
+    )
+    let subjects = SubjectGraph.make(graph: graph, composition: directed)
+    let foreground = try #require(subjects.subjects.first { $0.isForegroundSupport })
+    let trip = try #require(directed.pointerTrip(forActionID: 1))
+    let entry = try #require(foreground.framingEligibleAt)
+    #expect(entry == 2)
+    #expect(trip.start > entry)
+
+    var policy = ShotSchedulePlanner.Policy.default
+    policy.moveCost = 0
+    policy.scaleCost = 0
+    policy.translationCost = 0
+    let schedule = ShotSchedulePlanner.plan(
+        subjects: subjects, composition: directed,
+        base: CameraState(x: size.width / 2, y: size.height / 2, logScale: 0),
+        policy: policy
+    )
+    let shot = try #require(schedule.shots.first { $0.subjectID == foreground.id })
+    #expect(shot.intent == .frame)
+}
+
+@Test func subjectGraphCombinesLocalizedRevealTilesWithTheirFactualTrigger() throws {
+    let directed = try composition(
+        """
+        [{"action":"click","time":2.0,"coordinates":{"xNorm":0.55,"yNorm":0.45},"targetResolution":{"provenance":"direct","confidence":0.99}}]
+        """,
+        duration: 8
+    )
+    let observations = [
+        VisualMotionObservation(
+            time: 2.45, normalizedBounds: CGRect(x: 0.35, y: 0.35, width: 0.2, height: 0.15),
+            changedFraction: 0.08, magnitude: 0.9, kind: .appearance, startTime: 2.45
+        ),
+        VisualMotionObservation(
+            time: 2.45, normalizedBounds: CGRect(x: 0.55, y: 0.35, width: 0.2, height: 0.15),
+            changedFraction: 0.08, magnitude: 0.9, kind: .appearance, startTime: 2.45
+        )
+    ]
+    let graph = ProductionPlanGraph.make(
+        from: directed, contentRect: rect, sourceDuration: 8,
+        observations: observations, motionRanges: [2.4...2.6]
+    )
+    let subjects = SubjectGraph.make(graph: graph, composition: directed)
+    let reveal = try #require(subjects.subjects.first { $0.actionIDs == [0] })
+
+    #expect(reveal.kind == .surface)
+    #expect(reveal.observationIDs == [0, 1])
+    #expect(reveal.bounds.width > 380)
+    #expect(reveal.sourceRange.upperBound >= 4.85)
+}
+
+@Test func subjectGraphDoesNotTurnDisappearanceIntoAReveal() throws {
+    let directed = try composition(
+        """
+        [{"action":"click","time":2.0,"coordinates":{"xNorm":0.55,"yNorm":0.45},"targetResolution":{"provenance":"direct","confidence":0.99}}]
+        """,
+        duration: 8
+    )
+    let observation = VisualMotionObservation(
+        time: 2.45,
+        normalizedBounds: CGRect(x: 0.35, y: 0.35, width: 0.4, height: 0.15),
+        changedFraction: 0.08,
+        magnitude: 0.9,
+        kind: .appearance,
+        polarity: .vanish,
+        startTime: 2.20
+    )
+    let graph = ProductionPlanGraph.make(
+        from: directed, contentRect: rect, sourceDuration: 8,
+        observations: [observation], motionRanges: [2.2...2.45]
+    )
+    let subjects = SubjectGraph.make(graph: graph, composition: directed)
+    let target = try #require(subjects.subjects.first { $0.actionIDs == [0] })
+
+    #expect(target.kind == .target)
+    #expect(target.observationIDs.isEmpty)
+}
+
+@Test func unverifiedFocusCannotEraseACoexistingStructuralReveal() throws {
+    let directed = try composition(
+        """
+        [{"action":"click","time":2.0,"coordinates":{"xNorm":0.50,"yNorm":0.50},"targetResolution":{"provenance":"direct","confidence":0.99}}]
+        """,
+        duration: 7
+    )
+    let reveal = VisualMotionObservation(
+        time: 2.45,
+        normalizedBounds: CGRect(x: 0.38, y: 0.36, width: 0.24, height: 0.22),
+        changedFraction: 0.08,
+        magnitude: 0.9,
+        kind: .appearance,
+        polarity: .appear,
+        startTime: 2.10
+    )
+    let unverifiedFocus = VisualMotionObservation(
+        time: 2.45,
+        normalizedBounds: CGRect(x: 0.30, y: 0.25, width: 0.40, height: 0.50),
+        changedFraction: 0.20,
+        magnitude: 0.9,
+        kind: .focus,
+        focusTransition: .held,
+        startTime: 2.45
+    )
+    let graph = ProductionPlanGraph.make(
+        from: directed, contentRect: rect, sourceDuration: 7,
+        observations: [reveal, unverifiedFocus], motionRanges: [2.1...2.45]
+    )
+    let subjects = SubjectGraph.make(graph: graph, composition: directed)
+    let subject = try #require(subjects.subjects.first { $0.actionIDs == [0] })
+
+    #expect(subject.observationIDs.contains(0))
+    #expect(subject.isForegroundSupport == false)
+}
+
+@Test func localizedDisappearanceClosesABackwardVerifiedSurface() throws {
+    let directed = try composition(
+        """
+        [
+          {"action":"click","time":2.0,"coordinates":{"xNorm":0.50,"yNorm":0.50},"targetResolution":{"provenance":"direct","confidence":0.99}},
+          {"action":"click","time":5.0,"coordinates":{"xNorm":0.52,"yNorm":0.55},"targetResolution":{"provenance":"direct","confidence":0.99}}
+        ]
+        """,
+        duration: 8
+    )
+    let broadBirth = VisualMotionObservation(
+        time: 2.7,
+        normalizedBounds: CGRect(x: 0, y: 0, width: 0.96, height: 1),
+        changedFraction: 0.012,
+        magnitude: 0.7,
+        kind: .transformation,
+        startTime: 2.1
+    )
+    let release = VisualMotionObservation(
+        time: 5.35,
+        normalizedBounds: CGRect(x: 0.35, y: 0.30, width: 0.30, height: 0.40),
+        changedFraction: 0.08,
+        magnitude: 0.9,
+        kind: .appearance,
+        polarity: .vanish,
+        startTime: 5.10
+    )
+    let closingTransition = VisualMotionObservation(
+        time: 5.0,
+        normalizedBounds: CGRect(x: 0, y: 0, width: 1, height: 1),
+        changedFraction: 0.2,
+        magnitude: 0.9,
+        kind: .contextTransition,
+        startTime: 5.0
+    )
+    let graph = ProductionPlanGraph.make(
+        from: directed, contentRect: rect, sourceDuration: 8,
+        observations: [broadBirth, release, closingTransition],
+        motionRanges: [2.1...2.7, 5.0...5.35]
+    )
+    let subjects = SubjectGraph.make(graph: graph, composition: directed)
+    let surface = try #require(subjects.subjects.first { $0.actionIDs == [0, 1] })
+
+    #expect(surface.kind == .surface)
+    #expect(surface.observationIDs.contains(1))
+    #expect(surface.requiresOverview == false)
+    #expect(surface.sourceRange.upperBound < 6)
+    #expect(surface.verifiedReleaseTime == 5.0)
+}
+
+@Test func heldEnclosingFocusVetoesAPartialDisappearanceRelease() throws {
+    let directed = try composition(
+        """
+        [
+          {"action":"click","time":2.0,"coordinates":{"xNorm":0.50,"yNorm":0.50},"targetResolution":{"provenance":"direct","confidence":0.99}},
+          {"action":"click","time":5.0,"coordinates":{"xNorm":0.52,"yNorm":0.55},"targetResolution":{"provenance":"direct","confidence":0.99}}
+        ]
+        """,
+        duration: 8
+    )
+    let partialDisappearance = VisualMotionObservation(
+        time: 5.35,
+        normalizedBounds: CGRect(x: 0.43, y: 0.42, width: 0.16, height: 0.18),
+        changedFraction: 0.08,
+        magnitude: 0.9,
+        kind: .appearance,
+        polarity: .vanish,
+        startTime: 5.10
+    )
+    let heldEnclosingFocus = VisualMotionObservation(
+        time: 5.35,
+        normalizedBounds: CGRect(x: 0.30, y: 0.25, width: 0.40, height: 0.50),
+        changedFraction: 0.2,
+        magnitude: 0.9,
+        kind: .focus,
+        focusTransition: .held,
+        startTime: 5.35
+    )
+    let graph = ProductionPlanGraph.make(
+        from: directed, contentRect: rect, sourceDuration: 8,
+        observations: [partialDisappearance, heldEnclosingFocus],
+        motionRanges: [5.1...5.35]
+    )
+    let subjects = SubjectGraph.make(graph: graph, composition: directed)
+    let subject = try #require(subjects.subjects.first { $0.actionIDs == [0, 1] })
+
+    #expect(subject.verifiedReleaseTime == nil)
+    #expect(subject.observationIDs.contains(0))
+}
+
+@Test func laterOwnedActionVetoesAnEarlierNestedDisappearanceRelease() throws {
+    let directed = try composition(
+        """
+        [
+          {"action":"click","time":2.0,"coordinates":{"xNorm":0.50,"yNorm":0.50},"targetResolution":{"provenance":"direct","confidence":0.99}},
+          {"action":"click","time":5.0,"coordinates":{"xNorm":0.52,"yNorm":0.55},"targetResolution":{"provenance":"direct","confidence":0.99}},
+          {"action":"click","time":7.0,"coordinates":{"xNorm":0.54,"yNorm":0.50},"targetResolution":{"provenance":"direct","confidence":0.99}}
+        ]
+        """,
+        duration: 10
+    )
+    let nestedDisappearance = VisualMotionObservation(
+        time: 5.35,
+        normalizedBounds: CGRect(x: 0.43, y: 0.42, width: 0.16, height: 0.18),
+        changedFraction: 0.08,
+        magnitude: 0.9,
+        kind: .appearance,
+        polarity: .vanish,
+        startTime: 5.10
+    )
+    let graph = ProductionPlanGraph.make(
+        from: directed, contentRect: rect, sourceDuration: 10,
+        observations: [nestedDisappearance],
+        motionRanges: [5.1...5.35]
+    )
+    let subjects = SubjectGraph.make(graph: graph, composition: directed)
+    let subject = try #require(subjects.subjects.first { $0.actionIDs == [0, 1, 2] })
+
+    #expect(subject.kind == .surface)
+    #expect(subject.verifiedReleaseTime == nil)
+}
+
+@Test func requiredObservationCoverageIsReservedBeforeBeamCostFilling() {
+    let required: Set<Int> = [41, 73]
+    let coverages = Array(repeating: Set<Int>(), count: 200) + [
+        Set([41]), Set([73]), Set([41, 73])
+    ]
+    let reserved = RequiredObservationBeamPolicy.reservationIndices(
+        coverages: coverages,
+        required: required,
+        width: 160
+    )
+
+    #expect(reserved.contains(202))
+    #expect(reserved.contains(200))
+    #expect(reserved.contains(201))
+    #expect(reserved.contains(0))
+}
+
+@Test func backwardVerifiedSurfaceFramesAfterItsEstablishingTransition() throws {
+    let directed = try composition(
+        """
+        [
+          {"action":"click","time":2.0,"coordinates":{"xNorm":0.50,"yNorm":0.50},"targetResolution":{"provenance":"direct","confidence":0.99}},
+          {"action":"click","time":4.0,"coordinates":{"xNorm":0.53,"yNorm":0.53},"targetResolution":{"provenance":"direct","confidence":0.99}},
+          {"action":"click","time":6.0,"coordinates":{"xNorm":0.52,"yNorm":0.55},"targetResolution":{"provenance":"direct","confidence":0.99}}
+        ]
+        """,
+        duration: 9
+    )
+    let establishingTransition = VisualMotionObservation(
+        time: 2.0,
+        normalizedBounds: CGRect(x: 0, y: 0, width: 1, height: 1),
+        changedFraction: 0.25,
+        magnitude: 1,
+        kind: .contextTransition,
+        startTime: 2.0
+    )
+    let release = VisualMotionObservation(
+        time: 6.35,
+        normalizedBounds: CGRect(x: 0.35, y: 0.30, width: 0.30, height: 0.40),
+        changedFraction: 0.08,
+        magnitude: 0.9,
+        kind: .appearance,
+        polarity: .vanish,
+        startTime: 6.10
+    )
+    let graph = ProductionPlanGraph.make(
+        from: directed, contentRect: rect, sourceDuration: 9,
+        observations: [establishingTransition, release],
+        motionRanges: [2.0...2.2, 6.1...6.35]
+    )
+    let subjects = SubjectGraph.make(graph: graph, composition: directed)
+    let surface = try #require(subjects.subjects.first { $0.actionIDs == [0, 1, 2] })
+    let eligibleAt = try #require(surface.framingEligibleAt)
+
+    #expect(eligibleAt > 2.0)
+    #expect(eligibleAt <= 4.0)
+    #expect(surface.verifiedReleaseTime == 6.0)
+}
+
+@Test func subjectGraphDoesNotTurnPreexistingAnimationIntoAnActionReveal() throws {
+    let directed = try composition(
+        """
+        [{"action":"click","time":2.0,"coordinates":{"xNorm":0.55,"yNorm":0.45},"targetResolution":{"provenance":"direct","confidence":0.99}}]
+        """,
+        duration: 8
+    )
+    let observations = [VisualMotionObservation(
+        time: 2.45, normalizedBounds: CGRect(x: 0.35, y: 0.35, width: 0.4, height: 0.15),
+        changedFraction: 0.08, magnitude: 0.9, kind: .transformation, startTime: 1.0
+    )]
+    let graph = ProductionPlanGraph.make(
+        from: directed, contentRect: rect, sourceDuration: 8,
+        observations: observations, motionRanges: [1.0...2.6]
+    )
+    let subjects = SubjectGraph.make(graph: graph, composition: directed)
+    let target = try #require(subjects.subjects.first { $0.actionIDs == [0] })
+
+    #expect(target.kind == .target)
+    #expect(target.observationIDs.isEmpty)
+    #expect(target.sourceRange.upperBound < 3)
+}
+
+@Test func subjectGraphKeepsActionsWithinOneFrameOfForegroundBirthInTheOwner() throws {
+    let directed = try composition(
+        """
+        [
+          {"action":"click","time":1.5,"coordinates":{"xNorm":0.8,"yNorm":0.8}},
+          {"action":"click","time":1.999999,"coordinates":{"xNorm":0.5,"yNorm":0.25}},
+          {"action":"click","time":6.01,"coordinates":{"xNorm":0.52,"yNorm":0.52}}
+        ]
+        """,
+        duration: 8
+    )
+    let support = CGRect(x: 0.35, y: 0.3, width: 0.3, height: 0.4)
+    let observations = [
+        VisualMotionObservation(
+            time: 2, normalizedBounds: support, changedFraction: 0.1,
+            magnitude: 1, kind: .focus, focusTransition: .gained, startTime: 2
+        ),
+        VisualMotionObservation(
+            time: 6, normalizedBounds: support, changedFraction: 0.1,
+            magnitude: 1, kind: .focus, focusTransition: .released, startTime: 6
+        )
+    ]
+    let graph = ProductionPlanGraph.make(
+        from: directed, contentRect: rect, sourceDuration: 8,
+        observations: observations, motionRanges: [2...6],
+        evaluationCondition: .dOracleGated,
+        supportObservationIDs: [0, 1],
+        oracleSupportLifecycles: [.init(
+            bounds: support, gainedAt: 2, releasedAt: 6,
+            gainedObservationID: 0, releasedObservationID: 1
+        )]
+    )
+    let subjects = SubjectGraph.make(graph: graph, composition: directed)
+    let foreground = try #require(subjects.subjects.first { $0.isForegroundSupport })
+
+    #expect(foreground.actionIDs.contains(1))
+    #expect(foreground.actionIDs.contains(2))
+    #expect(foreground.sourceRange.lowerBound > 1.9)
+}
+
+@Test func shotScheduleValuesMeasuredSurfaceLifetimeInsteadOfSingleClickHold() throws {
+    let directed = try composition(
+        """
+        [{"action":"click","time":2.2,"coordinates":{"xNorm":0.5,"yNorm":0.5},"targetResolution":{"provenance":"direct","confidence":0.99}}]
+        """,
+        duration: 20
+    )
+    let surface = SubjectGraph.Subject(
+        id: 0,
+        kind: .surface,
+        bounds: CGRect(x: 350, y: 220, width: 300, height: 300),
+        sourceRange: 2...17,
+        actionIDs: [0],
+        confidence: 1
+    )
+    let subjects = SubjectGraph(size: size, subjects: [surface], transitions: [])
+    let schedule = ShotSchedulePlanner.plan(
+        subjects: subjects,
+        composition: directed,
+        base: CameraState(x: size.width / 2, y: size.height / 2, logScale: 0)
+    )
+    let shot = try #require(schedule.shots.first)
+
+    #expect(shot.intent == .frame)
+    #expect(exp(shot.pose.logScale) >= 1.2)
+    #expect(abs(shot.interval.lowerBound - directed.outputTime(atSourceTime: 2)) < 0.001)
+    #expect(abs(shot.interval.upperBound - directed.outputTime(atSourceTime: 17)) < 0.001)
+}
+
+@Test func briefVerifiedPeripheralSubjectDoesNotForceAnUnreadableCameraMove() throws {
+    let directed = try composition(
+        """
+        [{"action":"click","time":2.2,"coordinates":{"xNorm":0.82,"yNorm":0.75}}]
+        """,
+        duration: 6
+    )
+    let subject = SubjectGraph.Subject(
+        id: 0,
+        kind: .surface,
+        bounds: CGRect(x: 690, y: 570, width: 180, height: 90),
+        sourceRange: 2...3,
+        actionIDs: [0],
+        confidence: 1,
+        framingEligibleAt: 2,
+        isForegroundSupport: true,
+        verifiedReleaseTime: 3
+    )
+    let base = CameraState(x: size.width / 2, y: size.height / 2, logScale: 0)
+    let schedule = ShotSchedulePlanner.plan(
+        subjects: SubjectGraph(size: size, subjects: [subject], transitions: []),
+        composition: directed, base: base
+    )
+    let shot = try #require(schedule.shots.first)
+
+    #expect(shot.intent == .overview)
+    #expect(shot.pose == base)
+    #expect(schedule.moves.isEmpty)
+}
+
+@Test func shotScheduleReturnsOnlyAfterVerifiedForegroundRelease() throws {
+    let directed = try composition(
+        """
+        [{"action":"click","time":2.2,"coordinates":{"xNorm":0.5,"yNorm":0.5},"targetResolution":{"provenance":"direct","confidence":0.99}}]
+        """,
+        duration: 9
+    )
+    let surface = SubjectGraph.Subject(
+        id: 0,
+        kind: .surface,
+        bounds: CGRect(x: 350, y: 220, width: 300, height: 300),
+        sourceRange: 2...6,
+        actionIDs: [0],
+        confidence: 1,
+        isForegroundSupport: true,
+        verifiedReleaseTime: 6
+    )
+    var policy = ShotSchedulePlanner.Policy.default
+    policy.moveCost = 0
+    policy.scaleCost = 0
+    policy.translationCost = 0
+    policy.minimumReadableScale = 1.01
+    let base = CameraState(x: size.width / 2, y: size.height / 2, logScale: 0)
+    let schedule = ShotSchedulePlanner.plan(
+        subjects: SubjectGraph(size: size, subjects: [surface], transitions: []),
+        composition: directed,
+        base: base,
+        policy: policy
+    )
+    let release = try #require(schedule.moves.first {
+        $0.label == "experimental-release-0"
+    })
+
+    #expect(release.start >= directed.outputTime(atSourceTime: 6))
+    #expect(abs(release.to.x - base.x) < 0.001)
+    #expect(abs(release.to.y - base.y) < 0.001)
+    #expect(abs(release.to.logScale - base.logScale) < 0.001)
+}
+
+@Test func shotScheduleRestoresAnActiveParentWhenNestedForegroundReleases() throws {
+    let directed = try composition(
+        """
+        [
+          {"action":"click","time":2.2,"coordinates":{"xNorm":0.5,"yNorm":0.5}},
+          {"action":"click","time":4.2,"coordinates":{"xNorm":0.58,"yNorm":0.58}}
+        ]
+        """,
+        duration: 10
+    )
+    let parent = SubjectGraph.Subject(
+        id: 0, kind: .surface,
+        bounds: CGRect(x: 300, y: 200, width: 400, height: 360),
+        sourceRange: 2...8, actionIDs: [0], confidence: 1,
+        isForegroundSupport: true, verifiedReleaseTime: 8
+    )
+    let child = SubjectGraph.Subject(
+        id: 1, kind: .surface,
+        bounds: CGRect(x: 500, y: 360, width: 180, height: 140),
+        sourceRange: 4...6, actionIDs: [1], confidence: 1,
+        isForegroundSupport: true, verifiedReleaseTime: 6
+    )
+    var policy = ShotSchedulePlanner.Policy.default
+    policy.moveCost = 0
+    policy.minimumReadableScale = 1.01
+    let base = CameraState(x: size.width / 2, y: size.height / 2, logScale: 0)
+    let schedule = ShotSchedulePlanner.plan(
+        subjects: SubjectGraph(size: size, subjects: [parent, child], transitions: []),
+        composition: directed, base: base, policy: policy
+    )
+    let parentShot = try #require(schedule.shots.first { $0.subjectID == parent.id })
+    let childShot = try #require(schedule.shots.first { $0.subjectID == child.id })
+    let parentRelease = try #require(schedule.moves.first {
+        $0.label == "experimental-release-0"
+    })
+
+    #expect(childShot.pose == parentShot.pose)
+    #expect(!schedule.moves.contains { $0.label == "experimental-shot-1" })
+    #expect(!schedule.moves.contains { $0.label == "experimental-release-1" })
+    #expect(abs(parentRelease.to.logScale - base.logScale) < 0.001)
+}
+
+@Test func simultaneousNestedReleasesReturnToOverviewInsteadOfRestoringExpiredParent() throws {
+    let directed = try composition(
+        """
+        [
+          {"action":"click","time":2.2,"coordinates":{"xNorm":0.4,"yNorm":0.5}},
+          {"action":"click","time":4.2,"coordinates":{"xNorm":0.5,"yNorm":0.5}}
+        ]
+        """,
+        duration: 9
+    )
+    let parent = SubjectGraph.Subject(
+        id: 0, kind: .surface,
+        bounds: CGRect(x: 280, y: 200, width: 420, height: 360),
+        sourceRange: 2...6, actionIDs: [0, 1], confidence: 1,
+        isForegroundSupport: true, verifiedReleaseTime: 6
+    )
+    let child = SubjectGraph.Subject(
+        id: 1, kind: .surface,
+        bounds: CGRect(x: 460, y: 330, width: 190, height: 150),
+        sourceRange: 4...6, actionIDs: [1], confidence: 1,
+        isForegroundSupport: true, verifiedReleaseTime: 6
+    )
+    var policy = ShotSchedulePlanner.Policy.default
+    policy.moveCost = 0
+    policy.minimumReadableScale = 1.01
+    let base = CameraState(x: size.width / 2, y: size.height / 2, logScale: 0)
+    let schedule = ShotSchedulePlanner.plan(
+        subjects: SubjectGraph(size: size, subjects: [parent, child], transitions: []),
+        composition: directed, base: base, policy: policy
+    )
+    let release = try #require(schedule.moves.last)
+
+    #expect(release.label.hasPrefix("experimental-release-"))
+    #expect(abs(release.to.x - base.x) < 0.001)
+    #expect(abs(release.to.y - base.y) < 0.001)
+    #expect(abs(release.to.logScale - base.logScale) < 0.001)
+}
+
+@Test func nestedForegroundReframesWhenTheParentCannotComfortablyShowIt() throws {
+    let directed = try composition(
+        """
+        [
+          {"action":"click","time":2.0,"coordinates":{"xNorm":0.25,"yNorm":0.5}},
+          {"action":"click","time":5.0,"coordinates":{"xNorm":0.82,"yNorm":0.5}}
+        ]
+        """,
+        duration: 10
+    )
+    let parent = SubjectGraph.Subject(
+        id: 0, kind: .surface,
+        bounds: CGRect(x: 100, y: 220, width: 320, height: 320),
+        sourceRange: 2...9, actionIDs: [0], confidence: 1
+    )
+    let child = SubjectGraph.Subject(
+        id: 1, kind: .surface,
+        bounds: CGRect(x: 760, y: 300, width: 180, height: 180),
+        sourceRange: 5...8, actionIDs: [1], confidence: 1,
+        framingEligibleAt: 5, isForegroundSupport: true,
+        verifiedReleaseTime: 8
+    )
+    var policy = ShotSchedulePlanner.Policy.default
+    policy.moveCost = 0
+    policy.scaleCost = 0
+    policy.translationCost = 0
+    policy.minimumReadableScale = 1.01
+    let schedule = ShotSchedulePlanner.plan(
+        subjects: SubjectGraph(size: size, subjects: [parent, child], transitions: []),
+        composition: directed,
+        base: CameraState(x: size.width / 2, y: size.height / 2, logScale: 0),
+        policy: policy
+    )
+
+    #expect(schedule.moves.contains { $0.label == "experimental-shot-1" })
+}
+
+@Test func rejectedNestedCloseupKeepsTheActiveParentInsteadOfZoomingOut() throws {
+    let directed = try composition(
+        """
+        [
+          {"action":"click","time":2.0,"coordinates":{"xNorm":0.5,"yNorm":0.5}},
+          {"action":"click","time":5.0,"coordinates":{"xNorm":0.58,"yNorm":0.58}}
+        ]
+        """,
+        duration: 10
+    )
+    let parent = SubjectGraph.Subject(
+        id: 0, kind: .surface,
+        bounds: CGRect(x: 300, y: 200, width: 400, height: 360),
+        sourceRange: 2...9, actionIDs: [0], confidence: 1
+    )
+    let child = SubjectGraph.Subject(
+        id: 1, kind: .surface,
+        bounds: CGRect(x: 500, y: 360, width: 180, height: 140),
+        sourceRange: 5...5.25, actionIDs: [1], confidence: 1
+    )
+    let base = CameraState(x: size.width / 2, y: size.height / 2, logScale: 0)
+    var policy = ShotSchedulePlanner.Policy.default
+    policy.moveCost = 0
+    policy.scaleCost = 0
+    policy.translationCost = 0
+    let schedule = ShotSchedulePlanner.plan(
+        subjects: SubjectGraph(size: size, subjects: [parent, child], transitions: []),
+        composition: directed, base: base, policy: policy
+    )
+    let parentShot = try #require(schedule.shots.first { $0.subjectID == 0 })
+    let childShot = try #require(schedule.shots.first { $0.subjectID == 1 })
+
+    #expect(parentShot.intent == .frame)
+    #expect(childShot.pose == parentShot.pose)
+    #expect(!schedule.moves.contains {
+        $0.start >= childShot.interval.lowerBound && abs($0.to.logScale) < 0.001
+    })
+}
+
+@Test func shotScheduleDoesNotInventReleaseFromUnverifiedSubjectTiming() throws {
+    let directed = try composition(
+        """
+        [{"action":"click","time":2.2,"coordinates":{"xNorm":0.5,"yNorm":0.5},"targetResolution":{"provenance":"direct","confidence":0.99}}]
+        """,
+        duration: 9
+    )
+    let surface = SubjectGraph.Subject(
+        id: 0,
+        kind: .surface,
+        bounds: CGRect(x: 350, y: 220, width: 300, height: 300),
+        sourceRange: 2...6,
+        actionIDs: [0],
+        confidence: 1
+    )
+    var policy = ShotSchedulePlanner.Policy.default
+    policy.moveCost = 0
+    policy.minimumReadableScale = 1.01
+    let schedule = ShotSchedulePlanner.plan(
+        subjects: SubjectGraph(size: size, subjects: [surface], transitions: []),
+        composition: directed,
+        base: CameraState(x: size.width / 2, y: size.height / 2, logScale: 0),
+        policy: policy
+    )
+
+    #expect(!schedule.moves.contains { $0.label.hasPrefix("experimental-release-") })
+}
+
+@Test func factualOnlyDragCannotInventASecondResponsePose() throws {
+    let directed = try composition(
+        """
+        [{"action":"drag","time":3.0,"coordinates":{"from":{"xNorm":0.35,"yNorm":0.5},"to":{"xNorm":0.65,"yNorm":0.5}},"targetResolution":{"provenance":"direct","confidence":0.99}}]
+        """,
+        duration: 6
+    )
+    let graph = ProductionPlanGraph.make(
+        from: directed,
+        contentRect: rect,
+        sourceDuration: 6,
+        observations: [],
+        motionRanges: []
+    )
+    let plan = ProductionPlanner.plan(
+        graph: graph,
+        composition: directed,
+        base: CameraState(x: size.width / 2, y: size.height / 2, logScale: 0)
+    )
+    let decision = try #require(plan.decisions.first)
+
+    #expect(plan.camera.diagnostics.feasible)
+    #expect(decision.arrivalPose == decision.pose)
+    #expect(!plan.camera.moves.contains { $0.label.hasSuffix("-response") })
+}
+
 @Test func subjectGraphSeparatesOrientationFromLocalizedTransitionResponse() throws {
     let observations = [
         VisualMotionObservation(
@@ -2036,6 +5085,24 @@ private func rectArea(_ rect: CGRect) -> CGFloat {
     #expect(editorial != base)
 }
 
+@Test func overlappingShotIntervalsSelectTheLatestStartedOwner() throws {
+    let base = CameraState(x: 500, y: 400, logScale: 0)
+    let older = ShotSchedule.Shot(
+        id: 2, subjectID: 10, intent: .overview, interval: 2...12,
+        pose: base, actionIDs: [0], readabilityValue: 0
+    )
+    let newer = ShotSchedule.Shot(
+        id: 3, subjectID: 11, intent: .frame, interval: 6...10,
+        pose: CameraState(x: 620, y: 430, logScale: log(1.4)),
+        actionIDs: [1], readabilityValue: 1
+    )
+    let schedule = ShotSchedule(shots: [newer, older], moves: [])
+
+    #expect(schedule.selectedShot(at: 4)?.subjectID == 10)
+    #expect(schedule.selectedShot(at: 8)?.subjectID == 11)
+    #expect(schedule.selectedShot(at: 13) == nil)
+}
+
 @Test func overviewShotSettlesBeforeFactualPointerDeparture() throws {
     let directed = try composition(
         """
@@ -2066,6 +5133,8 @@ private func rectArea(_ rect: CGRect) -> CGFloat {
     )
     var policy = ShotSchedulePlanner.Policy.default
     policy.moveCost = 0
+    policy.scaleCost = 0
+    policy.translationCost = 0
     policy.minimumReadableScale = 1.01
     let schedule = ShotSchedulePlanner.plan(
         subjects: subjects, composition: directed, base: base, policy: policy
@@ -2239,4 +5308,494 @@ private func rectArea(_ rect: CGRect) -> CGFloat {
     #expect(zip(retime, retime.dropFirst()).allSatisfy {
         abs($0.sourceEnd - $1.sourceStart) < 0.000_001
     })
+}
+
+@Test func oracleForegroundSupportFixtureProducesVisibleLifecycleEndpoints() throws {
+    let data = Data("""
+    {
+      "version": 1,
+      "coordinateSpace": "source-window-normalized-top-left",
+      "observations": [{
+        "id": "dialog-1",
+        "lifecycleId": "dialog",
+        "startTime": 2.5,
+        "endTime": 6.0,
+        "bounds": {"x": 0.25, "y": 0.2, "width": 0.5, "height": 0.6},
+        "confidence": 1.0,
+        "abstained": false,
+        "note": "visible support only"
+      }]
+    }
+    """.utf8)
+    let fixture = try JSONDecoder().decode(
+        OracleForegroundSupportFixture.self,
+        from: data
+    ).validated(sourceDuration: 8)
+    let observations = fixture.visualObservations()
+
+    #expect(observations.count == 2)
+    #expect(observations[0].focusTransition == .gained)
+    #expect(observations[1].focusTransition == .released)
+    #expect(observations.allSatisfy { $0.normalizedBounds == CGRect(x: 0.25, y: 0.2, width: 0.5, height: 0.6) })
+}
+
+@Test func topLeftOracleCoordinatesMapIntoBottomLeftCameraCanvasExactly() throws {
+    let directed = try composition("[]", duration: 8)
+    let normalized = CGRect(x: 0.35, y: 0.38, width: 0.28, height: 0.32)
+    let observations = [
+        VisualMotionObservation(
+            time: 2,
+            normalizedBounds: normalized,
+            changedFraction: 0.1,
+            magnitude: 1,
+            kind: .focus,
+            focusTransition: .gained,
+            startTime: 2
+        ),
+        VisualMotionObservation(
+            time: 6,
+            normalizedBounds: normalized,
+            changedFraction: 0.1,
+            magnitude: 1,
+            kind: .focus,
+            focusTransition: .released,
+            startTime: 6
+        )
+    ]
+    let graph = ProductionPlanGraph.make(
+        from: directed,
+        contentRect: rect,
+        sourceDuration: 8,
+        observations: observations,
+        motionRanges: [2...6],
+        evaluationCondition: .dOracleGated,
+        supportObservationIDs: [0, 1],
+        oracleSupportLifecycles: [OracleForegroundSupportLifecycle(
+            bounds: normalized,
+            gainedAt: 2,
+            releasedAt: 6,
+            gainedObservationID: 0,
+            releasedObservationID: 1
+        )]
+    )
+    let mapped = try #require(graph.lifecycles.first?.bounds)
+
+    #expect(abs(mapped.minX - 350) < 0.001)
+    #expect(abs(mapped.minY - 240) < 0.001)
+    #expect(abs(mapped.width - 280) < 0.001)
+    #expect(abs(mapped.height - 256) < 0.001)
+}
+
+@Test func oracleGateSuppressesDisjointMotionWithoutChangingCurrentCondition() throws {
+    let directed = try composition("""
+    [{"action":"click","time":3.0,"coordinates":{"xNorm":0.5,"yNorm":0.5},"targetResolution":{"provenance":"direct","confidence":0.99}}]
+    """, duration: 8)
+    let observations = [
+        VisualMotionObservation(
+            time: 3.45,
+            normalizedBounds: CGRect(x: 0.02, y: 0.08, width: 0.16, height: 0.2),
+            changedFraction: 0.15, magnitude: 0.9, kind: .appearance,
+            startTime: 3.1
+        ),
+        VisualMotionObservation(
+            time: 2.8,
+            normalizedBounds: CGRect(x: 0.35, y: 0.2, width: 0.55, height: 0.65),
+            changedFraction: 0.12, magnitude: 1, kind: .focus,
+            focusTransition: .gained, startTime: 2.68
+        ),
+        VisualMotionObservation(
+            time: 6.0,
+            normalizedBounds: CGRect(x: 0.35, y: 0.2, width: 0.55, height: 0.65),
+            changedFraction: 0.12, magnitude: 1, kind: .focus,
+            focusTransition: .released, startTime: 5.88
+        )
+    ]
+    let current = ProductionPlanGraph.make(
+        from: directed, contentRect: rect, sourceDuration: 8,
+        observations: observations, motionRanges: [2.68...6.0],
+        evaluationCondition: .cOracleCurrent, supportObservationIDs: [1, 2]
+    )
+    let gated = ProductionPlanGraph.make(
+        from: directed, contentRect: rect, sourceDuration: 8,
+        observations: observations, motionRanges: [2.68...6.0],
+        evaluationCondition: .dOracleGated, supportObservationIDs: [1, 2],
+        oracleSupportLifecycles: [OracleForegroundSupportLifecycle(
+            bounds: CGRect(x: 0.35, y: 0.2, width: 0.55, height: 0.65),
+            gainedAt: 2.8, releasedAt: 6,
+            gainedObservationID: 1, releasedObservationID: 2
+        )]
+    )
+
+    #expect(current.actions[0].attention.contains { $0.observationIDs.contains(0) })
+    #expect(!gated.actions[0].attention.contains { $0.observationIDs.contains(0) })
+    #expect(gated.actions[0].attention.contains { $0.observationClass == .oracleForegroundSupport })
+    #expect(gated.observationClass(for: 0) == .motionEditorial)
+    #expect(gated.observationClass(for: 1) == .oracleForegroundSupport)
+}
+
+@Test func currentEvaluationConditionPreservesProductionCameraDecisions() throws {
+    let observations = [VisualMotionObservation(
+        time: 3.6,
+        normalizedBounds: CGRect(x: 0.3, y: 0.25, width: 0.35, height: 0.3),
+        changedFraction: 0.15, magnitude: 0.9, kind: .appearance,
+        startTime: 3.2
+    )]
+    let directed = try composition("""
+    [{"action":"click","time":3.0,"coordinates":{"xNorm":0.5,"yNorm":0.5},"targetResolution":{"provenance":"direct","confidence":0.99}}]
+    """, duration: 8, motion: observations)
+    let production = ProductionPlanGraph.make(
+        from: directed, contentRect: rect, sourceDuration: 8,
+        observations: observations, motionRanges: [3.2...3.6]
+    )
+    let current = ProductionPlanGraph.make(
+        from: directed, contentRect: rect, sourceDuration: 8,
+        observations: observations, motionRanges: [3.2...3.6],
+        evaluationCondition: .aCurrent
+    )
+    let base = CameraState(x: size.width / 2, y: size.height / 2, logScale: 0)
+    let productionPlan = ProductionPlanner.plan(graph: production, composition: directed, base: base)
+    let currentPlan = ProductionPlanner.plan(graph: current, composition: directed, base: base)
+
+    #expect(productionPlan.decisions.map(\.attentionID) == currentPlan.decisions.map(\.attentionID))
+    #expect(productionPlan.decisions.map(\.timingID) == currentPlan.decisions.map(\.timingID))
+    #expect(productionPlan.camera.moves.count == currentPlan.camera.moves.count)
+    for (left, right) in zip(productionPlan.camera.moves, currentPlan.camera.moves) {
+        #expect(abs(left.start - right.start) < 0.000_001)
+        #expect(abs(left.end - right.end) < 0.000_001)
+        #expect(abs(left.to.x - right.to.x) < 0.000_001)
+        #expect(abs(left.to.y - right.to.y) < 0.000_001)
+        #expect(abs(left.to.logScale - right.to.logScale) < 0.000_001)
+    }
+}
+
+@Test func factorialGraphFreezesResolvedControlTiming() throws {
+    let phase = InteractionPhases(
+        rawEstimate: 4.2, toolStart: 2.8, toolEnd: 4.5,
+        pointerArrival: 3.0, activation: 3.25, responseOnset: 3.5,
+        source: "resolved-control"
+    )
+    let directed = try composition(
+        """
+        [{"action":"click","time":4.0,"coordinates":{"xNorm":0.5,"yNorm":0.5}}]
+        """,
+        duration: 8,
+        interactionPhases: [0: phase]
+    )
+    let graph = ProductionPlanGraph.make(
+        from: directed, contentRect: rect, sourceDuration: 8,
+        observations: [], motionRanges: [],
+        evaluationCondition: .bOptionalMotion,
+        freezeResolvedTiming: true
+    )
+    let timings = try #require(graph.actions.first?.timings)
+
+    #expect(timings.count == 1)
+    #expect(timings[0].activation == 3.25)
+    #expect(timings[0].pointerArrival == 3.0)
+    #expect(timings[0].responseOnset == 3.5)
+    #expect(timings[0].source == "factorial-control:resolved-control")
+}
+
+@Test func gatedObjectiveKeepsOrdinaryEditorialEvidenceOptionalOutsideOracleOwnership() throws {
+    let directed = try composition("[]", duration: 10)
+    let observations = [
+        VisualMotionObservation(
+            time: 3.8,
+            normalizedBounds: CGRect(x: 0.3, y: 0.2, width: 0.4, height: 0.5),
+            changedFraction: 0.1, magnitude: 0.8, kind: .appearance,
+            startTime: 3.2
+        ),
+        VisualMotionObservation(
+            time: 8.0,
+            normalizedBounds: CGRect(x: 0.1, y: 0.1, width: 0.2, height: 0.2),
+            changedFraction: 0.1, magnitude: 0.8, kind: .appearance,
+            startTime: 7.5
+        ),
+        VisualMotionObservation(
+            time: 3.0,
+            normalizedBounds: CGRect(x: 0.25, y: 0.15, width: 0.5, height: 0.6),
+            changedFraction: 0.1, magnitude: 1, kind: .focus,
+            focusTransition: .gained, startTime: 3.0
+        ),
+        VisualMotionObservation(
+            time: 6.0,
+            normalizedBounds: CGRect(x: 0.25, y: 0.15, width: 0.5, height: 0.6),
+            changedFraction: 0.1, magnitude: 1, kind: .focus,
+            focusTransition: .released, startTime: 6.0
+        )
+    ]
+    let graph = ProductionPlanGraph.make(
+        from: directed, contentRect: rect, sourceDuration: 10,
+        observations: observations, motionRanges: [3.0...6.0, 7.5...8.0],
+        evaluationCondition: .dOracleGated,
+        supportObservationIDs: [2, 3],
+        oracleSupportLifecycles: [OracleForegroundSupportLifecycle(
+            bounds: CGRect(x: 0.25, y: 0.15, width: 0.5, height: 0.6),
+            gainedAt: 3.0, releasedAt: 6.0,
+            gainedObservationID: 2, releasedObservationID: 3
+        )]
+    )
+
+    #expect(graph.editorialEvidenceIsOptional(observationID: 0))
+    #expect(graph.editorialEvidenceIsOptional(observationID: 1))
+    #expect(graph.editorialEvidenceIsOptional(observationID: 2))
+}
+
+@Test func actionResponseCoverageCatchesShortFragmentedEffectOutsideCamera() throws {
+    func evidence(
+        _ id: Int, actionID: Int, start: Double, end: Double, bounds: CGRect,
+        changed: Double = 0.001, confidence: Double = 0.6
+    ) -> ActionResponseSlice.Evidence {
+        ActionResponseSlice.Evidence(id: id, source: EpisodeVisualEvidence(
+            actionID: actionID, startTime: start, endTime: end,
+            normalizedBounds: bounds, changedFraction: changed,
+            confidence: confidence
+        ))
+    }
+    let response = [
+        evidence(0, actionID: -1, start: 2.05, end: 2.30,
+                 bounds: CGRect(x: 0.72, y: 0.10, width: 0.13, height: 0.03)),
+        evidence(1, actionID: 7, start: 2.14, end: 2.40,
+                 bounds: CGRect(x: 0.72, y: 0.10, width: 0.15, height: 0.05)),
+        evidence(2, actionID: 7, start: 2.22, end: 2.48,
+                 bounds: CGRect(x: 0.90, y: 0.10, width: 0.075, height: 0.05))
+    ]
+    let slices = [ActionResponseSlice(
+        actionID: 7, activation: 2, exclusiveEnd: 3,
+        exclusiveEvidence: response
+    )]
+    let audit = ActionResponseCoverageAudit.evaluate(
+        slices: slices,
+        contentRect: CGRect(x: 0, y: 0, width: 1_000, height: 1_000),
+        outputSize: CGSize(width: 1_000, height: 1_000),
+        cameraAtSourceTime: { _ in
+            CameraState(x: 500, y: 500, logScale: log(1.6))
+        }
+    )
+    let failure = try #require(audit.croppedMaterialResponses.first)
+
+    #expect(failure.actionID == 7)
+    #expect(failure.evidenceIDs == [0, 1, 2])
+    #expect(failure.sourceOwnedEvidenceIDs == [1, 2])
+    #expect(failure.sourceRange.upperBound - failure.sourceRange.lowerBound < 0.75)
+    #expect(failure.normalizedBounds.maxX == 0.975)
+    #expect(failure.minimumVisibleFraction < 0.5)
+}
+
+@Test func actionResponseCoverageDoesNotPromoteUnownedMotionToMaterialResponse() throws {
+    let global = ActionResponseSlice.Evidence(id: 0, source: EpisodeVisualEvidence(
+        actionID: -1, startTime: 2.05, endTime: 2.45,
+        normalizedBounds: CGRect(x: 0.75, y: 0.08, width: 0.22, height: 0.08),
+        changedFraction: 0.02, confidence: 0.95
+    ))
+    let repeated = ActionResponseSlice.Evidence(id: 1, source: EpisodeVisualEvidence(
+        actionID: -1, startTime: 2.20, endTime: 2.60,
+        normalizedBounds: CGRect(x: 0.76, y: 0.08, width: 0.21, height: 0.08),
+        changedFraction: 0.02, confidence: 0.95
+    ))
+    let audit = ActionResponseCoverageAudit.evaluate(
+        slices: [ActionResponseSlice(
+            actionID: 4, activation: 2, exclusiveEnd: 3,
+            exclusiveEvidence: [global, repeated]
+        )],
+        contentRect: CGRect(x: 0, y: 0, width: 1_000, height: 1_000),
+        outputSize: CGSize(width: 1_000, height: 1_000),
+        cameraAtSourceTime: { _ in
+            CameraState(x: 500, y: 500, logScale: log(1.8))
+        }
+    )
+
+    #expect(audit.responses.count == 1)
+    #expect(audit.responses[0].cropped)
+    #expect(!audit.responses[0].material)
+    #expect(audit.croppedMaterialResponses.isEmpty)
+}
+
+@Test func actionResponseCoverageKeepsDistantSimultaneousChangesSeparate() throws {
+    func item(_ id: Int, _ x: CGFloat) -> ActionResponseSlice.Evidence {
+        ActionResponseSlice.Evidence(id: id, source: EpisodeVisualEvidence(
+            actionID: 2, startTime: 2.05, endTime: 2.35,
+            normalizedBounds: CGRect(x: x, y: 0.1, width: 0.08, height: 0.08),
+            changedFraction: 0.01, confidence: 0.8
+        ))
+    }
+    let audit = ActionResponseCoverageAudit.evaluate(
+        slices: [ActionResponseSlice(
+            actionID: 2, activation: 2, exclusiveEnd: 3,
+            exclusiveEvidence: [item(0, 0.05), item(1, 0.85)]
+        )],
+        contentRect: CGRect(x: 0, y: 0, width: 1_000, height: 1_000),
+        outputSize: CGSize(width: 1_000, height: 1_000),
+        cameraAtSourceTime: { _ in
+            CameraState(x: 500, y: 500, logScale: 0)
+        }
+    )
+
+    #expect(audit.responses.count == 2)
+    #expect(audit.responses.allSatisfy { $0.evidenceCount == 1 })
+    #expect(audit.materialResponses.isEmpty)
+}
+
+@Test func actionResponseCoverageRejectsWeakCroppedFragmentBesideStrongCoveredResponse() throws {
+    func item(
+        _ id: Int, bounds: CGRect, changed: Double
+    ) -> ActionResponseSlice.Evidence {
+        ActionResponseSlice.Evidence(id: id, source: EpisodeVisualEvidence(
+            actionID: 3, startTime: 2.05 + Double(id % 2) * 0.08,
+            endTime: 2.35 + Double(id % 2) * 0.08,
+            normalizedBounds: bounds, changedFraction: changed,
+            confidence: 0.8
+        ))
+    }
+    let audit = ActionResponseCoverageAudit.evaluate(
+        slices: [ActionResponseSlice(
+            actionID: 3, activation: 2, exclusiveEnd: 3,
+            exclusiveEvidence: [
+                item(0, bounds: CGRect(x: 0.35, y: 0.35, width: 0.20, height: 0.15), changed: 0.03),
+                item(1, bounds: CGRect(x: 0.36, y: 0.35, width: 0.19, height: 0.15), changed: 0.03),
+                item(2, bounds: CGRect(x: 0.92, y: 0.08, width: 0.07, height: 0.16), changed: 0.003),
+                item(3, bounds: CGRect(x: 0.93, y: 0.08, width: 0.06, height: 0.16), changed: 0.003)
+            ]
+        )],
+        contentRect: CGRect(x: 0, y: 0, width: 1_000, height: 1_000),
+        outputSize: CGSize(width: 1_000, height: 1_000),
+        cameraAtSourceTime: { _ in
+            CameraState(x: 500, y: 500, logScale: log(1.6))
+        }
+    )
+    let weak = try #require(audit.responses.first { $0.normalizedBounds.minX > 0.8 })
+    let strong = try #require(audit.responses.first { $0.normalizedBounds.minX < 0.8 })
+
+    #expect(weak.cropped)
+    #expect(weak.relativeSignal < 0.2)
+    #expect(!weak.material)
+    #expect(strong.material)
+    #expect(!strong.cropped)
+    #expect(audit.croppedMaterialResponses.isEmpty)
+}
+
+@Test func actionResponseCoverageRetainsMultipleComparableResponseHypotheses() throws {
+    func item(
+        _ id: Int, x: CGFloat, changed: Double
+    ) -> ActionResponseSlice.Evidence {
+        ActionResponseSlice.Evidence(id: id, source: EpisodeVisualEvidence(
+            actionID: 5, startTime: 2.05 + Double(id % 2) * 0.08,
+            endTime: 2.35 + Double(id % 2) * 0.08,
+            normalizedBounds: CGRect(x: x, y: 0.40, width: 0.12, height: 0.10),
+            changedFraction: changed, confidence: 0.8
+        ))
+    }
+    let audit = ActionResponseCoverageAudit.evaluate(
+        slices: [ActionResponseSlice(
+            actionID: 5, activation: 2, exclusiveEnd: 3,
+            exclusiveEvidence: [
+                item(0, x: 0.42, changed: 0.03), item(1, x: 0.43, changed: 0.03),
+                item(2, x: 0.84, changed: 0.027), item(3, x: 0.85, changed: 0.027)
+            ]
+        )],
+        contentRect: CGRect(x: 0, y: 0, width: 1_000, height: 1_000),
+        outputSize: CGSize(width: 1_000, height: 1_000),
+        cameraAtSourceTime: { _ in
+            CameraState(x: 500, y: 500, logScale: log(1.6))
+        }
+    )
+
+    #expect(audit.materialResponses.count == 2)
+    #expect(audit.croppedMaterialResponses.count == 1)
+    #expect(audit.croppedMaterialResponses[0].relativeSignal > 0.8)
+}
+
+@Test func actionResponseCoverageLeavesDiffuseSceneFieldsToOverviewInference() throws {
+    func item(_ id: Int, start: Double) -> ActionResponseSlice.Evidence {
+        ActionResponseSlice.Evidence(id: id, source: EpisodeVisualEvidence(
+            actionID: 8, startTime: start, endTime: start + 0.30,
+            normalizedBounds: CGRect(x: 0.20, y: 0.05, width: 0.60, height: 0.80),
+            changedFraction: 0.20, confidence: 0.95
+        ))
+    }
+    let audit = ActionResponseCoverageAudit.evaluate(
+        slices: [ActionResponseSlice(
+            actionID: 8, activation: 2, exclusiveEnd: 3,
+            exclusiveEvidence: [item(0, start: 2.05), item(1, start: 2.18)]
+        )],
+        contentRect: CGRect(x: 0, y: 0, width: 1_000, height: 1_000),
+        outputSize: CGSize(width: 1_000, height: 1_000),
+        cameraAtSourceTime: { _ in
+            CameraState(x: 500, y: 500, logScale: log(1.8))
+        }
+    )
+
+    #expect(audit.responses.count == 1)
+    #expect(audit.responses[0].cropped)
+    #expect(!audit.responses[0].material)
+    #expect(ActionResponseCoverageAudit.constraints(
+        slices: [ActionResponseSlice(
+            actionID: 8, activation: 2, exclusiveEnd: 3,
+            exclusiveEvidence: [item(0, start: 2.05), item(1, start: 2.18)]
+        )]
+    ).isEmpty)
+}
+
+@Test func shotScheduleUsesResponseCoverageOnlyToZoomOutFromChosenCenter() throws {
+    let directed = try composition(
+        """
+        [
+          {"action":"click","time":2.0,"coordinates":{"xNorm":0.50,"yNorm":0.50}},
+          {"action":"click","time":5.0,"coordinates":{"xNorm":0.52,"yNorm":0.50}}
+        ]
+        """,
+        duration: 12
+    )
+    let subject = SubjectGraph.Subject(
+        id: 0, kind: .surface,
+        bounds: CGRect(x: 450, y: 440, width: 110, height: 120),
+        sourceRange: 2...10, actionIDs: [0, 1], confidence: 0.9
+    )
+    let subjects = SubjectGraph(
+        size: CGSize(width: 1_000, height: 1_000),
+        subjects: [subject], transitions: []
+    )
+    let base = CameraState(x: 500, y: 500, logScale: 0)
+    let unconstrained = ShotSchedulePlanner.plan(
+        subjects: subjects, composition: directed, base: base
+    )
+    let constrained = ShotSchedulePlanner.plan(
+        subjects: subjects,
+        composition: directed,
+        base: base,
+        responseCoverageConstraints: [.init(
+            actionID: 1,
+            sourceRange: 5.1...5.6,
+            normalizedBounds: CGRect(x: 0.70, y: 0.40, width: 0.20, height: 0.10),
+            evidenceIDs: [0, 1], relativeSignal: 1
+        )],
+        contentRect: CGRect(x: 0, y: 0, width: 1_000, height: 1_000)
+    )
+    let originalShot = try #require(unconstrained.shots.first { $0.subjectID == 0 })
+    let safeShot = try #require(constrained.shots.first { $0.subjectID == 0 })
+    let originalScale = exp(originalShot.pose.logScale)
+    let safeScale = exp(safeShot.pose.logScale)
+
+    #expect(originalScale > safeScale)
+    #expect(safeScale >= 1.15)
+    #expect(abs(safeShot.pose.x - originalShot.pose.x) < 0.001)
+    #expect(abs(safeShot.pose.y - originalShot.pose.y) < 0.001)
+    let response = CGRect(x: 700, y: 500, width: 200, height: 100)
+    let projectedMin = projectPointThroughCamera(
+        response.origin, camera: safeShot.pose, outputSize: subjects.size
+    )
+    let projectedMax = projectPointThroughCamera(
+        CGPoint(x: response.maxX, y: response.maxY),
+        camera: safeShot.pose, outputSize: subjects.size
+    )
+    let projected = CGRect(
+        x: min(projectedMin.x, projectedMax.x),
+        y: min(projectedMin.y, projectedMax.y),
+        width: abs(projectedMax.x - projectedMin.x),
+        height: abs(projectedMax.y - projectedMin.y)
+    )
+    let visible = projected.intersection(CGRect(origin: .zero, size: subjects.size))
+    let visibleFraction = visible.width * visible.height
+        / (projected.width * projected.height)
+    #expect(visibleFraction >= 0.98 - 0.000_001)
 }

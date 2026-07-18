@@ -38,6 +38,252 @@ public struct CaptureDamageRect: Codable, Equatable, Sendable {
     }
 }
 
+public struct CaptureFrameRect: Codable, Equatable, Sendable {
+    public let x: Double
+    public let y: Double
+    public let width: Double
+    public let height: Double
+
+    public init(x: Double, y: Double, width: Double, height: Double) {
+        self.x = x
+        self.y = y
+        self.width = width
+        self.height = height
+    }
+}
+
+/// Per-frame ScreenCaptureKit geometry. The movie buffer can remain fixed while
+/// the active window raster moves or changes scale inside it, so buffer size is
+/// deliberately recorded separately from the frame attachment rectangles.
+public struct CaptureFrameGeometry: Codable, Equatable, Sendable {
+    public let bufferWidth: Int
+    public let bufferHeight: Int
+    public let contentRect: CaptureFrameRect?
+    public let boundingRect: CaptureFrameRect?
+    public let screenRect: CaptureFrameRect?
+    public let scaleFactor: Double?
+    public let contentScale: Double?
+
+    public init(
+        bufferWidth: Int,
+        bufferHeight: Int,
+        contentRect: CaptureFrameRect? = nil,
+        boundingRect: CaptureFrameRect? = nil,
+        screenRect: CaptureFrameRect? = nil,
+        scaleFactor: Double? = nil,
+        contentScale: Double? = nil
+    ) {
+        self.bufferWidth = bufferWidth
+        self.bufferHeight = bufferHeight
+        self.contentRect = contentRect
+        self.boundingRect = boundingRect
+        self.screenRect = screenRect
+        self.scaleFactor = scaleFactor
+        self.contentScale = contentScale
+    }
+
+    public var effectivePixelsPerPointX: Double? {
+        guard let contentRect, let boundingRect, boundingRect.width > 0 else { return nil }
+        return contentRect.width / boundingRect.width
+    }
+
+    public var effectivePixelsPerPointY: Double? {
+        guard let contentRect, let boundingRect, boundingRect.height > 0 else { return nil }
+        return contentRect.height / boundingRect.height
+    }
+}
+
+public enum CaptureGeometryDiscontinuityKind: String, Codable, Equatable, Sendable {
+    case bufferWidth
+    case bufferHeight
+    case contentRectX
+    case contentRectY
+    case contentRectWidth
+    case contentRectHeight
+    case contentRectUnavailable
+    case boundingRectWidth
+    case boundingRectHeight
+    case boundingRectUnavailable
+    case scaleFactor
+    case scaleFactorUnavailable
+    case contentScale
+    case contentScaleUnavailable
+    case effectivePixelsPerPointX
+    case effectivePixelsPerPointY
+}
+
+public struct CaptureGeometryDiscontinuity: Codable, Equatable, Sendable {
+    public let kind: CaptureGeometryDiscontinuityKind
+    public let baseline: Double?
+    public let observed: Double?
+
+    public init(
+        kind: CaptureGeometryDiscontinuityKind,
+        baseline: Double? = nil,
+        observed: Double? = nil
+    ) {
+        self.kind = kind
+        self.baseline = baseline
+        self.observed = observed
+    }
+}
+
+public struct CaptureGeometryContract: Codable, Equatable, Sendable {
+    public let configuredWidth: Int
+    public let configuredHeight: Int
+    public let pointPixelScale: Double
+    public let pixelFormat: String
+    public let captureResolution: String
+    public let scalesToFit: Bool
+    public let preservesAspectRatio: Bool
+
+    public init(
+        configuredWidth: Int,
+        configuredHeight: Int,
+        pointPixelScale: Double,
+        pixelFormat: String,
+        captureResolution: String,
+        scalesToFit: Bool,
+        preservesAspectRatio: Bool
+    ) {
+        self.configuredWidth = configuredWidth
+        self.configuredHeight = configuredHeight
+        self.pointPixelScale = pointPixelScale
+        self.pixelFormat = pixelFormat
+        self.captureResolution = captureResolution
+        self.scalesToFit = scalesToFit
+        self.preservesAspectRatio = preservesAspectRatio
+    }
+}
+
+/// Compares every complete frame with the first complete frame. This is a
+/// capture contract check, not motion detection: persistent drift continues to
+/// be reported until ScreenCaptureKit returns to the baseline geometry.
+public struct CaptureGeometryMonitor: Sendable {
+    public private(set) var baseline: CaptureFrameGeometry?
+
+    public init(baseline: CaptureFrameGeometry? = nil) {
+        self.baseline = baseline
+    }
+
+    public mutating func inspect(_ geometry: CaptureFrameGeometry) -> [CaptureGeometryDiscontinuity] {
+        guard let baseline else {
+            self.baseline = geometry
+            return []
+        }
+
+        var result: [CaptureGeometryDiscontinuity] = []
+        compare(
+            .bufferWidth, Double(baseline.bufferWidth), Double(geometry.bufferWidth),
+            tolerance: 0, into: &result
+        )
+        compare(
+            .bufferHeight, Double(baseline.bufferHeight), Double(geometry.bufferHeight),
+            tolerance: 0, into: &result
+        )
+        compareRect(
+            baseline.contentRect, geometry.contentRect,
+            unavailable: .contentRectUnavailable,
+            components: (.contentRectX, .contentRectY, .contentRectWidth, .contentRectHeight),
+            into: &result
+        )
+        compareRectSize(
+            baseline.boundingRect, geometry.boundingRect,
+            unavailable: .boundingRectUnavailable,
+            components: (.boundingRectWidth, .boundingRectHeight),
+            into: &result
+        )
+        compareOptional(
+            .scaleFactor, unavailable: .scaleFactorUnavailable,
+            baseline.scaleFactor, geometry.scaleFactor, tolerance: 0.001, into: &result
+        )
+        compareOptional(
+            .contentScale, unavailable: .contentScaleUnavailable,
+            baseline.contentScale, geometry.contentScale, tolerance: 0.001, into: &result
+        )
+        compareOptional(
+            .effectivePixelsPerPointX, unavailable: nil,
+            baseline.effectivePixelsPerPointX, geometry.effectivePixelsPerPointX,
+            tolerance: 0.001, into: &result
+        )
+        compareOptional(
+            .effectivePixelsPerPointY, unavailable: nil,
+            baseline.effectivePixelsPerPointY, geometry.effectivePixelsPerPointY,
+            tolerance: 0.001, into: &result
+        )
+        return result
+    }
+
+    private func compareRect(
+        _ baseline: CaptureFrameRect?,
+        _ observed: CaptureFrameRect?,
+        unavailable: CaptureGeometryDiscontinuityKind,
+        components: (
+            CaptureGeometryDiscontinuityKind, CaptureGeometryDiscontinuityKind,
+            CaptureGeometryDiscontinuityKind, CaptureGeometryDiscontinuityKind
+        ),
+        into result: inout [CaptureGeometryDiscontinuity]
+    ) {
+        guard let baseline, let observed else {
+            if baseline != nil || observed != nil {
+                result.append(CaptureGeometryDiscontinuity(kind: unavailable))
+            }
+            return
+        }
+        compare(components.0, baseline.x, observed.x, tolerance: 0.5, into: &result)
+        compare(components.1, baseline.y, observed.y, tolerance: 0.5, into: &result)
+        compare(components.2, baseline.width, observed.width, tolerance: 0.5, into: &result)
+        compare(components.3, baseline.height, observed.height, tolerance: 0.5, into: &result)
+    }
+
+    private func compareRectSize(
+        _ baseline: CaptureFrameRect?,
+        _ observed: CaptureFrameRect?,
+        unavailable: CaptureGeometryDiscontinuityKind,
+        components: (CaptureGeometryDiscontinuityKind, CaptureGeometryDiscontinuityKind),
+        into result: inout [CaptureGeometryDiscontinuity]
+    ) {
+        guard let baseline, let observed else {
+            if baseline != nil || observed != nil {
+                result.append(CaptureGeometryDiscontinuity(kind: unavailable))
+            }
+            return
+        }
+        compare(components.0, baseline.width, observed.width, tolerance: 0.5, into: &result)
+        compare(components.1, baseline.height, observed.height, tolerance: 0.5, into: &result)
+    }
+
+    private func compareOptional(
+        _ kind: CaptureGeometryDiscontinuityKind,
+        unavailable: CaptureGeometryDiscontinuityKind?,
+        _ baseline: Double?,
+        _ observed: Double?,
+        tolerance: Double,
+        into result: inout [CaptureGeometryDiscontinuity]
+    ) {
+        guard let baseline, let observed else {
+            if (baseline != nil || observed != nil), let unavailable {
+                result.append(CaptureGeometryDiscontinuity(kind: unavailable))
+            }
+            return
+        }
+        compare(kind, baseline, observed, tolerance: tolerance, into: &result)
+    }
+
+    private func compare(
+        _ kind: CaptureGeometryDiscontinuityKind,
+        _ baseline: Double,
+        _ observed: Double,
+        tolerance: Double,
+        into result: inout [CaptureGeometryDiscontinuity]
+    ) {
+        guard baseline.isFinite, observed.isFinite, abs(observed - baseline) > tolerance else { return }
+        result.append(CaptureGeometryDiscontinuity(
+            kind: kind, baseline: baseline, observed: observed
+        ))
+    }
+}
+
 public struct CapturedFrameSample: Codable, Equatable, Sendable {
     public let sourceTime: Double
     public let displayTime: UInt64?
@@ -45,6 +291,8 @@ public struct CapturedFrameSample: Codable, Equatable, Sendable {
     public let dirtyRects: [CaptureDamageRect]
     public let writerDisposition: FrameWriterDisposition
     public let pixelComparison: CapturedPixelComparison?
+    public let geometry: CaptureFrameGeometry?
+    public let geometryDiscontinuities: [CaptureGeometryDiscontinuity]?
 
     public init(
         sourceTime: Double,
@@ -52,7 +300,9 @@ public struct CapturedFrameSample: Codable, Equatable, Sendable {
         status: CapturedFrameStatus,
         dirtyRects: [CaptureDamageRect] = [],
         writerDisposition: FrameWriterDisposition = .notApplicable,
-        pixelComparison: CapturedPixelComparison? = nil
+        pixelComparison: CapturedPixelComparison? = nil,
+        geometry: CaptureFrameGeometry? = nil,
+        geometryDiscontinuities: [CaptureGeometryDiscontinuity]? = nil
     ) {
         self.sourceTime = sourceTime
         self.displayTime = displayTime
@@ -60,6 +310,8 @@ public struct CapturedFrameSample: Codable, Equatable, Sendable {
         self.dirtyRects = dirtyRects
         self.writerDisposition = writerDisposition
         self.pixelComparison = pixelComparison
+        self.geometry = geometry
+        self.geometryDiscontinuities = geometryDiscontinuities
     }
 }
 
@@ -69,19 +321,25 @@ public struct CaptureIntegrity: Codable, Equatable, Sendable {
     public let droppedBackpressureFrames: Int
     public let droppedNonMonotonicFrames: Int
     public let appendFailedFrames: Int
+    public let geometryDiscontinuityFrames: Int?
+    public let geometryMetadataIncompleteFrames: Int?
 
     public init(
         invalidMetadataSamples: Int = 0,
         preRollSamples: Int = 0,
         droppedBackpressureFrames: Int = 0,
         droppedNonMonotonicFrames: Int = 0,
-        appendFailedFrames: Int = 0
+        appendFailedFrames: Int = 0,
+        geometryDiscontinuityFrames: Int? = nil,
+        geometryMetadataIncompleteFrames: Int? = nil
     ) {
         self.invalidMetadataSamples = invalidMetadataSamples
         self.preRollSamples = preRollSamples
         self.droppedBackpressureFrames = droppedBackpressureFrames
         self.droppedNonMonotonicFrames = droppedNonMonotonicFrames
         self.appendFailedFrames = appendFailedFrames
+        self.geometryDiscontinuityFrames = geometryDiscontinuityFrames
+        self.geometryMetadataIncompleteFrames = geometryMetadataIncompleteFrames
     }
 }
 
@@ -91,19 +349,25 @@ public struct CaptureFrameLedger: Codable, Equatable, Sendable {
     public let expectedFrameInterval: Double
     public let samples: [CapturedFrameSample]
     public let integrity: CaptureIntegrity
+    public let geometryContract: CaptureGeometryContract?
+    public let geometryBaseline: CaptureFrameGeometry?
 
     public init(
-        version: Int = 1,
+        version: Int = 2,
         sourceTimebase: String = "first-complete-frame-presentation-time",
         expectedFrameInterval: Double,
         samples: [CapturedFrameSample],
-        integrity: CaptureIntegrity = CaptureIntegrity()
+        integrity: CaptureIntegrity = CaptureIntegrity(),
+        geometryContract: CaptureGeometryContract? = nil,
+        geometryBaseline: CaptureFrameGeometry? = nil
     ) {
         self.version = version
         self.sourceTimebase = sourceTimebase
         self.expectedFrameInterval = expectedFrameInterval
         self.samples = samples
         self.integrity = integrity
+        self.geometryContract = geometryContract
+        self.geometryBaseline = geometryBaseline
     }
 }
 
@@ -167,7 +431,7 @@ public enum CaptureTruthAnalyzer {
         sourceDuration: Double,
         actions: [FactualActionWindow] = []
     ) -> CaptureTruthAnalysis {
-        guard ledger.version == 1, sourceDuration > 0 else {
+        guard (ledger.version == 1 || ledger.version == 2), sourceDuration > 0 else {
             return CaptureTruthAnalysis(
                 intervals: sourceDuration > 0
                     ? [VisibilityInterval(start: 0, end: sourceDuration, state: .unknown)] : [],
@@ -217,6 +481,11 @@ public enum CaptureTruthAnalyzer {
                 state = .unknown
             } else if isDropped(pair.0) || isDropped(pair.1) {
                 state = .unknown
+            } else if !(pair.1.geometryDiscontinuities ?? []).isEmpty {
+                // A WindowServer presentation or resolution transition is a
+                // visible source event even if a future pixel comparer cannot
+                // observe the unavailable active rectangle directly.
+                state = .visibleChange
             } else if pair.1.pixelComparison == .changed {
                 state = .visibleChange
             } else if pair.1.pixelComparison == .identical {

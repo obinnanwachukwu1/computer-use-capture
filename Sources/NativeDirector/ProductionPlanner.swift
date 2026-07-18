@@ -20,6 +20,8 @@ public struct GlobalProductionPlan: Sendable {
         public let activation: Double
         public let timingSource: String
         public let observationIDs: Set<Int>
+        public let evidenceSources: [EvidenceSource]
+        public let observationClass: PlannerObservationClass?
         public let arrivalPose: CameraState
         public let pose: CameraState
         public let cumulativeCost: Double
@@ -87,15 +89,16 @@ public enum ProductionPlanner {
         )
         let candidatesByAction = graph.actions.map { node in
             actionCandidates(
-                node: node, poses: posePool, size: graph.size,
-                composition: composition, policy: policy
+                node: node, poses: posePool, graph: graph,
+                composition: composition,
+                policy: policy
             )
         }
         let hypothesisCount = candidatesByAction.reduce(0) { $0 + $1.count }
         guard !candidatesByAction.contains(where: { $0.isEmpty }) else {
             return GlobalProductionPlan(
                 camera: CameraPlan(moves: [], diagnostics: CameraPlanDiagnostics(
-                    plannerVersion: "normal", feasible: false,
+                    plannerVersion: graph.evaluationCondition.plannerVersion, feasible: false,
                     failure: "one or more actions have no factual-visibility-feasible hypothesis"
                 )),
                 decisions: [], hypothesisCount: hypothesisCount, beamWidth: policy.beamWidth,
@@ -103,6 +106,9 @@ public enum ProductionPlanner {
             )
         }
 
+        let requiredObservations = Set(graph.observations.indices.filter {
+            graph.observations[$0].kind == .contextTransition
+        })
         var beam = [Path(
             cost: 0, previousPose: base, pose: base,
             previousActivation: -.infinity, lastMoveEnd: 0,
@@ -146,7 +152,11 @@ public enum ProductionPlanner {
                 feasibilityByKey[$0.feasibilityKey] == true ? $0.path : nil
             }
             expanded.sort(by: pathPrecedes)
-            beam = diverseBeam(expanded, width: policy.beamWidth)
+            beam = diverseBeam(
+                expanded,
+                width: policy.beamWidth,
+                requiredObservations: requiredObservations
+            )
             searchTrace.append(.init(
                 actionID: graph.actions[actionIndex].action.id,
                 candidateCount: candidates.count,
@@ -159,9 +169,6 @@ public enum ProductionPlanner {
             if beam.isEmpty { break }
         }
 
-        let requiredObservations = Set(graph.observations.indices.filter {
-            graph.observations[$0].kind == .contextTransition
-        })
         let completePaths = beam.filter {
             requiredObservations.isSubset(of: $0.explainedObservations)
         }
@@ -173,7 +180,7 @@ public enum ProductionPlanner {
         }) else {
             return GlobalProductionPlan(
                 camera: CameraPlan(moves: [], diagnostics: CameraPlanDiagnostics(
-                    plannerVersion: "normal", feasible: false,
+                    plannerVersion: graph.evaluationCondition.plannerVersion, feasible: false,
                     failure: searchTrace.last?.outputPathCount == 0
                         ? "global production search exhausted at action \(searchTrace.last!.actionID)"
                         : "no globally feasible production path covers every required context transition"
@@ -185,7 +192,10 @@ public enum ProductionPlanner {
         return GlobalProductionPlan(
             camera: CameraPlan(
                 moves: winner.moves,
-                diagnostics: CameraPlanDiagnostics(plannerVersion: "normal", feasible: true)
+                diagnostics: CameraPlanDiagnostics(
+                    plannerVersion: graph.evaluationCondition.plannerVersion,
+                    feasible: true
+                )
             ),
             decisions: winner.decisions,
             hypothesisCount: hypothesisCount,
@@ -405,18 +415,18 @@ private func propose(
         guard timingGapCost.isFinite else { continue }
         let newlyExplained = candidate.attention.observationIDs.subtracting(path.explainedObservations)
         let explanationReward = newlyExplained.reduce(0.0) {
-            $0 + observationExplanationValue(graph.observations[$1])
+            $0 + observationExplanationValue($1, graph: graph)
         }
         let activationAttention = activationHypothesis(from: candidate.attention, action: candidate.action)
         let responseAttention = responseHypothesis(from: candidate.attention, size: graph.size)
         let poseOverrideCost = max(
             0,
-            attentionPoseCost(attention: activationAttention, pose: arrivalPose, size: graph.size, policy: policy)
-                - attentionPoseCost(attention: activationAttention, pose: candidate.arrivalPose, size: graph.size, policy: policy)
+            attentionPoseCost(attention: activationAttention, pose: arrivalPose, size: graph.size, condition: graph.evaluationCondition, policy: policy)
+                - attentionPoseCost(attention: activationAttention, pose: candidate.arrivalPose, size: graph.size, condition: graph.evaluationCondition, policy: policy)
         ) + max(
             0,
-            attentionPoseCost(attention: responseAttention, pose: responsePose, size: graph.size, policy: policy)
-                - attentionPoseCost(attention: responseAttention, pose: candidate.responsePose, size: graph.size, policy: policy)
+            attentionPoseCost(attention: responseAttention, pose: responsePose, size: graph.size, condition: graph.evaluationCondition, policy: policy)
+                - attentionPoseCost(attention: responseAttention, pose: candidate.responsePose, size: graph.size, condition: graph.evaluationCondition, policy: policy)
         )
         let cost = path.cost + candidate.cost + poseOverrideCost + transitionCost
             + attributionReuse + timingGapCost - explanationReward
@@ -427,6 +437,10 @@ private func propose(
             activation: candidate.timing.activation,
             timingSource: candidate.timing.source,
             observationIDs: candidate.attention.observationIDs,
+            evidenceSources: candidate.attention.evidence.map(\.source).reduce(into: []) {
+                if !$0.contains($1) { $0.append($1) }
+            }.sorted { $0.rawValue < $1.rawValue },
+            observationClass: candidate.attention.observationClass,
             arrivalPose: arrivalPose,
             pose: responsePose,
             cumulativeCost: cost
@@ -474,7 +488,11 @@ private func buildPosePool(
     base: CameraState,
     maximumCount: Int
 ) -> [CameraState] {
-    var poses = [base]
+    struct PoseCandidate {
+        let pose: CameraState
+        let isOracleSupport: Bool
+    }
+    var candidates = [PoseCandidate(pose: base, isOracleSupport: false)]
     for node in graph.actions {
         for hypothesis in node.attention {
             guard let bounds = hypothesis.bounds, let behavior = hypothesis.behavior else { continue }
@@ -484,17 +502,27 @@ private func buildPosePool(
             case .region: 1.58
             case .wideResponse: 1.48
             }
-            poses.append(composition.cameraPose(containing: bounds, maximumScale: maximumScale))
+            candidates.append(PoseCandidate(
+                pose: composition.cameraPose(containing: bounds, maximumScale: maximumScale),
+                isOracleSupport: hypothesis.observationClass == .oracleForegroundSupport
+            ))
         }
     }
-    poses.sort {
-        if abs($0.logScale - $1.logScale) > 0.000_001 { return $0.logScale < $1.logScale }
-        if abs($0.y - $1.y) > 0.001 { return $0.y < $1.y }
-        return $0.x < $1.x
+    candidates.sort {
+        // Oracle evaluation is meaningless if a correct foreground pose is
+        // generated and then removed by the broadest-first pool cap. Reserve
+        // those alternatives in C/D. With no oracle observations this sort is
+        // identical to the production ordering.
+        if $0.isOracleSupport != $1.isOracleSupport { return $0.isOracleSupport }
+        if abs($0.pose.logScale - $1.pose.logScale) > 0.000_001 {
+            return $0.pose.logScale < $1.pose.logScale
+        }
+        if abs($0.pose.y - $1.pose.y) > 0.001 { return $0.pose.y < $1.pose.y }
+        return $0.pose.x < $1.pose.x
     }
     var unique: [CameraState] = []
-    for pose in poses where !unique.contains(where: { poseEqual($0, pose) }) {
-        unique.append(pose)
+    for candidate in candidates where !unique.contains(where: { poseEqual($0, candidate.pose) }) {
+        unique.append(candidate.pose)
         if unique.count >= maximumCount { break }
     }
     return unique
@@ -503,20 +531,44 @@ private func buildPosePool(
 private func actionCandidates(
     node: ProductionPlanGraph.ActionNode,
     poses: [CameraState],
-    size: CGSize,
+    graph: ProductionPlanGraph,
     composition: NativeComposition,
     policy: ProductionPlanner.Policy
 ) -> [ActionCandidate] {
+    let size = graph.size
+    let condition = graph.evaluationCondition
     var result: [ActionCandidate] = []
     let timingByID = Dictionary(uniqueKeysWithValues: node.timings.map { ($0.id, $0) })
     for attention in node.attention {
         guard let timing = timingByID[attention.timingID] else { continue }
         let activationAttention = activationHypothesis(from: attention, action: node.action)
         let responseAttention = responseHypothesis(from: attention, size: size)
-        let rankedArrivalPoses = poses.compactMap { pose -> (CameraState, Double)? in
-            guard factualVisibilityFeasible(action: node.action, pose: pose, size: size, inset: policy.cursorInset) else { return nil }
-            return (pose, attentionPoseCost(attention: activationAttention, pose: pose, size: size, policy: policy))
-        }.sorted { $0.1 < $1.1 }
+        let foregroundOwnershipPose = foregroundOwnershipPose(
+            attention: attention,
+            action: node.action,
+            activation: timing.activation,
+            graph: graph,
+            composition: composition,
+            policy: policy
+        )
+        let foregroundReleases = attention.evidence.contains {
+            [.released, .invalidated, .reset].contains($0.focusTransition)
+        }
+        let rankedArrivalPoses: [(CameraState, Double)]
+        if let foregroundOwnershipPose {
+            rankedArrivalPoses = [(
+                foregroundOwnershipPose,
+                attentionPoseCost(
+                    attention: activationAttention, pose: foregroundOwnershipPose,
+                    size: size, condition: condition, policy: policy
+                )
+            )]
+        } else {
+            rankedArrivalPoses = poses.compactMap { pose -> (CameraState, Double)? in
+                guard factualVisibilityFeasible(action: node.action, pose: pose, size: size, inset: policy.cursorInset) else { return nil }
+                return (pose, attentionPoseCost(attention: activationAttention, pose: pose, size: size, condition: condition, policy: policy))
+            }.sorted { $0.1 < $1.1 }
+        }
         var arrivalPoses = Array(rankedArrivalPoses.prefix(5))
         if let broadest = rankedArrivalPoses.min(by: { $0.0.logScale < $1.0.logScale }),
            !arrivalPoses.contains(where: { poseEqual($0.0, broadest.0) }) {
@@ -530,11 +582,14 @@ private func actionCandidates(
         // compromise at an intermediate zoom simply because the next action
         // happens nearby, leaving a newly navigated page without an
         // establishing view.
+        let hasVisualResponse = attention.evidence.contains {
+            ![.pointer, .visualPointer, .accessibility, .dragPath].contains($0.source)
+        }
         let eligibleResponsePoses = responseAttention.behavior == .overview
             ? poses.filter { abs($0.logScale) <= 0.001 }
             : poses
         let rankedResponsePoses = eligibleResponsePoses.map { pose in
-            (pose, attentionPoseCost(attention: responseAttention, pose: pose, size: size, policy: policy))
+            (pose, attentionPoseCost(attention: responseAttention, pose: pose, size: size, condition: condition, policy: policy))
         }.sorted { $0.1 < $1.1 }
         var responsePoses = Array(rankedResponsePoses.prefix(5))
         if let broadest = rankedResponsePoses.min(by: { $0.0.logScale < $1.0.logScale }),
@@ -562,9 +617,23 @@ private func actionCandidates(
         } else {
             boundaryRole = nil
         }
-        let sceneContextReward = persistentSceneContextValue(attention)
+        let sceneContextReward = persistentSceneContextValue(
+            attention,
+            graph: graph
+        )
         for arrival in arrivalPoses {
-            for response in responsePoses {
+            // A foreground lifecycle is one framing contract, not a separate
+            // click shot followed by a response shot. Likewise, factual-only
+            // evidence has no event capable of authoring a response move.
+            // In both cases the action must hold its arrival pose.
+            let actionResponsePoses: [(CameraState, Double)] =
+                (foregroundOwnershipPose != nil && !foregroundReleases) || !hasVisualResponse
+                ? [(arrival.0, attentionPoseCost(
+                    attention: responseAttention, pose: arrival.0,
+                    size: size, condition: condition, policy: policy
+                ))]
+                : responsePoses
+            for response in actionResponsePoses {
                 let internalTravel = hypot(response.0.x - arrival.0.x, response.0.y - arrival.0.y) / max(1, hypot(size.width, size.height))
                 let internalZoom = abs(response.0.logScale - arrival.0.logScale)
                 let internalCost = poseEqual(arrival.0, response.0) ? 0
@@ -589,6 +658,24 @@ private func actionCandidates(
             return $0.arrivalPose.logScale < $1.arrivalPose.logScale
         }
         return $0.responsePose.logScale < $1.responsePose.logScale
+    }
+    if ProcessInfo.processInfo.environment["COMPUTER_USE_CAPTURE_TRACE_ACTION"]
+        == String(node.action.id) {
+        for group in Dictionary(grouping: ordered, by: { $0.attention.id }).values {
+            guard let best = group.first else { continue }
+            let sources = best.attention.evidence.map(\.source.rawValue).joined(separator: "+")
+            let observationClass = best.attention.observationClass?.rawValue ?? "none"
+            let cost = String(format: "%.4f", best.cost)
+            let arrivalScale = String(format: "%.2f", exp(best.arrivalPose.logScale))
+            let responseScale = String(format: "%.2f", exp(best.responsePose.logScale))
+            print(
+                "native candidate action=\(node.action.id) attention=\(best.attention.id)"
+                + " class=\(observationClass) obs=\(best.attention.observationIDs.sorted())"
+                + " evidence=\(sources) cost=\(cost)"
+                + " arrival=(\(Int(best.arrivalPose.x)),\(Int(best.arrivalPose.y)),\(arrivalScale))"
+                + " response=(\(Int(best.responsePose.x)),\(Int(best.responsePose.y)),\(responseScale))"
+            )
+        }
     }
     // Preserve interpretation diversity before the clip-wide beam. A global
     // cost prefix lets dozens of cheap pose variants for factual-only evidence
@@ -618,10 +705,72 @@ private func actionCandidates(
     }.prefix(112))
 }
 
+/// Condition D evaluates a foreground-support lifecycle as a camera subject
+/// spanning time, not as one more action-local rectangle. Every non-release
+/// action owned by that lifecycle receives the same canonical pose. Factual
+/// pointer/AX evidence remains a hard visibility constraint; if the canonical
+/// subject pose cannot show the action, widen once to their union rather than
+/// creating a second response move.
+private func foregroundOwnershipPose(
+    attention: ProductionPlanGraph.AttentionHypothesis,
+    action: DirectedAction,
+    activation: Double,
+    graph: ProductionPlanGraph,
+    composition: NativeComposition,
+    policy: ProductionPlanner.Policy
+) -> CameraState? {
+    guard graph.evaluationCondition == .dOracleGated,
+          attention.observationClass == .oracleForegroundSupport else { return nil }
+    let owned = graph.lifecycles
+        .filter { graph.supportObservationIDs.contains($0.gainedObservationID) }
+        .filter { lifecycle in
+            lifecycle.contains(activation)
+                || attention.evidence.contains { evidence in
+                    evidence.source == .visualFocus
+                        && evidence.timeRange.overlaps(
+                            lifecycle.gainedAt...(lifecycle.releasedAt ?? graph.sourceDuration)
+                        )
+                        && rectangleOverlap(evidence.bounds, lifecycle.bounds) >= 0.15
+                }
+        }
+        .max { left, right in
+            rectangleOverlap(attention.bounds ?? .null, left.bounds)
+                < rectangleOverlap(attention.bounds ?? .null, right.bounds)
+        }
+    guard let owned else { return nil }
+
+    let canonical = composition.cameraPose(containing: owned.bounds, maximumScale: 1.48)
+    if factualVisibilityFeasible(
+        action: action, pose: canonical, size: graph.size, inset: policy.cursorInset
+    ) {
+        return canonical
+    }
+    let factualBounds = attention.evidence
+        .filter { [.pointer, .visualPointer, .accessibility, .dragPath].contains($0.source) }
+        .map(\.bounds)
+        .reduce(owned.bounds) { $0.union($1) }
+    let widened = composition.cameraPose(containing: factualBounds, maximumScale: 1.48)
+    return factualVisibilityFeasible(
+        action: action, pose: widened, size: graph.size, inset: policy.cursorInset
+    ) ? widened : nil
+}
+
+private func rectangleOverlap(_ left: CGRect, _ right: CGRect) -> Double {
+    guard !left.isNull, !right.isNull else { return 0 }
+    let intersection = left.intersection(right)
+    guard !intersection.isNull else { return 0 }
+    let intersectionArea = intersection.width * intersection.height
+    return Double(intersectionArea / max(1, min(
+        left.width * left.height,
+        right.width * right.height
+    )))
+}
+
 private func persistentSceneContextValue(
-    _ attention: ProductionPlanGraph.AttentionHypothesis
+    _ attention: ProductionPlanGraph.AttentionHypothesis,
+    graph: ProductionPlanGraph
 ) -> Double {
-    attention.evidence.compactMap { evidence -> Double? in
+    let raw = attention.evidence.compactMap { evidence -> Double? in
         guard [.visualResponse, .visualFocus].contains(evidence.source) else { return nil }
         let duration = evidence.timeRange.upperBound - evidence.timeRange.lowerBound
         guard duration >= 0.75 else { return nil }
@@ -633,6 +782,23 @@ private func persistentSceneContextValue(
         let durationValue = 0.8 + min(2.0, duration * 0.35)
         return min(4.5, durationValue * evidence.framingWeight * (0.5 + evidence.persistence) * 1.1)
     }.max() ?? 0
+    let evidenceRange = attention.evidence.map(\.timeRange).reduce(nil as ClosedRange<Double>?) { range, next in
+        guard let range else { return next }
+        return min(range.lowerBound, next.lowerBound)...max(range.upperBound, next.upperBound)
+    }
+    guard let evidenceRange, graph.editorialEvidenceIsOptional(timeRange: evidenceRange) else {
+        return raw
+    }
+    switch attention.observationClass {
+    case .oracleForegroundSupport:
+        return min(graph.evaluationCondition == .dOracleGated ? 3.0 : 1.3, raw)
+    case .foregroundEditorial:
+        return min(graph.evaluationCondition == .dOracleGated ? 0.85 : 1.3, raw)
+    case .motionEditorial:
+        return min(graph.evaluationCondition == .dOracleGated ? 0.30 : 0.55, raw)
+    case .requiredContext, nil:
+        return min(0.55, raw)
+    }
 }
 
 private func activationHypothesis(
@@ -651,6 +817,7 @@ private func activationHypothesis(
         behavior: factual.isEmpty ? nil : factualBehavior(for: action),
         evidence: factual,
         observationIDs: [],
+        observationClass: nil,
         cost: 0
     )
 }
@@ -670,7 +837,8 @@ private func responseHypothesis(
         return .init(
             id: hypothesis.id, actionID: hypothesis.actionID, timingID: hypothesis.timingID,
             bounds: CGRect(origin: .zero, size: size), behavior: .overview,
-            evidence: visual, observationIDs: hypothesis.observationIDs, cost: 0
+            evidence: visual, observationIDs: hypothesis.observationIDs,
+            observationClass: hypothesis.observationClass, cost: 0
         )
     }
     guard !visual.isEmpty else { return hypothesis }
@@ -678,7 +846,8 @@ private func responseHypothesis(
     return .init(
         id: hypothesis.id, actionID: hypothesis.actionID, timingID: hypothesis.timingID,
         bounds: bounds, behavior: hypothesis.behavior, evidence: visual,
-        observationIDs: hypothesis.observationIDs, cost: 0
+        observationIDs: hypothesis.observationIDs,
+        observationClass: hypothesis.observationClass, cost: 0
     )
 }
 
@@ -690,6 +859,7 @@ private func attentionPoseCost(
     attention: ProductionPlanGraph.AttentionHypothesis,
     pose: CameraState,
     size: CGSize,
+    condition: ProductionEvaluationCondition,
     policy: ProductionPlanner.Policy
 ) -> Double {
     guard let bounds = attention.bounds, let behavior = attention.behavior else {
@@ -712,9 +882,11 @@ private func attentionPoseCost(
     case .overview: 1
     }
     let scaleDeviation = abs(Double(exp(pose.logScale)) - desiredScale)
-    return (1 - coverage) * policy.attentionCoverageWeight
+    let framingPriority = condition == .dOracleGated
+            && attention.observationClass == .oracleForegroundSupport ? 3.0 : 1.0
+    return framingPriority * ((1 - coverage) * policy.attentionCoverageWeight
         + Double(centerDistance) * policy.centerWeight
-        + scaleDeviation * policy.editorialScaleWeight
+        + scaleDeviation * policy.editorialScaleWeight)
 }
 
 private func factualVisibilityFeasible(
@@ -958,7 +1130,7 @@ private func attributionReuseCost(
     return 0.75
 }
 
-private func observationExplanationValue(_ observation: VisualMotionObservation) -> Double {
+private func baseObservationExplanationValue(_ observation: VisualMotionObservation) -> Double {
     let area = Double(observation.normalizedBounds.width * observation.normalizedBounds.height)
     let duration = max(0, observation.time - observation.startTime)
     let persistenceGain = min(4.5, duration * 0.28)
@@ -979,10 +1151,33 @@ private func observationExplanationValue(_ observation: VisualMotionObservation)
     }
 }
 
+private func observationExplanationValue(
+    _ observationID: Int,
+    graph: ProductionPlanGraph
+) -> Double {
+    let raw = baseObservationExplanationValue(graph.observations[observationID])
+    guard graph.editorialEvidenceIsOptional(observationID: observationID) else { return raw }
+    switch graph.observationClass(for: observationID) {
+    case .requiredContext:
+        return raw
+    case .oracleForegroundSupport:
+        return min(graph.evaluationCondition == .dOracleGated ? 3.1 : 1.4, raw)
+    case .foregroundEditorial:
+        return min(graph.evaluationCondition == .dOracleGated ? 0.85 : 1.4, raw)
+    case .motionEditorial:
+        return min(graph.evaluationCondition == .dOracleGated ? 0.30 : 0.55, raw)
+    }
+}
+
 private func terminalCost(_ path: Path, graph: ProductionPlanGraph) -> Double {
     let unexplained = graph.observations.indices.filter { !path.explainedObservations.contains($0) }
     return path.cost + unexplained.reduce(0.0) {
-        $0 + observationExplanationValue(graph.observations[$1])
+        let observationClass = graph.observationClass(for: $1)
+        guard !graph.editorialEvidenceIsOptional(observationID: $1)
+                || observationClass == .requiredContext else {
+            return $0
+        }
+        return $0 + observationExplanationValue($1, graph: graph)
     }
 }
 
@@ -995,10 +1190,56 @@ private func projectedRect(_ rect: CGRect, through pose: CameraState, size: CGSi
     )
 }
 
-private func diverseBeam(_ paths: [Path], width: Int) -> [Path] {
+enum RequiredObservationBeamPolicy {
+    /// Returns one best-path index for every distinct hard-obligation
+    /// coverage state. `paths` must already be in objective order.
+    ///
+    /// Required observations are terminal feasibility constraints, so a
+    /// cost-only beam cannot be allowed to erase every path that has made
+    /// progress on them. Reserving coverage states keeps the search global;
+    /// it does not reward or reinterpret any visual observation.
+    static func reservationIndices(
+        coverages: [Set<Int>],
+        required: Set<Int>,
+        width: Int
+    ) -> [Int] {
+        guard width > 0, !coverages.isEmpty, !required.isEmpty else { return [] }
+        var firstByCoverage: [Set<Int>: Int] = [:]
+        for (index, coverage) in coverages.enumerated() {
+            let requiredCoverage = coverage.intersection(required)
+            firstByCoverage[requiredCoverage] = firstByCoverage[requiredCoverage] ?? index
+        }
+        return firstByCoverage.map { (coverage: $0.key, index: $0.value) }
+            .sorted {
+                if $0.coverage.count != $1.coverage.count {
+                    return $0.coverage.count > $1.coverage.count
+                }
+                return $0.index < $1.index
+            }
+            .prefix(width)
+            .map(\.index)
+    }
+}
+
+private func diverseBeam(
+    _ paths: [Path],
+    width: Int,
+    requiredObservations: Set<Int>
+) -> [Path] {
     var retained: [Path] = []
+    let reservationIndices = RequiredObservationBeamPolicy.reservationIndices(
+        coverages: paths.map(\.explainedObservations),
+        required: requiredObservations,
+        width: width
+    )
+    let reserved = Set(reservationIndices)
+    retained.append(contentsOf: reservationIndices.map { paths[$0] })
     var signatures = Set<String>()
-    for path in paths {
+    for path in retained {
+        let coverage = path.explainedObservations.sorted().map(String.init).joined(separator: ",")
+        signatures.insert("\(Int(path.pose.x / 24)):\(Int(path.pose.y / 24)):\(Int(path.pose.logScale * 20)):\(path.decisions.last?.timingID ?? -1):\(path.decisions.last?.attentionID ?? -1):\(coverage)")
+    }
+    for (index, path) in paths.enumerated() where !reserved.contains(index) {
         let coverage = path.explainedObservations.sorted().map(String.init).joined(separator: ",")
         let signature = "\(Int(path.pose.x / 24)):\(Int(path.pose.y / 24)):\(Int(path.pose.logScale * 20)):\(path.decisions.last?.timingID ?? -1):\(path.decisions.last?.attentionID ?? -1):\(coverage)"
         if signatures.insert(signature).inserted {
@@ -1006,7 +1247,8 @@ private func diverseBeam(_ paths: [Path], width: Int) -> [Path] {
             if retained.count >= width { break }
         }
     }
-    return retained
+    retained.sort(by: pathPrecedes)
+    return Array(retained.prefix(width))
 }
 
 private func pathPrecedes(_ left: Path, _ right: Path) -> Bool {

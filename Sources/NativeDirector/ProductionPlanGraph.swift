@@ -33,6 +33,7 @@ public struct ProductionPlanGraph: Sendable {
         public let behavior: CameraBehavior?
         public let evidence: [AttentionEvidence]
         public let observationIDs: Set<Int>
+        public let observationClass: PlannerObservationClass?
         public let cost: Double
     }
 
@@ -60,25 +61,79 @@ public struct ProductionPlanGraph: Sendable {
     public let sourceDuration: Double
     public let actions: [ActionNode]
     public let observations: [VisualMotionObservation]
+    public let actionResponseSlices: [ActionResponseSlice]
     public let motionRanges: [ClosedRange<Double>]
     public let lifecycles: [SurfaceLifecycle]
     public let attributions: [AttributionHypothesis]
+    public let evaluationCondition: ProductionEvaluationCondition
+    public let supportObservationIDs: Set<Int>
+
+    public func observationClass(for observationID: Int) -> PlannerObservationClass {
+        if supportObservationIDs.contains(observationID) { return .oracleForegroundSupport }
+        switch observations[observationID].kind {
+        case .contextTransition: return .requiredContext
+        case .focus: return .foregroundEditorial
+        case .appearance, .transformation, .translation: return .motionEditorial
+        }
+    }
+
+    public func editorialEvidenceIsOptional(observationID: Int) -> Bool {
+        switch evaluationCondition {
+        case .production, .aCurrent, .cOracleCurrent:
+            return false
+        case .bOptionalMotion:
+            return observationClass(for: observationID) != .requiredContext
+        case .dOracleGated:
+            return observationClass(for: observationID) != .requiredContext
+        }
+    }
+
+    public func editorialEvidenceIsOptional(timeRange: ClosedRange<Double>) -> Bool {
+        switch evaluationCondition {
+        case .production, .aCurrent, .cOracleCurrent: return false
+        case .bOptionalMotion, .dOracleGated: return true
+        }
+    }
 
     public static func make(
         from composition: NativeComposition,
         contentRect: CGRect,
         sourceDuration: Double,
         observations: [VisualMotionObservation],
-        motionRanges: [ClosedRange<Double>]
+        episodeVisualEvidence: [EpisodeVisualEvidence] = [],
+        motionRanges: [ClosedRange<Double>],
+        evaluationCondition: ProductionEvaluationCondition = .production,
+        supportObservationIDs: Set<Int> = [],
+        oracleSupportLifecycles: [OracleForegroundSupportLifecycle] = [],
+        freezeResolvedTiming: Bool = false
     ) -> ProductionPlanGraph {
         let orderedObservations = observations.enumerated().sorted {
             $0.element.time == $1.element.time ? $0.offset < $1.offset : $0.element.time < $1.element.time
         }
-        let lifecycles = buildLifecycles(
-            observations: orderedObservations,
+        let actionResponseSlices = ActionResponseSlicer.make(
+            actions: composition.actions,
+            phases: composition.interactionPhases,
+            evidence: episodeVisualEvidence,
+            sourceDuration: sourceDuration
+        )
+        let detectorLifecycles = buildLifecycles(
+            observations: orderedObservations.filter { !supportObservationIDs.contains($0.offset) },
             contentRect: contentRect,
             size: composition.size
         )
+        let oracleLifecycles = oracleSupportLifecycles.enumerated().map { index, lifecycle in
+            SurfaceLifecycle(
+                id: detectorLifecycles.count + index,
+                bounds: mapNormalizedBounds(
+                    lifecycle.bounds, contentRect: contentRect, size: composition.size
+                ),
+                gainedAt: lifecycle.gainedAt,
+                releasedAt: lifecycle.releasedAt,
+                gainedObservationID: lifecycle.gainedObservationID,
+                releasedObservationID: lifecycle.releasedObservationID
+            )
+        }
+        let lifecycles = (detectorLifecycles + oracleLifecycles).sorted { $0.gainedAt < $1.gainedAt }
         let causalOnsets = causalResponseOnsets(
             actions: composition.actions,
             phases: composition.interactionPhases,
@@ -89,9 +144,21 @@ public struct ProductionPlanGraph: Sendable {
             phases: composition.interactionPhases
         )
         let timingByAction = Dictionary(uniqueKeysWithValues: composition.actions.map { action in
-            (action.id, timingHypotheses(
+            let phase = composition.interactionPhases[action.id]
+            if freezeResolvedTiming {
+                return (action.id, [TimingHypothesis(
+                    id: action.id * 1_000,
+                    actionID: action.id,
+                    pointerArrival: phase?.pointerArrival ?? action.time,
+                    activation: phase?.activation ?? action.time,
+                    responseOnset: phase?.responseOnset,
+                    source: "factorial-control:\(phase?.source ?? "timeline")",
+                    cost: 0
+                )])
+            }
+            return (action.id, timingHypotheses(
                 for: action,
-                phase: composition.interactionPhases[action.id],
+                phase: phase,
                 causalResponseOnset: causalOnsets[action.id],
                 activationWindow: activationWindows[action.id]
             ))
@@ -115,6 +182,7 @@ public struct ProductionPlanGraph: Sendable {
                         behavior: factualBehavior(for: action),
                         evidence: factual,
                         observationIDs: [],
+                        observationClass: nil,
                         cost: 0.28
                     ))
                     nextAttentionID += 1
@@ -127,6 +195,7 @@ public struct ProductionPlanGraph: Sendable {
                         behavior: nil,
                         evidence: [],
                         observationIDs: [],
+                        observationClass: nil,
                         cost: 0.65
                     ))
                     nextAttentionID += 1
@@ -134,13 +203,22 @@ public struct ProductionPlanGraph: Sendable {
 
                 for entry in orderedObservations {
                     let observation = entry.element
+                    guard observationIsAvailable(
+                        entry,
+                        at: timing.activation,
+                        condition: evaluationCondition,
+                        supportObservationIDs: supportObservationIDs,
+                        lifecycles: lifecycles,
+                        observations: orderedObservations
+                    ) else { continue }
                     let attribution = attributionHypothesis(
                         observationID: entry.offset,
                         observation: observation,
                         action: action,
                         activation: timing.activation,
                         contentRect: contentRect,
-                        size: composition.size
+                        size: composition.size,
+                        isOracleSupport: supportObservationIDs.contains(entry.offset)
                     )
                     guard attribution.cost < 2.5 else { continue }
                     allAttributions.append(attribution)
@@ -163,6 +241,11 @@ public struct ProductionPlanGraph: Sendable {
                         behavior: behavior(for: observation, action: action),
                         evidence: combined,
                         observationIDs: [entry.offset],
+                        observationClass: plannerObservationClass(
+                            observationID: entry.offset,
+                            observation: observation,
+                            supportObservationIDs: supportObservationIDs
+                        ),
                         cost: attribution.cost + (factual.isEmpty ? 0.15 : 0)
                     ))
                     nextAttentionID += 1
@@ -172,6 +255,19 @@ public struct ProductionPlanGraph: Sendable {
                 // its lifetime may use it even when no transition frame occurs
                 // near the action itself.
                 for lifecycle in lifecycles where lifecycle.contains(timing.activation) {
+                    guard lifecycleIsAvailable(
+                        lifecycle,
+                        at: timing.activation,
+                        condition: evaluationCondition,
+                        supportObservationIDs: supportObservationIDs,
+                        lifecycles: lifecycles,
+                        observations: observations
+                    ) else { continue }
+                    let lifecycleClass = plannerObservationClass(
+                        observationID: lifecycle.gainedObservationID,
+                        observation: observations[lifecycle.gainedObservationID],
+                        supportObservationIDs: supportObservationIDs
+                    )
                     let evidence = AttentionEvidence(
                         source: .visualFocus,
                         timeRange: lifecycle.gainedAt...(lifecycle.releasedAt ?? sourceDuration),
@@ -181,6 +277,10 @@ public struct ProductionPlanGraph: Sendable {
                         persistence: 1.0,
                         causalActionID: action.id
                     )
+                    let claimsForegroundBirth = evaluationCondition == .dOracleGated
+                        && supportObservationIDs.contains(lifecycle.gainedObservationID)
+                        && lifecycle.gainedAt >= timing.activation - 0.35
+                        && lifecycle.gainedAt <= timing.activation + 1.75
                     hypotheses.append(AttentionHypothesis(
                         id: nextAttentionID,
                         actionID: action.id,
@@ -188,10 +288,13 @@ public struct ProductionPlanGraph: Sendable {
                         bounds: unionBounds((factual + [evidence]).map(\.bounds)),
                         behavior: .wideResponse,
                         evidence: factual + [evidence],
-                        // Persistence supports framing but does not explain the
-                        // birth transition. Only a causal attribution candidate
-                        // may claim that observation in the global objective.
-                        observationIDs: [],
+                        // A high-confidence support lifecycle born at a nearby
+                        // factual action is downstream fusion evidence for that
+                        // action. Held lifecycles remain framing-only and cannot
+                        // repeatedly claim their birth transition.
+                        observationIDs: claimsForegroundBirth
+                            ? [lifecycle.gainedObservationID] : [],
+                        observationClass: lifecycleClass,
                         cost: factual.isEmpty ? 0.34 : 0.18
                     ))
                     nextAttentionID += 1
@@ -206,7 +309,15 @@ public struct ProductionPlanGraph: Sendable {
                 for entry in orderedObservations where
                     entry.element.time - entry.element.startTime >= 0.75
                     && entry.element.timeRange.contains(timing.activation)
-                    && SpatialMotion.isFramingEligible(entry.element) {
+                    && SpatialMotion.isFramingEligible(entry.element)
+                    && observationIsAvailable(
+                        entry,
+                        at: timing.activation,
+                        condition: evaluationCondition,
+                        supportObservationIDs: supportObservationIDs,
+                        lifecycles: lifecycles,
+                        observations: orderedObservations
+                    ) {
                     let evidence = visualEvidence(
                         observationID: entry.offset,
                         observation: entry.element,
@@ -226,6 +337,11 @@ public struct ProductionPlanGraph: Sendable {
                         // for framing without letting the action claim the
                         // observation in the global explanation objective.
                         observationIDs: [],
+                        observationClass: plannerObservationClass(
+                            observationID: entry.offset,
+                            observation: entry.element,
+                            supportObservationIDs: supportObservationIDs
+                        ),
                         cost: factual.isEmpty ? 0.16 : 0.10
                     ))
                     nextAttentionID += 1
@@ -268,9 +384,12 @@ public struct ProductionPlanGraph: Sendable {
             sourceDuration: sourceDuration,
             actions: nodes,
             observations: observations,
+            actionResponseSlices: actionResponseSlices,
             motionRanges: motionRanges,
             lifecycles: lifecycles,
-            attributions: allAttributions
+            attributions: allAttributions,
+            evaluationCondition: evaluationCondition,
+            supportObservationIDs: supportObservationIDs
         )
     }
 
@@ -298,6 +417,9 @@ public struct ProductionPlanGraph: Sendable {
                 id: action.id, actionId: action.actionId, kind: action.kind,
                 time: decision.activation, point: action.point, from: action.from, to: action.to,
                 duration: action.duration, semanticBounds: action.semanticBounds,
+                interactionContainerBounds: action.interactionContainerBounds,
+                interactionCandidateBounds: action.interactionCandidateBounds,
+                interactionContainerVerifiedThrough: action.interactionContainerVerifiedThrough,
                 pointProvenance: action.pointProvenance, pointConfidence: action.pointConfidence,
                 cursorAllowed: action.cursorAllowed, emphasis: action.emphasis,
                 holdExtension: action.holdExtension, requiresExactTarget: action.requiresExactTarget,
@@ -318,13 +440,23 @@ public struct ProductionPlanGraph: Sendable {
                   let timing = node.timings.first(where: { $0.id == decision.timingID }),
                   let old = existing[decision.actionID]
             else { continue }
+            // A visual response is useful only while it remains causally
+            // compatible with the selected activation. Ordered action windows
+            // can legitimately reject every response-aligned timing and fall
+            // back to the factual telemetry estimate. In that case retain the
+            // action, but abstain from the now-impossible response association
+            // instead of carrying "effect before cause" into the next fixed
+            // point iteration and the camera audit.
+            let orderedResponseOnset = timing.responseOnset.flatMap {
+                $0 + 0.08 >= timing.activation ? $0 : nil
+            }
             result[decision.actionID] = InteractionPhases(
                 rawEstimate: old.rawEstimate,
                 toolStart: old.toolStart,
                 toolEnd: old.toolEnd,
                 pointerArrival: timing.pointerArrival,
                 activation: timing.activation,
-                responseOnset: timing.responseOnset,
+                responseOnset: orderedResponseOnset,
                 source: timing.source,
                 activityThreshold: old.activityThreshold,
                 prePointerActivityEnd: old.prePointerActivityEnd,
@@ -438,43 +570,33 @@ private func orderedActivationWindows(
     actions: [DirectedAction],
     phases: [Int: InteractionPhases]
 ) -> [Int: ClosedRange<Double>] {
-    // Multiple Computer Use actions can share one node_repl/tool envelope.
-    // Their raw estimates encode the only factual total order available.
-    // Partition that envelope at adjacent midpoints so independent visual
-    // probes cannot assign one response cluster to two actions, collapse two
-    // clicks onto one frame, or reverse their order during fixed-point passes.
-    let ordered = actions.compactMap { action -> (DirectedAction, InteractionPhases)? in
-        phases[action.id].map { (action, $0) }
-    }.sorted { left, right in
-        if abs(left.1.toolStart - right.1.toolStart) > 0.001 {
-            return left.1.toolStart < right.1.toolStart
-        }
-        return left.1.rawEstimate < right.1.rawEstimate
+    // Computer Use log order is factual across tool envelopes, not only
+    // within one shared node_repl call. Visual response timing may refine an
+    // action, but it cannot move that action across either adjacent recorded
+    // action. Partition the entire ordered action sequence at the midpoints
+    // between its factual estimates. This leaves a wide refinement interval
+    // while preventing a response onset from reversing cause and effect.
+    let ordered = actions.sorted {
+        if abs($0.time - $1.time) > 0.000_001 { return $0.time < $1.time }
+        return $0.id < $1.id
     }
-    var groups: [[(DirectedAction, InteractionPhases)]] = []
-    for entry in ordered {
-        if let last = groups.indices.last,
-           let first = groups[last].first,
-           abs(first.1.toolStart - entry.1.toolStart) <= 0.001,
-           abs(first.1.toolEnd - entry.1.toolEnd) <= 0.001 {
-            groups[last].append(entry)
-        } else {
-            groups.append([entry])
-        }
+    let estimates = ordered.map { action in
+        phases[action.id]?.rawEstimate ?? action.time
     }
     var result: [Int: ClosedRange<Double>] = [:]
-    for group in groups where group.count > 1 {
-        let byEstimate = group.sorted { $0.1.rawEstimate < $1.1.rawEstimate }
-        for index in byEstimate.indices {
-            let phase = byEstimate[index].1
-            let lower = index == byEstimate.startIndex
-                ? phase.toolStart
-                : (byEstimate[index - 1].1.rawEstimate + phase.rawEstimate) / 2 + 0.001
-            let upper = index == byEstimate.index(before: byEstimate.endIndex)
-                ? phase.toolEnd
-                : (phase.rawEstimate + byEstimate[index + 1].1.rawEstimate) / 2 - 0.001
-            result[byEstimate[index].0.id] = min(lower, upper)...max(lower, upper)
-        }
+    for index in ordered.indices {
+        guard let phase = phases[ordered[index].id] else { continue }
+        let estimate = estimates[index]
+        let lower = index == ordered.startIndex
+            ? min(phase.toolStart, estimate)
+            : (estimates[index - 1] + estimate) / 2 + 0.001
+        let upper = index == ordered.index(before: ordered.endIndex)
+            ? max(phase.toolEnd, estimate)
+            : (estimate + estimates[index + 1]) / 2 - 0.001
+        // A malformed or duplicate timestamp must not erase the factual raw
+        // estimate. The composition has already imposed a strict log order,
+        // so this is only a numerical guard around coincident boundaries.
+        result[ordered[index].id] = min(lower, estimate)...max(upper, estimate)
     }
     return result
 }
@@ -563,13 +685,15 @@ private func attributionHypothesis(
     action: DirectedAction,
     activation: Double,
     contentRect: CGRect,
-    size: CGSize
+    size: CGSize,
+    isOracleSupport: Bool = false
 ) -> ProductionPlanGraph.AttributionHypothesis {
     // A sustained response is attributed by its onset, while its complete
     // range remains available for reading holds and camera continuity.
     let responseOnset = observation.startTime
     let delta = responseOnset - activation
-    let analysisTolerance = observation.time - observation.startTime >= 0.75 ? 0.35 : 0.08
+    let analysisTolerance = isOracleSupport || observation.time - observation.startTime >= 0.75
+        ? 0.35 : 0.08
     guard responseOnset >= activation - analysisTolerance, delta <= 1.75 else {
         return .init(observationID: observationID, actionID: action.id, cost: 9, temporalDistance: abs(delta), spatialAgreement: 0)
     }
@@ -620,6 +744,70 @@ private func visualEvidence(
         causalActionID: actionID,
         focusTransition: observation.focusTransition
     )
+}
+
+private func plannerObservationClass(
+    observationID: Int,
+    observation: VisualMotionObservation,
+    supportObservationIDs: Set<Int>
+) -> PlannerObservationClass {
+    if supportObservationIDs.contains(observationID) { return .oracleForegroundSupport }
+    switch observation.kind {
+    case .contextTransition: return .requiredContext
+    case .focus: return .foregroundEditorial
+    case .appearance, .transformation, .translation: return .motionEditorial
+    }
+}
+
+/// In condition D, oracle support is a gate rather than another rectangle the
+/// planner must explain. While a support span is active (or being born),
+/// unrelated ordinary motion is excluded from that action's hypothesis set.
+/// With no oracle support nearby, the gate is neutral and preserves recall.
+private func observationIsAvailable(
+    _ entry: (offset: Int, element: VisualMotionObservation),
+    at time: Double,
+    condition: ProductionEvaluationCondition,
+    supportObservationIDs: Set<Int>,
+    lifecycles: [ProductionPlanGraph.SurfaceLifecycle],
+    observations: [(offset: Int, element: VisualMotionObservation)]
+) -> Bool {
+    guard condition.gatesMotionWithOracleSupport,
+          !supportObservationIDs.contains(entry.offset),
+          entry.element.kind != .contextTransition else { return true }
+    let supportBounds = observations.compactMap { candidate -> CGRect? in
+        guard supportObservationIDs.contains(candidate.offset) else { return nil }
+        let lifecycleActive = candidate.element.focusTransition == .gained && lifecycles.contains {
+            $0.gainedObservationID == candidate.offset && $0.contains(time)
+        }
+        let boundaryIsNear = candidate.element.time >= time - 0.35
+            && candidate.element.time <= time + 1.75
+        return lifecycleActive || boundaryIsNear ? candidate.element.normalizedBounds : nil
+    }
+    guard !supportBounds.isEmpty else { return true }
+    return supportBounds.contains { overlap($0, entry.element.normalizedBounds) >= 0.15 }
+}
+
+private func lifecycleIsAvailable(
+    _ lifecycle: ProductionPlanGraph.SurfaceLifecycle,
+    at time: Double,
+    condition: ProductionEvaluationCondition,
+    supportObservationIDs: Set<Int>,
+    lifecycles: [ProductionPlanGraph.SurfaceLifecycle],
+    observations: [VisualMotionObservation]
+) -> Bool {
+    guard condition.gatesMotionWithOracleSupport,
+          !supportObservationIDs.contains(lifecycle.gainedObservationID) else { return true }
+    let activeOracle = lifecycles.filter { lifecycle in
+        guard supportObservationIDs.contains(lifecycle.gainedObservationID) else { return false }
+        let boundaryIDs = [lifecycle.gainedObservationID, lifecycle.releasedObservationID].compactMap { $0 }
+        let boundaryIsNear = boundaryIDs.contains { observationID in
+            let boundary = observations[observationID].time
+            return boundary >= time - 0.35 && boundary <= time + 1.75
+        }
+        return lifecycle.contains(time) || boundaryIsNear
+    }
+    guard !activeOracle.isEmpty else { return true }
+    return activeOracle.contains { overlap($0.bounds, lifecycle.bounds) >= 0.15 }
 }
 
 private func buildLifecycles(
@@ -679,11 +867,15 @@ private func buildLifecycles(
 }
 
 private func mapObservation(_ observation: VisualMotionObservation, contentRect: CGRect, size: CGSize) -> CGRect {
+    mapNormalizedBounds(observation.normalizedBounds, contentRect: contentRect, size: size)
+}
+
+private func mapNormalizedBounds(_ bounds: CGRect, contentRect: CGRect, size: CGSize) -> CGRect {
     CGRect(
-        x: contentRect.minX + observation.normalizedBounds.minX * contentRect.width,
-        y: contentRect.maxY - observation.normalizedBounds.maxY * contentRect.height,
-        width: observation.normalizedBounds.width * contentRect.width,
-        height: observation.normalizedBounds.height * contentRect.height
+        x: contentRect.minX + bounds.minX * contentRect.width,
+        y: contentRect.maxY - bounds.maxY * contentRect.height,
+        width: bounds.width * contentRect.width,
+        height: bounds.height * contentRect.height
     ).intersection(CGRect(origin: .zero, size: size))
 }
 

@@ -6,12 +6,20 @@ public struct DetectedMotionComponent: Sendable {
     public let changedFraction: Double
     public let magnitude: Double
     public let kind: VisualMotionKind
+    public let polarity: StructuralMotionPolarity?
 
-    public init(normalizedBounds: CGRect, changedFraction: Double, magnitude: Double, kind: VisualMotionKind) {
+    public init(
+        normalizedBounds: CGRect,
+        changedFraction: Double,
+        magnitude: Double,
+        kind: VisualMotionKind,
+        polarity: StructuralMotionPolarity? = nil
+    ) {
         self.normalizedBounds = normalizedBounds
         self.changedFraction = changedFraction
         self.magnitude = magnitude
         self.kind = kind
+        self.polarity = polarity
     }
 }
 
@@ -61,7 +69,8 @@ public enum SpatialMotion {
                 normalizedBounds: component.normalizedBounds,
                 changedFraction: component.changedFraction,
                 magnitude: component.magnitude,
-                kind: .transformation
+                kind: .transformation,
+                polarity: component.polarity
             )
         }
     }

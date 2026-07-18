@@ -9,7 +9,7 @@ const positional = argv.filter((value, index) =>
 );
 
 if (positional.length < 2) {
-  console.error("usage: npm run benchmark:pipeline -- <source.mov> <timeline.json> [--mode both|plan|render] [--planner normal|experimental] [--fps 60] [--samples 8] [--analysis-cache warm|cold|off] [--output-scale 1] [--output directory] [--keep-outputs]");
+  console.error("usage: npm run benchmark:pipeline -- <source.mov> <timeline.json> [--mode both|plan|render] [--planner normal|experimental] [--fps 60] [--samples 8] [--analysis-cache warm|cold|off] [--output-scale 1] [--cursor image --cursor-metadata json] [--wallpaper image|--background-color '#RRGGBB'] [--output directory] [--keep-outputs]");
   process.exit(2);
 }
 
@@ -17,7 +17,7 @@ const source = path.resolve(positional[0]);
 const timeline = path.resolve(positional[1]);
 const mode = value("--mode", "both");
 const trials = positiveInteger("--trials", 3);
-const planner = value("--planner", "normal");
+const planner = value("--planner", "experimental");
 const fps = positiveInteger("--fps", 60);
 const samples = positiveInteger("--samples", 8);
 const outputScale = positiveInteger("--output-scale", 1);
@@ -35,7 +35,19 @@ if (!modes.every(candidate => ["plan", "render"].includes(candidate))) {
 if (!["normal", "experimental"].includes(planner)) {
   throw new Error("--planner must be normal or experimental");
 }
-const plannerArgs = planner === "experimental" ? ["--experimental-camera-planner"] : [];
+const plannerArgs = planner === "normal"
+  ? ["--legacy-camera-planner"]
+  : ["--experimental-camera-planner"];
+const renderAssetArgs = [];
+for (const flag of ["--cursor", "--cursor-metadata", "--wallpaper", "--background-color"]) {
+  const asset = value(flag, undefined);
+  if (asset !== undefined) {
+    renderAssetArgs.push(
+      flag,
+      flag === "--background-color" ? asset : path.resolve(asset)
+    );
+  }
+}
 
 await mkdir(outputDirectory, { recursive: true });
 await run("swift", ["build", "-c", "release", "--product", "native-compose"], { inherit: true });
@@ -48,6 +60,7 @@ if (analysisCache === "warm") {
   await run(binary, [
     source, timeline, primeOutput,
     ...plannerArgs,
+    ...renderAssetArgs,
     "--fps", String(fps),
     "--samples", String(samples),
     "--output-scale", String(outputScale),
@@ -67,6 +80,7 @@ for (const currentMode of modes) {
     const composeArgs = [
       source, timeline, output,
       ...plannerArgs,
+      ...renderAssetArgs,
       "--fps", String(fps),
       "--samples", String(samples),
       "--output-scale", String(outputScale),

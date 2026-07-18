@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "coordinateSpace": "source-window-normalized-top-left",
+  "observations": [
+    {
+      "id": "export-menu-visible-support",
+      "lifecycleId": "export-menu",
+      "startTime": 14.881,
+      "endTime": 29.69,
+      "bounds": {"x": 0.5322, "y": 0.1862, "width": 0.1278, "height": 0.214},
+      "confidence": 1,
+      "abstained": false,
+      "note": "Visible menu support only."
+    },
+    {
+      "id": "edit-report-modal-visible-support",
+      "lifecycleId": "edit-report-modal",
+      "startTime": 56.877,
+      "endTime": 103.421,
+      "bounds": {"x": 0.3706, "y": 0.4119, "width": 0.2578, "height": 0.2563},
+      "confidence": 1,
+      "abstained": false,
+      "note": "Visible modal support only; the dimmed page is context."
+    },
+    {
+      "id": "folder-menu-visible-support",
+      "lifecycleId": "folder-menu",
+      "startTime": 65.649,
+      "endTime": 74.299,
+      "bounds": {"x": 0.3845, "y": 0.5989, "width": 0.1053, "height": 0.1421},
+      "confidence": 1,
+      "abstained": false,
+      "note": "Visible nested menu support only; the parent modal has its own lifecycle."
+    },
+    {
+      "id": "notice-abstention",
+      "lifecycleId": "notice",
+      "startTime": 111.942,
+      "endTime": 113.742,
+      "bounds": {"x": 0.8, "y": 0.78, "width": 0.18, "height": 0.12},
+      "confidence": 0,
+      "abstained": true,
+      "note": "The surface was invisible in the capture; do not invent support."
+    }
+  ]
+}

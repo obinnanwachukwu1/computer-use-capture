@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "coordinateSpace": "source-window-normalized-top-left",
+  "beats": [
+    {"id":"initial-shell-control","actionID":0,"baseline":"acceptable","desiredShot":"overview","negative":true},
+    {"id":"export-menu-appears","actionID":1,"baseline":"acceptable","desiredShot":"frame-subject","sampleOutputOffset":0.65,"subject":{"x":0.5322,"y":0.1862,"width":0.1278,"height":0.214},"scale":{"min":1.2,"max":2.15},"centerTolerance":0.25},
+    {"id":"export-menu-selection","actionID":2,"baseline":"acceptable","desiredShot":"frame-subject","subject":{"x":0.5322,"y":0.1862,"width":0.1278,"height":0.214},"scale":{"min":1.2,"max":2.15},"centerTolerance":0.25},
+    {"id":"outside-modal-opener","actionID":3,"baseline":"acceptable","desiredShot":"overview","negative":true},
+    {"id":"cursor-enters-modal","actionID":4,"baseline":"acceptable","desiredShot":"frame-subject","sampleOutputOffset":-0.12,"subject":{"x":0.3706,"y":0.4119,"width":0.2578,"height":0.2563},"scale":{"min":1.2,"max":1.95},"centerTolerance":0.15},
+    {"id":"nested-folder-selection","actionID":5,"baseline":"acceptable","desiredShot":"frame-subject","subject":{"x":0.3845,"y":0.5989,"width":0.1053,"height":0.1421},"scale":{"min":1.35,"max":2.4},"centerTolerance":0.22},
+    {"id":"modal-typing-holds","actionID":6,"baseline":"acceptable","desiredShot":"frame-subject","subject":{"x":0.3706,"y":0.4119,"width":0.2578,"height":0.2563},"scale":{"min":1.2,"max":1.95},"centerTolerance":0.15},
+    {"id":"edit-modal-closes","actionID":7,"baseline":"acceptable","desiredShot":"return","sampleOutputOffset":0.65,"negative":true},
+    {"id":"invisible-notice-abstention","actionID":8,"baseline":"acceptable","desiredShot":"overview","negative":true},
+    {"id":"filter-trigger-plus-reveal","actionID":9,"baseline":"bad","desiredShot":"frame-subject","sampleOutputOffset":0.65,"subject":{"x":0.1499,"y":0.4871,"width":0.4876,"height":0.3077},"scale":{"min":1.2,"max":1.9},"centerTolerance":0.22},
+    {"id":"filter-reveal-dismisses","actionID":10,"baseline":"acceptable","desiredShot":"return","negative":true},
+    {"id":"inline-reflow-closes","actionID":11,"baseline":"acceptable","desiredShot":"overview","negative":true}
+  ]
+}

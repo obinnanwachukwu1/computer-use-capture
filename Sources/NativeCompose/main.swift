@@ -31,9 +31,13 @@ struct Options {
     let waitingTime: Double
     let planOnly: Bool
     let directorDebug: Bool
+    let objectDetectionDebug: Bool
+    let overviewBlameDebug: Bool
     let cursorPath: CursorPathStyle?
     let cursorTiltStrength: Double?
     let cameraPlanner: CameraPlanner
+    let evaluationCondition: ProductionEvaluationCondition
+    let oracleSupport: URL?
     let profile: URL?
     let useAnalysisCache: Bool
     let verifyAssetsOnly: Bool
@@ -41,7 +45,7 @@ struct Options {
     static func parse() throws -> Options {
         let args = Array(CommandLine.arguments.dropFirst())
         guard args.count >= 3 else {
-            throw Failure("usage: native-compose <source.mov> <timeline.json> <output.mp4> [--wallpaper image] [--background-color '#RRGGBB'] [--cursor image --cursor-metadata json] [--experimental-camera-planner] [--output-scale 1|2] [--fps 60] [--samples 8] [--shutter 0.55] [--cursor-path natural|straight] [--cursor-tilt-strength 0...1.5] [--keep-waiting] [--waiting-time milliseconds] [--plan-only] [--director-debug] [--profile [profile.json]] [--no-analysis-cache]")
+            throw Failure("usage: native-compose <source.mov> <timeline.json> <output.mp4> [--wallpaper image] [--background-color '#RRGGBB'] [--cursor image --cursor-metadata json] [--legacy-camera-planner] [--camera-eval-condition a-current|b-optional-motion|c-oracle-current|d-oracle-gated --oracle-support fixture.json] [--output-scale 1|2] [--fps 60] [--samples 8] [--shutter 0.55] [--cursor-path natural|straight] [--cursor-tilt-strength 0...1.5] [--keep-waiting] [--waiting-time milliseconds] [--plan-only] [--director-debug|--object-detection-debug|--overview-blame-debug] [--profile [profile.json]] [--no-analysis-cache]")
         }
         func value(_ flag: String, _ fallback: String) -> String {
             guard let index = args.firstIndex(of: flag), index + 1 < args.count else { return fallback }
@@ -53,7 +57,7 @@ struct Options {
         }
         if args.contains("--camera-planner")
             || ProcessInfo.processInfo.environment["COMPUTER_USE_CAPTURE_CAMERA_PLANNER"] != nil {
-            throw Failure("--camera-planner was removed; normal is the default and the replacement is available only through --experimental-camera-planner")
+            throw Failure("--camera-planner was removed; the global scheduler is the default and the previous planner is available only through --legacy-camera-planner")
         }
         let cursorPath: CursorPathStyle?
         if let rawPath = optionalValue("--cursor-path") {
@@ -65,9 +69,27 @@ struct Options {
             cursorPath = nil
         }
         let cursorTiltStrength = optionalValue("--cursor-tilt-strength").flatMap(Double.init)
-        let cameraPlanner: CameraPlanner = args.contains("--experimental-camera-planner")
+        let legacyCamera = args.contains("--legacy-camera-planner")
+            || ProcessInfo.processInfo.environment["COMPUTER_USE_CAPTURE_LEGACY_CAMERA_PLANNER"] == "1"
+        // Keep accepting the pre-promotion opt-in as a compatibility no-op.
+        // Existing development scripts and saved commands should continue to
+        // select the same global scheduler after it becomes the default.
+        let globalCameraAlias = args.contains("--experimental-camera-planner")
             || ProcessInfo.processInfo.environment["COMPUTER_USE_CAPTURE_EXPERIMENTAL_CAMERA_PLANNER"] == "1"
-            ? .experimental : .normal
+        if legacyCamera && globalCameraAlias {
+            throw Failure("--legacy-camera-planner and --experimental-camera-planner are mutually exclusive")
+        }
+        let cameraPlanner: CameraPlanner = legacyCamera ? .normal : .experimental
+        let evaluationCondition: ProductionEvaluationCondition
+        if let rawCondition = optionalValue("--camera-eval-condition") {
+            guard let parsed = ProductionEvaluationCondition(rawValue: rawCondition),
+                  parsed != .production else {
+                throw Failure("--camera-eval-condition must be a-current, b-optional-motion, c-oracle-current, or d-oracle-gated")
+            }
+            evaluationCondition = parsed
+        } else {
+            evaluationCondition = .production
+        }
         let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
         let output = URL(fileURLWithPath: args[2], relativeTo: cwd).standardizedFileURL
         let wallpaper = optionalValue("--wallpaper").map {
@@ -91,6 +113,8 @@ struct Options {
         } else {
             profile = nil
         }
+        let objectDetectionDebug = args.contains("--object-detection-debug")
+        let overviewBlameDebug = args.contains("--overview-blame-debug")
         return Options(
             source: URL(fileURLWithPath: args[0], relativeTo: cwd).standardizedFileURL,
             timeline: URL(fileURLWithPath: args[1], relativeTo: cwd).standardizedFileURL,
@@ -107,10 +131,18 @@ struct Options {
             reduceWaiting: !args.contains("--keep-waiting"),
             waitingTime: max(0, (Double(value("--waiting-time", "100")) ?? 100) / 1000),
             planOnly: args.contains("--plan-only"),
-            directorDebug: args.contains("--director-debug"),
+            directorDebug: args.contains("--director-debug")
+                || objectDetectionDebug
+                || overviewBlameDebug,
+            objectDetectionDebug: objectDetectionDebug,
+            overviewBlameDebug: overviewBlameDebug,
             cursorPath: cursorPath,
             cursorTiltStrength: cursorTiltStrength,
             cameraPlanner: cameraPlanner,
+            evaluationCondition: evaluationCondition,
+            oracleSupport: optionalValue("--oracle-support").map {
+                URL(fileURLWithPath: $0, relativeTo: cwd).standardizedFileURL
+            },
             profile: profile,
             useAnalysisCache: !args.contains("--no-analysis-cache"),
             verifyAssetsOnly: args.contains("--verify-assets-only")
@@ -202,7 +234,13 @@ func render(_ options: Options) async throws {
     let fallbackActionTimes = Dictionary(uniqueKeysWithValues: timeline.events.enumerated().compactMap { id, event in
         event.time.map { (id, $0) }
     })
+    // The fixed-camera object view consumes canonical observations and the
+    // object graph, both of which are cacheable. Per-action raw motion fields
+    // are only needed by the broader director debugger; collecting them would
+    // force every object-only review to re-run the full analysis pass.
     let collectMotionFields = options.directorDebug
+        && !options.objectDetectionDebug
+        && !options.overviewBlameDebug
     let cachedMotionAnalysis = try MotionAnalysisCache.resolve(
         source: options.source,
         fallbackActionTimes: fallbackActionTimes,
@@ -224,7 +262,29 @@ func render(_ options: Options) async throws {
     }
     let rawMotionAnalysis = cachedMotionAnalysis.analysis
     profiler.complete("motionAnalysis")
-    let motionAnalysis = rawMotionAnalysis
+    let motionAnalysis = MotionAnalyzer.canonicalized(rawMotionAnalysis)
+    var planningObservations = motionAnalysis.observations
+    var supportObservationIDs = Set<Int>()
+    var oracleSupportLifecycles: [OracleForegroundSupportLifecycle] = []
+    if options.evaluationCondition.usesOracleSupport {
+        guard let oracleURL = options.oracleSupport else {
+            throw Failure("\(options.evaluationCondition.rawValue) requires --oracle-support")
+        }
+        let fixture = try JSONDecoder().decode(
+            OracleForegroundSupportFixture.self,
+            from: Data(contentsOf: oracleURL)
+        ).validated(sourceDuration: sourceDuration)
+        let supportEvidence = fixture.plannerEvidence(
+            startingObservationID: planningObservations.count
+        )
+        let support = supportEvidence.observations
+        oracleSupportLifecycles = supportEvidence.lifecycles
+        supportObservationIDs = Set(planningObservations.count..<(planningObservations.count + support.count))
+        planningObservations.append(contentsOf: support)
+        print("native oracle support fixture=\(oracleURL.path) spans=\(fixture.observations.count) endpoints=\(support.count)")
+    } else if options.oracleSupport != nil {
+        throw Failure("--oracle-support is valid only with c-oracle-current or d-oracle-gated")
+    }
     let captureTruth = loadCaptureTruth(
         timeline: timeline,
         timelineURL: options.timeline,
@@ -268,10 +328,27 @@ func render(_ options: Options) async throws {
         motionAnalysis: motionAnalysis,
         captureTruth: captureTruth,
         reduceWaiting: options.reduceWaiting,
-        waitingTime: options.waitingTime
+        waitingTime: options.waitingTime,
+        planningObservations: planningObservations,
+        supportObservationIDs: supportObservationIDs,
+        oracleSupportLifecycles: oracleSupportLifecycles,
+        evaluationCondition: options.evaluationCondition
     )
     profiler.complete("cameraPlanning")
     let composition = planned.composition
+    let actionResponseSlices = ActionResponseSlicer.make(
+        actions: composition.actions,
+        phases: composition.interactionPhases,
+        evidence: motionAnalysis.episodeVisualEvidence,
+        sourceDuration: sourceDuration
+    )
+    let objectBirthAudit = planned.experimental.map {
+        ObjectBirthAudit.make(
+            objects: $0.objects,
+            evidence: motionAnalysis.episodeVisualEvidence,
+            contentRect: contentRect
+        )
+    }
     if let first = composition.retime.first, first.sourceStart > 0.000_001 {
         let sourceStart = String(format: "%.3f", first.sourceStart)
         let firstPointer = composition.firstPointerMovementTime
@@ -279,7 +356,14 @@ func render(_ options: Options) async throws {
         print("native leading-idle-trim source-start=\(sourceStart) first-pointer=\(firstPointer)")
     }
     if options.directorDebug {
-        try writeDirectorDebugReport(composition: composition, motionAnalysis: motionAnalysis, output: options.output)
+        try writeDirectorDebugReport(
+            composition: composition,
+            motionAnalysis: motionAnalysis,
+            planningObservations: planningObservations,
+            supportObservationIDs: supportObservationIDs,
+            experimental: planned.experimental,
+            output: options.output
+        )
     }
     guard composition.outputDuration > 0 else { throw Failure("director produced an empty composition") }
     print("native director actions=\(composition.actions.count) shots=\(composition.shots.count) source=\(String(format: "%.2f", sourceDuration))s output=\(String(format: "%.2f", composition.outputDuration))s waiting=\(options.reduceWaiting ? "cut" : "compressed")")
@@ -289,7 +373,14 @@ func render(_ options: Options) async throws {
     let inferredPointers = pointerActions.filter { ($0.point != nil || $0.to != nil) && !$0.rendersCursor }
     let missingPointers = pointerActions.filter { $0.point == nil && $0.to == nil }
     print("native pointer coverage=\(factualPointers.count + inferredRenderedPointers.count)/\(pointerActions.count) factual=\(factualPointers.count) inferredRendered=\(inferredRenderedPointers.count) inferredOmitted=\(inferredPointers.count) unresolved=\(missingPointers.map(\.actionId))")
-    try writeCompositionReport(composition: composition, output: options.output, state: "planned")
+    try writeCompositionReport(
+        composition: composition,
+        output: options.output,
+        state: "planned",
+        sourceSize: naturalSize,
+        contentRect: contentRect,
+        renderScale: renderScale
+    )
     let attentionSummary = composition.actions.compactMap { action in
         action.attention.map { "\(action.kind)@\(String(format: "%.1f", action.time)):\($0.behavior.rawValue)[\($0.evidence.map(\.source.rawValue).joined(separator: "+"))]" }
     }.joined(separator: " | ")
@@ -326,11 +417,31 @@ func render(_ options: Options) async throws {
             return "a\($0.actionID){timing:\($0.timingSource),obs:\($0.observationIDs.sorted()),scale:\(scale)}"
         }.joined(separator: " | ")
         print("native production decisions=\(summary)")
-        try writeGlobalProductionPlanReport(global, output: options.output)
+        try writeGlobalProductionPlanReport(
+            global,
+            observations: planningObservations,
+            supportObservationIDs: supportObservationIDs,
+            evaluationCondition: options.evaluationCondition,
+            output: options.output
+        )
     }
     if let experimental = planned.experimental {
         print("native experimental subjects=\(experimental.subjects.subjects.count) shots=\(experimental.schedule.shots.count) factualSamples=\(experimental.factualSamples) trackingSamples=\(experimental.trackingSamples)")
+        if let objectBirthAudit {
+            try writeObjectBirthAudit(objectBirthAudit, output: options.output)
+        }
         try writeExperimentalProductionPlanReport(experimental, output: options.output)
+        try writeOverviewBlameReport(
+            experimental,
+            composition: composition,
+            observations: planningObservations,
+            contentRect: contentRect,
+            output: options.output
+        )
+        try writeActionResponseSliceReport(
+            actionResponseSlices,
+            output: options.output
+        )
     }
     profiler.complete("planReporting")
     if options.planOnly {
@@ -342,7 +453,8 @@ func render(_ options: Options) async throws {
         try writeCameraTrajectoryAudit(
             composition: composition, plan: cameraPlan, sampledPlan: sampledPlan,
             frameCount: totalFrames, fps: options.fps, samples: options.samples,
-            motionObservations: motionAnalysis.observations,
+            motionObservations: planningObservations,
+            actionResponseSlices: actionResponseSlices,
             contentRect: contentRect,
             output: options.output
         )
@@ -413,13 +525,23 @@ func render(_ options: Options) async throws {
         composition: composition, plan: cameraPlan, base: baseCamera,
         frameCount: totalFrames, fps: options.fps, samples: options.samples
     )
-    let cameraSamples = sampledPlan.states
+    // Object-detection diagnosis must have a stable coordinate system. Keep
+    // running the real planner and its audit so the overlays can show selected
+    // ownership and target viewports, but remove camera motion only from this
+    // diagnostic render. Production output is completely unchanged.
+    let cameraSamples = options.objectDetectionDebug || options.overviewBlameDebug
+        ? Array(repeating: baseCamera, count: sampledPlan.states.count)
+        : sampledPlan.states
+    if options.objectDetectionDebug || options.overviewBlameDebug {
+        print("native diagnostic camera=fixed-overview planner-still-evaluated=true")
+    }
     try writeCameraTrajectoryAudit(
         composition: composition, plan: cameraPlan, sampledPlan: sampledPlan,
         frameCount: totalFrames,
         fps: options.fps,
         samples: options.samples,
         motionObservations: motionAnalysis.observations,
+        actionResponseSlices: actionResponseSlices,
         contentRect: contentRect,
         output: options.output
     )
@@ -427,6 +549,15 @@ func render(_ options: Options) async throws {
     var nextSample = readerOutput.copyNextSampleBuffer()
     var decodedFrames: [DecodedFrame] = []
     var motionBlurredFrames = 0
+    let debugContext = options.directorDebug ? DirectorDebugContext(
+        rawObservations: motionAnalysis.observations,
+        planningObservations: planningObservations,
+        supportObservationIDs: supportObservationIDs,
+        experimental: planned.experimental,
+        objectBirthAudit: objectBirthAudit,
+        objectDetectionOnly: options.objectDetectionDebug,
+        overviewBlameOnly: options.overviewBlameDebug
+    ) : nil
 
     for frame in 0..<totalFrames {
         let outputTime = Double(frame) / Double(options.fps)
@@ -474,8 +605,7 @@ func render(_ options: Options) async throws {
             sampleSlots: sampleSlots,
             shutter: options.shutter,
             cameras: cameraSamples,
-            debug: options.directorDebug,
-            motionObservations: motionAnalysis.observations
+            debugContext: debugContext
         )
         context.render(image, to: outputBuffer, bounds: CGRect(origin: .zero, size: outputSize), colorSpace: colorSpace)
         guard adaptor.append(outputBuffer, withPresentationTime: CMTime(value: CMTimeValue(frame), timescale: options.fps)) else {
@@ -499,7 +629,16 @@ func render(_ options: Options) async throws {
     try? FileManager.default.removeItem(at: options.output)
     try FileManager.default.moveItem(at: temporaryOutput, to: options.output)
     profiler.complete("writerFinalizationAndMove")
-    try writeCompositionReport(composition: composition, output: options.output, state: "completed")
+    let maximumCameraScale = sampledPlan.states.map { exp($0.logScale) }.max() ?? 1
+    try writeCompositionReport(
+        composition: composition,
+        output: options.output,
+        state: "completed",
+        sourceSize: naturalSize,
+        contentRect: contentRect,
+        renderScale: renderScale,
+        maximumCameraScale: maximumCameraScale
+    )
     emitProgress(phase: "completed", percent: 100)
     print("temporal blur frames=\(motionBlurredFrames)/\(totalFrames)")
     profiler.complete("finalReporting")
@@ -609,13 +748,33 @@ func emitProgress(phase: String, percent: Double) {
     print("COMPUTER_USE_CAPTURE_PROGRESS \(String(decoding: data, as: UTF8.self))")
 }
 
-func writeCompositionReport(composition: NativeComposition, output: URL, state: String) throws {
+func writeCompositionReport(
+    composition: NativeComposition,
+    output: URL,
+    state: String,
+    sourceSize: CGSize,
+    contentRect: CGRect,
+    renderScale: CGFloat,
+    maximumCameraScale: CGFloat? = nil
+) throws {
     let pointerActions = composition.actions.filter { ["click", "drag"].contains($0.kind) }
+    let baseUpscaleX = contentRect.width * renderScale / max(1, sourceSize.width)
+    let baseUpscaleY = contentRect.height * renderScale / max(1, sourceSize.height)
+    let baseUpscale = max(baseUpscaleX, baseUpscaleY)
+    let maximumUpscale = maximumCameraScale.map { baseUpscale * $0 }
     let report: [String: Any] = [
-        "version": 1,
+        "version": 2,
         "state": state,
         "output": output.path,
         "durationSeconds": composition.outputDuration,
+        "sourceRaster": [
+            "width": sourceSize.width,
+            "height": sourceSize.height,
+            "baseUpscaleFactor": baseUpscale,
+            "maximumCameraScale": maximumCameraScale.map { $0 as Any } ?? NSNull(),
+            "maximumUpscaleFactor": maximumUpscale.map { $0 as Any } ?? NSNull(),
+            "baseUpscaled": baseUpscale > 1.000_001
+        ],
         "pointerRendering": [
             "factual": pointerActions.filter { $0.rendersCursor && isFactualCursorTarget($0) }.count,
             "inferredRendered": pointerActions.filter { $0.rendersCursor && !isFactualCursorTarget($0) }.count,
@@ -744,6 +903,16 @@ private struct SampledCameraPlan {
     let emergencyRanges: [ClosedRange<Int>]
 }
 
+struct DirectorDebugContext {
+    let rawObservations: [VisualMotionObservation]
+    let planningObservations: [VisualMotionObservation]
+    let supportObservationIDs: Set<Int>
+    let experimental: ExperimentalProductionPlan?
+    let objectBirthAudit: ObjectBirthAudit?
+    let objectDetectionOnly: Bool
+    let overviewBlameOnly: Bool
+}
+
 private func makeCameraPlan(
     composition: NativeComposition,
     base: CameraState,
@@ -753,13 +922,76 @@ private func makeCameraPlan(
     motionAnalysis: MotionAnalysis,
     captureTruth: CaptureTruthContext,
     reduceWaiting: Bool,
-    waitingTime: Double
+    waitingTime: Double,
+    planningObservations: [VisualMotionObservation],
+    supportObservationIDs: Set<Int>,
+    oracleSupportLifecycles: [OracleForegroundSupportLifecycle],
+    evaluationCondition: ProductionEvaluationCondition
 ) -> (
     composition: NativeComposition,
     camera: CameraPlan,
     global: GlobalProductionPlan?,
     experimental: ExperimentalProductionPlan?
 ) {
+    if evaluationCondition != .production && evaluationCondition != .aCurrent {
+        // A factorial condition may change only attention and camera choice.
+        // Resolve action timing and retiming once under A, then treat that
+        // composition as immutable control data for B/C/D.
+        let control = makeCameraPlan(
+            composition: composition,
+            base: base,
+            planner: .normal,
+            contentRect: contentRect,
+            sourceDuration: sourceDuration,
+            motionAnalysis: motionAnalysis,
+            captureTruth: captureTruth,
+            reduceWaiting: reduceWaiting,
+            waitingTime: waitingTime,
+            planningObservations: motionAnalysis.observations,
+            supportObservationIDs: [],
+            oracleSupportLifecycles: [],
+            evaluationCondition: .aCurrent
+        )
+        guard control.camera.diagnostics.feasible else { return control }
+        let graph = ProductionPlanGraph.make(
+            from: control.composition,
+            contentRect: contentRect,
+            sourceDuration: sourceDuration,
+            observations: planningObservations,
+            episodeVisualEvidence: motionAnalysis.episodeVisualEvidence,
+            motionRanges: motionAnalysis.ranges,
+            evaluationCondition: evaluationCondition,
+            supportObservationIDs: supportObservationIDs,
+            oracleSupportLifecycles: oracleSupportLifecycles,
+            freezeResolvedTiming: true
+        )
+        let global = ProductionPlanner.plan(
+            graph: graph, composition: control.composition, base: base
+        )
+        print("native camera factorial control=frozen-a-current timing=true retime=true")
+        if planner == .experimental {
+            let experimental = ExperimentalCameraPlanner.plan(
+                graph: graph,
+                composition: control.composition,
+                base: base,
+                episodeVisualEvidence: motionAnalysis.episodeVisualEvidence
+            )
+            let experimentalGlobal = GlobalProductionPlan(
+                camera: experimental.camera,
+                decisions: global.decisions,
+                hypothesisCount: global.hypothesisCount,
+                beamWidth: global.beamWidth,
+                searchTrace: global.searchTrace
+            )
+            return (
+                control.composition,
+                experimental.camera,
+                experimentalGlobal,
+                experimental
+            )
+        }
+        return (control.composition, global.camera, global, nil)
+    }
     switch planner {
     case .normal, .experimental:
         var resolvedComposition = composition
@@ -799,8 +1031,12 @@ private func makeCameraPlan(
                 from: resolvedComposition,
                 contentRect: contentRect,
                 sourceDuration: sourceDuration,
-                observations: motionAnalysis.observations,
-                motionRanges: motionAnalysis.ranges
+                observations: planningObservations,
+                episodeVisualEvidence: motionAnalysis.episodeVisualEvidence,
+                motionRanges: motionAnalysis.ranges,
+                evaluationCondition: evaluationCondition,
+                supportObservationIDs: supportObservationIDs,
+                oracleSupportLifecycles: oracleSupportLifecycles
             )
             let pass = ProductionPlanner.plan(
                 graph: graph, composition: resolvedComposition, base: base
@@ -822,6 +1058,9 @@ private func makeCameraPlan(
                 interactionPhases: phases
             )
             protectedObservationIDs = Set(pass.decisions.flatMap(\.observationIDs))
+            let rawProtectedObservationIDs = protectedObservationIDs.filter {
+                $0 < motionAnalysis.observations.count
+            }
             let retime = GlobalRetimePlanner.plan(
                 actions: actions,
                 sourceDuration: sourceDuration,
@@ -831,7 +1070,7 @@ private func makeCameraPlan(
                 ),
                 protectedResponseRanges: GlobalRetimePlanner.protectedResponseRanges(
                     observations: motionAnalysis.observations,
-                    observationIDs: protectedObservationIDs,
+                    observationIDs: Set(rawProtectedObservationIDs),
                     sourceDuration: sourceDuration
                 ),
                 verifiedIdleRanges: captureTruth.verifiedIdleRanges,
@@ -852,8 +1091,12 @@ private func makeCameraPlan(
             from: resolvedComposition,
             contentRect: contentRect,
             sourceDuration: sourceDuration,
-            observations: motionAnalysis.observations,
-            motionRanges: motionAnalysis.ranges
+            observations: planningObservations,
+            episodeVisualEvidence: motionAnalysis.episodeVisualEvidence,
+            motionRanges: motionAnalysis.ranges,
+            evaluationCondition: evaluationCondition,
+            supportObservationIDs: supportObservationIDs,
+            oracleSupportLifecycles: oracleSupportLifecycles
         )
         let global = ProductionPlanner.plan(
             graph: finalGraph, composition: resolvedComposition, base: base
@@ -865,7 +1108,8 @@ private func makeCameraPlan(
         let experimental = ExperimentalCameraPlanner.plan(
             graph: finalGraph,
             composition: resolvedComposition,
-            base: base
+            base: base,
+            episodeVisualEvidence: motionAnalysis.episodeVisualEvidence
         )
         let experimentalGlobal = GlobalProductionPlan(
             camera: experimental.camera,
@@ -946,6 +1190,7 @@ private func writeCameraTrajectoryAudit(
     fps: Int32,
     samples: Int,
     motionObservations: [VisualMotionObservation],
+    actionResponseSlices: [ActionResponseSlice],
     contentRect: CGRect,
     output: URL
 ) throws {
@@ -1098,6 +1343,12 @@ private func writeCameraTrajectoryAudit(
             "actionID": action.id,
             "kind": action.kind,
             "outputTime": sampled.outputTime,
+            "sourceTime": action.time,
+            "camera": [
+                "x": sampled.camera.x,
+                "y": sampled.camera.y,
+                "scale": exp(sampled.camera.logScale)
+            ],
             "scale": exp(sampled.camera.logScale)
         ]
     }
@@ -1160,6 +1411,67 @@ private func writeCameraTrajectoryAudit(
             ]
         ]
     }
+    let responseCoverageAudit = ActionResponseCoverageAudit.evaluate(
+        slices: actionResponseSlices,
+        contentRect: contentRect,
+        outputSize: logicalOutputSize,
+        cameraAtSourceTime: { camera(atSourceTime: $0).camera }
+    )
+    let responseCoverageEntries: [[String: Any]] = responseCoverageAudit.responses.map { response in
+        [
+            "actionID": response.actionID,
+            "evidenceIDs": response.evidenceIDs,
+            "sourceOwnedEvidenceIDs": response.sourceOwnedEvidenceIDs,
+            "sourceStart": response.sourceRange.lowerBound,
+            "sourceEnd": response.sourceRange.upperBound,
+            "worstSourceTime": response.worstSourceTime,
+            "worstOutputTime": composition.outputTime(atSourceTime: response.worstSourceTime),
+            "bounds": [
+                "x": response.normalizedBounds.minX,
+                "y": response.normalizedBounds.minY,
+                "width": response.normalizedBounds.width,
+                "height": response.normalizedBounds.height
+            ],
+            "evidenceCount": response.evidenceCount,
+            "totalChangedFraction": response.totalChangedFraction,
+            "relativeSignal": response.relativeSignal,
+            "maximumConfidence": response.maximumConfidence,
+            "material": response.material,
+            "minimumVisibleFraction": response.minimumVisibleFraction,
+            "minimumSafeVisibleFraction": response.minimumSafeVisibleFraction,
+            "cropped": response.cropped,
+            "reason": response.material && response.cropped
+                ? "material-exclusive-action-response-cropped-by-selected-camera"
+                : response.material
+                    ? "material-exclusive-action-response-covered"
+                    : "insufficient-exclusive-causal-support-for-camera-authority"
+        ]
+    }
+    let responseCoverageReport: [String: Any] = [
+        "version": 1,
+        "policy": [
+            "authority": "exclusive-action-response-negative-crop-diagnostic",
+            "ordinaryMotionCreatesSubjects": false,
+            "changesCamera": false
+        ],
+        "summary": [
+            "responses": responseCoverageAudit.responses.count,
+            "materialResponses": responseCoverageAudit.materialResponses.count,
+            "croppedMaterialResponses": responseCoverageAudit.croppedMaterialResponses.count,
+            "croppedActionIDs": Array(Set(
+                responseCoverageAudit.croppedMaterialResponses.map(\.actionID)
+            )).sorted()
+        ],
+        "responses": responseCoverageEntries
+    ]
+    let responseCoverageData = try JSONSerialization.data(
+        withJSONObject: responseCoverageReport,
+        options: [.prettyPrinted, .sortedKeys]
+    )
+    let responseCoverageURL = output.deletingPathExtension()
+        .appendingPathExtension("response-coverage-blame.json")
+    try responseCoverageData.write(to: responseCoverageURL, options: .atomic)
+    print("native response coverage blame=\(responseCoverageURL.path) cropped=\(responseCoverageAudit.croppedMaterialResponses.count)")
     let pointerActions = composition.actions.filter { ["click", "drag"].contains($0.kind) }
     let factualPointers = pointerActions.filter { $0.rendersCursor && isFactualCursorTarget($0) }
     let inferredRenderedPointers = pointerActions.filter { $0.rendersCursor && !isFactualCursorTarget($0) }
@@ -1170,8 +1482,13 @@ private func writeCameraTrajectoryAudit(
         !$0.rendersCursor && $0.pointProvenance != "visual-inferred"
     }
     let report: [String: Any] = [
-        "version": 3,
+        "version": 4,
         "planner": plan.diagnostics.plannerVersion,
+        "canvas": ["width": logicalOutputSize.width, "height": logicalOutputSize.height],
+        "contentRect": [
+            "x": contentRect.minX, "y": contentRect.minY,
+            "width": contentRect.width, "height": contentRect.height
+        ],
         "planFeasible": plan.diagnostics.feasible,
         "planFailure": plan.diagnostics.failure ?? NSNull(),
         "emergencyCorrections": sampledPlan.emergencyCorrections,
@@ -1190,6 +1507,19 @@ private func writeCameraTrajectoryAudit(
         "moves": moveWindows,
         "tracks": trackWindows,
         "beatScales": beatScales,
+        "trajectory": stride(
+            from: 0,
+            to: frameCameras.count,
+            by: max(1, Int(fps) / 10)
+        ).map { index in
+            let camera = frameCameras[index]
+            return [
+                "outputTime": Double(index) / Double(fps),
+                "x": camera.x,
+                "y": camera.y,
+                "scale": exp(camera.logScale)
+            ]
+        },
         "causalOrdering": [
             "checks": causalOrdering,
             "violations": causalOrdering.filter { ($0["valid"] as? Bool) != true }.count
@@ -1198,6 +1528,7 @@ private func writeCameraTrajectoryAudit(
             "sustainedResponses": sustainedResponses,
             "unframedSustainedResponses": sustainedResponses.filter { ($0["framed"] as? Bool) != true }.count
         ],
+        "actionResponseCoverage": responseCoverageReport,
         "alignment": alignment
     ]
     let data = try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])
@@ -1208,6 +1539,9 @@ private func writeCameraTrajectoryAudit(
 
 private func writeGlobalProductionPlanReport(
     _ plan: GlobalProductionPlan,
+    observations: [VisualMotionObservation],
+    supportObservationIDs: Set<Int>,
+    evaluationCondition: ProductionEvaluationCondition,
     output: URL
 ) throws {
     func camera(_ state: CameraState) -> [String: Any] {
@@ -1225,14 +1559,45 @@ private func writeGlobalProductionPlanReport(
             "activation": decision.activation,
             "timingSource": decision.timingSource,
             "observationIDs": decision.observationIDs.sorted(),
+            "evidenceSources": decision.evidenceSources.map(\.rawValue),
+            "observationClass": decision.observationClass?.rawValue ?? NSNull(),
             "arrivalPose": camera(decision.arrivalPose),
             "responsePose": camera(decision.pose),
             "cumulativeCost": decision.cumulativeCost
         ]
     }
+    let explained = Set(plan.decisions.flatMap(\.observationIDs))
+    let observationReport: [[String: Any]] = observations.indices.map { observationID in
+        let observation = observations[observationID]
+        let observationClass: PlannerObservationClass
+        if supportObservationIDs.contains(observationID) {
+            observationClass = .oracleForegroundSupport
+        } else {
+            observationClass = switch observation.kind {
+            case .contextTransition: .requiredContext
+            case .focus: .foregroundEditorial
+            case .appearance, .transformation, .translation: .motionEditorial
+            }
+        }
+        return [
+            "id": observationID,
+            "class": observationClass.rawValue,
+            "kind": observation.kind.rawValue,
+            "startTime": observation.startTime,
+            "endTime": observation.time,
+            "explained": explained.contains(observationID),
+            "bounds": [
+                "x": observation.normalizedBounds.minX,
+                "y": observation.normalizedBounds.minY,
+                "width": observation.normalizedBounds.width,
+                "height": observation.normalizedBounds.height
+            ]
+        ]
+    }
     var report: [String: Any] = [
-        "version": 1,
+        "version": 2,
         "planner": plan.camera.diagnostics.plannerVersion,
+        "evaluationCondition": evaluationCondition.rawValue,
         "feasible": plan.camera.diagnostics.feasible,
         "hypothesisCount": plan.hypothesisCount,
         "beamWidth": plan.beamWidth,
@@ -1248,6 +1613,7 @@ private func writeGlobalProductionPlanReport(
             ]
         },
         "decisions": decisions,
+        "observations": observationReport,
         "moves": plan.camera.moves.map { move in
             [
                 "label": move.label,
@@ -1288,6 +1654,21 @@ private func writeExperimentalProductionPlanReport(
         "feasible": plan.camera.diagnostics.feasible,
         "factualSamples": plan.factualSamples,
         "trackingSamples": plan.trackingSamples,
+        "responseCoverageConstraints": plan.responseCoverageConstraints.map { constraint in
+            [
+                "actionID": constraint.actionID,
+                "sourceStart": constraint.sourceRange.lowerBound,
+                "sourceEnd": constraint.sourceRange.upperBound,
+                "evidenceIDs": constraint.evidenceIDs,
+                "relativeSignal": constraint.relativeSignal,
+                "bounds": [
+                    "x": constraint.normalizedBounds.minX,
+                    "y": constraint.normalizedBounds.minY,
+                    "width": constraint.normalizedBounds.width,
+                    "height": constraint.normalizedBounds.height
+                ]
+            ] as [String: Any]
+        },
         "subjects": plan.subjects.subjects.map { subject in
             [
                 "id": subject.id,
@@ -1298,9 +1679,41 @@ private func writeExperimentalProductionPlanReport(
                 ],
                 "sourceStart": subject.sourceRange.lowerBound,
                 "sourceEnd": subject.sourceRange.upperBound,
+                "framingEligibleAt": subject.framingEligibleAt ?? NSNull(),
                 "actionIDs": subject.actionIDs,
                 "observationIDs": subject.observationIDs.sorted(),
-                "confidence": subject.confidence
+                "confidence": subject.confidence,
+                "isForegroundSupport": subject.isForegroundSupport,
+                "requiresOverview": subject.requiresOverview,
+                "overviewBlame": subject.overviewBlame.map { blame in
+                    ["actions": blame.actions.map { evidence in
+                        [
+                            "actionID": evidence.actionID,
+                            "broadObservationIDs": evidence.broadObservationIDs.sorted(),
+                            "preexistingBroadObservationIDs": evidence.preexistingBroadObservationIDs.sorted(),
+                            "broadResponseEvidenceIDs": evidence.broadResponseEvidence.map(\.id),
+                            "preexistingResponseEvidenceIDs": evidence.preexistingResponseEvidence.map(\.id),
+                            "crossBoundaryResponseEvidenceIDs": evidence.crossBoundaryResponseEvidence.map(\.id),
+                            "broadWeight": evidence.broadWeight,
+                            "localizedObservationIDs": evidence.localizedObservationIDs.sorted(),
+                            "localizedWeight": evidence.localizedWeight,
+                            "causalBasis": evidence.causalBasis,
+                            "reason": evidence.reason
+                        ] as [String: Any]
+                    }] as [String: Any]
+                } ?? NSNull(),
+                "verifiedReleaseTime": subject.verifiedReleaseTime ?? NSNull(),
+                "framingHypotheses": subject.framingHypotheses.map { hypothesis in
+                    [
+                        "id": hypothesis.id,
+                        "bounds": [
+                            "x": hypothesis.bounds.minX, "y": hypothesis.bounds.minY,
+                            "width": hypothesis.bounds.width, "height": hypothesis.bounds.height
+                        ],
+                        "observationIDs": hypothesis.observationIDs.sorted(),
+                        "evidenceCoverage": hypothesis.evidenceCoverage
+                    ] as [String: Any]
+                }
             ] as [String: Any]
         },
         "transitions": plan.subjects.transitions.map { transition in
@@ -1311,6 +1724,34 @@ private func writeExperimentalProductionPlanReport(
                 "responseSubjectID": transition.responseSubjectID ?? NSNull()
             ] as [String: Any]
         },
+        "objectCandidates": plan.objects.candidates.map { candidate in
+            [
+                "id": candidate.id,
+                "source": candidate.source.rawValue,
+                "bounds": [
+                    "x": candidate.bounds.minX, "y": candidate.bounds.minY,
+                    "width": candidate.bounds.width, "height": candidate.bounds.height
+                ],
+                "sourceStart": candidate.sourceRange.lowerBound,
+                "sourceEnd": candidate.sourceRange.upperBound,
+                "actionIDs": candidate.actionIDs,
+                "observationIDs": candidate.observationIDs.sorted(),
+                "confidence": candidate.confidence,
+                "causalScore": candidate.causalScore
+            ] as [String: Any]
+        },
+        "interactionEpisodes": plan.objects.episodes.map { episode in
+            [
+                "id": episode.id,
+                "actionIDs": episode.actionIDs,
+                "sourceStart": episode.sourceRange.lowerBound,
+                "sourceEnd": episode.sourceRange.upperBound,
+                "triggerCandidateID": episode.triggerCandidateID ?? NSNull(),
+                "candidateIDs": episode.candidateIDs,
+                "selectedResponseCandidateID": episode.selectedResponseCandidateID ?? NSNull()
+            ] as [String: Any]
+        },
+        "shotScheduleObjectiveValue": plan.schedule.objectiveValue,
         "shots": plan.schedule.shots.map { shot in
             [
                 "id": shot.id,
@@ -1344,6 +1785,242 @@ private func writeExperimentalProductionPlanReport(
     print("native experimental plan=\(url.path)")
 }
 
+private func writeOverviewBlameReport(
+    _ plan: ExperimentalProductionPlan,
+    composition: NativeComposition,
+    observations: [VisualMotionObservation],
+    contentRect: CGRect,
+    output: URL
+) throws {
+    func rect(_ value: CGRect) -> [String: Double] {
+        ["x": value.minX, "y": value.minY, "width": value.width, "height": value.height]
+    }
+    func canvasBounds(_ observation: VisualMotionObservation) -> CGRect {
+        CGRect(
+            x: contentRect.minX + observation.normalizedBounds.minX * contentRect.width,
+            y: contentRect.maxY - observation.normalizedBounds.maxY * contentRect.height,
+            width: observation.normalizedBounds.width * contentRect.width,
+            height: observation.normalizedBounds.height * contentRect.height
+        )
+    }
+    func observationReport(ids: Set<Int>, relation: String) -> [[String: Any]] {
+        ids.sorted().compactMap { observationID in
+            guard observations.indices.contains(observationID) else { return nil }
+            let observation = observations[observationID]
+            return [
+                "id": observationID,
+                "relation": relation,
+                "startTime": observation.startTime,
+                "endTime": observation.time,
+                "kind": observation.kind.rawValue,
+                "normalizedBounds": rect(observation.normalizedBounds),
+                "canvasBounds": rect(canvasBounds(observation)),
+                "changedFraction": observation.changedFraction,
+                "magnitude": observation.magnitude,
+                "weight": max(0, observation.changedFraction)
+                    * max(0.25, observation.magnitude)
+            ] as [String: Any]
+        }
+    }
+    func responseEvidenceReport(
+        _ evidence: [SubjectGraph.Subject.OverviewBlame.ResponseEvidence],
+        relation: String
+    ) -> [[String: Any]] {
+        evidence.map { item in
+            let bounds = item.normalizedBounds
+            let canvas = CGRect(
+                x: contentRect.minX + bounds.minX * contentRect.width,
+                y: contentRect.maxY - bounds.maxY * contentRect.height,
+                width: bounds.width * contentRect.width,
+                height: bounds.height * contentRect.height
+            )
+            return [
+                "id": item.id,
+                "relation": relation,
+                "startTime": item.startTime,
+                "endTime": item.endTime,
+                "kind": item.kind.rawValue,
+                "normalizedBounds": rect(bounds),
+                "canvasBounds": rect(canvas),
+                "changedFraction": item.changedFraction,
+                "confidence": item.confidence,
+                "weight": max(0, item.changedFraction) * max(0.25, item.confidence)
+            ] as [String: Any]
+        }
+    }
+
+    let constrained = plan.subjects.subjects.compactMap { subject -> [String: Any]? in
+        guard let blame = subject.overviewBlame else { return nil }
+        return [
+            "subjectID": subject.id,
+            "subjectKind": subject.kind.rawValue,
+            "subjectBounds": rect(subject.bounds),
+            "sourceStart": subject.sourceRange.lowerBound,
+            "sourceEnd": subject.sourceRange.upperBound,
+            "actionEvidence": blame.actions.map { evidence in
+                let action = composition.actions.first { $0.id == evidence.actionID }
+                return [
+                    "actionID": evidence.actionID,
+                    "actionKind": action?.kind ?? "unknown",
+                    "actionSourceTime": action?.time ?? NSNull(),
+                    "actionOutputTime": action.map {
+                        composition.outputTime(atSourceTime: $0.time)
+                    } ?? NSNull(),
+                    "causalBasis": evidence.causalBasis,
+                    "broadWeight": evidence.broadWeight,
+                    "localizedWeight": evidence.localizedWeight,
+                    "reason": evidence.reason,
+                    "broadActionAligned": observationReport(
+                        ids: evidence.broadObservationIDs,
+                        relation: "action-aligned-by-onset"
+                    ),
+                    "broadAlreadyUnderway": observationReport(
+                        ids: evidence.preexistingBroadObservationIDs,
+                        relation: "already-underway-before-activation"
+                    ),
+                    "localizedResponse": observationReport(
+                        ids: evidence.localizedObservationIDs,
+                        relation: "localized-action-response"
+                    ),
+                    "broadExclusiveResponseSlice": responseEvidenceReport(
+                        evidence.broadResponseEvidence,
+                        relation: "exclusive-action-response-slice"
+                    ),
+                    "broadAlreadyUnderwayResponseSlice": responseEvidenceReport(
+                        evidence.preexistingResponseEvidence,
+                        relation: "already-underway-before-activation"
+                    ),
+                    "broadCrossBoundaryResponseSlice": responseEvidenceReport(
+                        evidence.crossBoundaryResponseEvidence,
+                        relation: "crosses-later-factual-activation"
+                    )
+                ] as [String: Any]
+            }
+        ] as [String: Any]
+    }
+    let report: [String: Any] = [
+        "version": 2,
+        "constrainedSubjectCount": constrained.count,
+        "legend": [
+            "yellow": "factual subject bounds",
+            "red": "broad action-aligned response",
+            "green": "localized action response",
+            "blue": "broad motion already underway before activation",
+            "magenta": "broad rolling interval crossing a later factual activation"
+        ],
+        "subjects": constrained
+    ]
+    let data = try JSONSerialization.data(
+        withJSONObject: report,
+        options: [.prettyPrinted, .sortedKeys]
+    )
+    let url = output.deletingPathExtension()
+        .appendingPathExtension("overview-blame.json")
+    try data.write(to: url, options: .atomic)
+    print("native overview blame=\(url.path) constrained=\(constrained.count)")
+}
+
+private func writeActionResponseSliceReport(
+    _ slices: [ActionResponseSlice],
+    output: URL
+) throws {
+    func rect(_ value: CGRect) -> [String: Double] {
+        ["x": value.minX, "y": value.minY, "width": value.width, "height": value.height]
+    }
+    func evidence(_ items: [ActionResponseSlice.Evidence]) -> [[String: Any]] {
+        items.map { item in
+            [
+                "id": item.id,
+                "sourceActionID": item.sourceActionID,
+                "startTime": item.startTime,
+                "endTime": item.endTime,
+                "kind": item.kind.rawValue,
+                "normalizedBounds": rect(item.normalizedBounds),
+                "changedFraction": item.changedFraction,
+                "confidence": item.confidence
+            ] as [String: Any]
+        }
+    }
+    let report: [String: Any] = [
+        "version": 1,
+        "invariant": "only exclusive evidence may constrain one action; preexisting and cross-boundary evidence remain diagnostic",
+        "slices": slices.map { slice in
+            [
+                "actionID": slice.actionID,
+                "activation": slice.activation,
+                "exclusiveEnd": slice.exclusiveEnd,
+                "exclusiveEvidence": evidence(slice.exclusiveEvidence),
+                "preexistingEvidence": evidence(slice.preexistingEvidence),
+                "crossBoundaryEvidence": evidence(slice.crossBoundaryEvidence)
+            ] as [String: Any]
+        }
+    ]
+    let data = try JSONSerialization.data(
+        withJSONObject: report,
+        options: [.prettyPrinted, .sortedKeys]
+    )
+    let url = output.deletingPathExtension()
+        .appendingPathExtension("action-response-slices.json")
+    try data.write(to: url, options: .atomic)
+    let exclusive = slices.reduce(0) { $0 + $1.exclusiveEvidence.count }
+    let crossBoundary = slices.reduce(0) { $0 + $1.crossBoundaryEvidence.count }
+    print(
+        "native action response slices=\(url.path) "
+            + "exclusive=\(exclusive) crossBoundary=\(crossBoundary)"
+    )
+}
+
+private func writeObjectBirthAudit(_ audit: ObjectBirthAudit, output: URL) throws {
+    func rect(_ value: CGRect) -> [String: Double] {
+        ["x": value.minX, "y": value.minY, "width": value.width, "height": value.height]
+    }
+    let births = audit.entries.map { entry -> [String: Any] in
+        [
+            "candidateID": entry.candidateID,
+            "source": entry.source.rawValue,
+            "birthTime": entry.birthTime,
+            "deathTime": entry.deathTime,
+            "bounds": rect(entry.bounds),
+            "normalizedBounds": rect(entry.normalizedBounds),
+            "actionIDs": entry.actionIDs,
+            "status": entry.status.rawValue,
+            "birthLagMilliseconds": entry.birthLagMilliseconds ?? NSNull(),
+            "support": entry.support.map { support in
+                [
+                    "startTime": support.startTime,
+                    "endTime": support.endTime,
+                    "normalizedBounds": rect(support.normalizedBounds),
+                    "overlap": support.overlap,
+                    "changedFraction": support.changedFraction,
+                    "localChangedDensity": support.localChangedDensity,
+                    "confidence": support.confidence
+                ] as [String: Any]
+            }
+        ]
+    }
+    let unsupported = audit.unsupportedVisualBirths
+    let report: [String: Any] = [
+        "version": 1,
+        "invariant": "Every visually sourced object must have spatially overlapping motion evidence at its declared birth time.",
+        "counts": [
+            "total": audit.entries.count,
+            "visual": audit.entries.filter { $0.status != .nonVisualEvidence }.count,
+            "supportedVisual": audit.entries.filter { $0.status == .supported }.count,
+            "unsupportedVisual": unsupported.count,
+            "nonVisual": audit.entries.filter { $0.status == .nonVisualEvidence }.count
+        ],
+        "unsupportedVisualBirths": unsupported.map(\.candidateID),
+        "births": births
+    ]
+    let data = try JSONSerialization.data(
+        withJSONObject: report,
+        options: [.prettyPrinted, .sortedKeys]
+    )
+    let url = output.deletingPathExtension().appendingPathExtension("object-births.json")
+    try data.write(to: url, options: .atomic)
+    print("native object birth audit=\(url.path) unsupported=\(unsupported.count)")
+}
+
 func composeMotionBlurredFrame(
     sourceFrames: [DecodedFrame],
     wallpaper: CIImage,
@@ -1357,8 +2034,7 @@ func composeMotionBlurredFrame(
     sampleSlots: [Int],
     shutter: CGFloat,
     cameras: [CameraState],
-    debug: Bool,
-    motionObservations: [VisualMotionObservation]
+    debugContext: DirectorDebugContext?
 ) -> CIImage {
     var accumulated: CIImage?
     let centerIndex = min(cameras.count - 1, frame * samples + samples / 2)
@@ -1398,14 +2074,16 @@ func composeMotionBlurredFrame(
         } else { accumulated = withCursor }
     }
     var result = accumulated!.cropped(to: CGRect(origin: .zero, size: outputSize))
-    if debug {
+    if let debugContext {
+        let outputTime = (Double(frame) + 0.5) / Double(fps)
         let sourceTime = composition.sourceTime(atOutputTime: (Double(frame) + 0.5) / Double(fps))
         result = directorDebugOverlay(
             over: result,
             composition: composition,
+            outputTime: outputTime,
             sourceTime: sourceTime,
             camera: centerCamera,
-            observations: motionObservations,
+            debug: debugContext,
             contentRect: contentRect
         )
     }
@@ -1415,9 +2093,10 @@ func composeMotionBlurredFrame(
 func directorDebugOverlay(
     over background: CIImage,
     composition: NativeComposition,
+    outputTime: Double,
     sourceTime: Double,
     camera: CameraState,
-    observations: [VisualMotionObservation],
+    debug: DirectorDebugContext,
     contentRect: CGRect
 ) -> CIImage {
     var result = background
@@ -1427,22 +2106,205 @@ func directorDebugOverlay(
         return CGRect(x: min(a.x, b.x), y: min(a.y, b.y), width: abs(b.x - a.x), height: abs(b.y - a.y))
             .scaled(by: renderScale)
     }
-    for observation in observations where
-        abs(observation.time - sourceTime) <= 0.9
-        && SpatialMotion.isFramingEligible(observation) {
-        let bounds = CGRect(
+    func canvasBounds(for observation: VisualMotionObservation) -> CGRect {
+        CGRect(
             x: contentRect.minX + observation.normalizedBounds.minX * contentRect.width,
             y: contentRect.maxY - observation.normalizedBounds.maxY * contentRect.height,
             width: observation.normalizedBounds.width * contentRect.width,
             height: observation.normalizedBounds.height * contentRect.height
         )
+    }
+    func canvasBounds(for normalizedBounds: CGRect) -> CGRect {
+        CGRect(
+            x: contentRect.minX + normalizedBounds.minX * contentRect.width,
+            y: contentRect.maxY - normalizedBounds.maxY * contentRect.height,
+            width: normalizedBounds.width * contentRect.width,
+            height: normalizedBounds.height * contentRect.height
+        )
+    }
+
+    // Overview-blame diagnosis shows only the factual subject and the exact
+    // evidence that vetoed a close-up. Yellow is the subject, red is broad
+    // action-aligned response, green is localized response, and blue is broad
+    // motion already underway before activation. The fixed camera keeps those
+    // geometries in one coordinate system throughout the diagnostic render.
+    if debug.overviewBlameOnly, let experimental = debug.experimental {
+        for subject in experimental.subjects.subjects {
+            guard let blame = subject.overviewBlame else { continue }
+            let actionTimes = blame.actions.compactMap { evidence in
+                composition.actions.first { $0.id == evidence.actionID }?.time
+            }
+            let observationIDs = Set(blame.actions.flatMap {
+                $0.broadObservationIDs
+                    .union($0.localizedObservationIDs)
+                    .union($0.preexistingBroadObservationIDs)
+            })
+            let observations = observationIDs.compactMap {
+                debug.planningObservations.indices.contains($0)
+                    ? debug.planningObservations[$0] : nil
+            }
+            let responseEvidence = blame.actions.flatMap {
+                $0.broadResponseEvidence
+                    + $0.preexistingResponseEvidence
+                    + $0.crossBoundaryResponseEvidence
+            }
+            let visibleStart = min(
+                actionTimes.min() ?? subject.sourceRange.lowerBound,
+                min(
+                    observations.map(\.startTime).min() ?? subject.sourceRange.lowerBound,
+                    responseEvidence.map(\.startTime).min() ?? subject.sourceRange.lowerBound
+                )
+            ) - 0.35
+            let visibleEnd = max(
+                actionTimes.max() ?? subject.sourceRange.upperBound,
+                max(
+                    observations.map(\.time).max() ?? subject.sourceRange.upperBound,
+                    responseEvidence.map(\.endTime).max() ?? subject.sourceRange.upperBound
+                )
+            ) + 0.85
+            guard sourceTime >= visibleStart, sourceTime <= visibleEnd else { continue }
+
+            result = drawOutline(
+                projected(subject.bounds),
+                color: CIColor(red: 1, green: 0.82, blue: 0.08, alpha: 1),
+                width: 7 * renderScale,
+                over: result
+            )
+            for evidence in blame.actions {
+                let layers: [(Set<Int>, CIColor, CGFloat)] = [
+                    (
+                        evidence.preexistingBroadObservationIDs,
+                        CIColor(red: 0.12, green: 0.55, blue: 1, alpha: 0.95),
+                        3
+                    ),
+                    (
+                        evidence.broadObservationIDs,
+                        CIColor(red: 1, green: 0.08, blue: 0.28, alpha: 0.98),
+                        6
+                    ),
+                    (
+                        evidence.localizedObservationIDs,
+                        CIColor(red: 0.2, green: 1, blue: 0.42, alpha: 0.98),
+                        4
+                    )
+                ]
+                for (ids, color, width) in layers {
+                    for observationID in ids where
+                        debug.planningObservations.indices.contains(observationID) {
+                        let observation = debug.planningObservations[observationID]
+                        guard sourceTime >= observation.startTime - 0.35,
+                              sourceTime <= observation.time + 0.85
+                        else { continue }
+                        result = drawOutline(
+                            projected(canvasBounds(for: observation)),
+                            color: color,
+                            width: width * renderScale,
+                            over: result
+                        )
+                    }
+                }
+                let responseLayers: [(
+                    [SubjectGraph.Subject.OverviewBlame.ResponseEvidence], CIColor, CGFloat
+                )] = [
+                    (
+                        evidence.preexistingResponseEvidence,
+                        CIColor(red: 0.12, green: 0.55, blue: 1, alpha: 0.95),
+                        3
+                    ),
+                    (
+                        evidence.crossBoundaryResponseEvidence,
+                        CIColor(red: 1, green: 0.12, blue: 0.82, alpha: 0.96),
+                        4
+                    ),
+                    (
+                        evidence.broadResponseEvidence,
+                        CIColor(red: 1, green: 0.08, blue: 0.28, alpha: 0.98),
+                        6
+                    )
+                ]
+                for (items, color, width) in responseLayers {
+                    for item in items {
+                        guard sourceTime >= item.startTime - 0.35,
+                              sourceTime <= item.endTime + 0.85
+                        else { continue }
+                        result = drawOutline(
+                            projected(canvasBounds(for: item.normalizedBounds)),
+                            color: color,
+                            width: width * renderScale,
+                            over: result
+                        )
+                    }
+                }
+            }
+        }
+        return result.cropped(to: CGRect(origin: .zero, size: outputSize))
+    }
+
+    // The object-only diagnostic is intentionally austere: no raw detector
+    // observations, legacy attention, subject graph, or camera ownership.
+    // Those layers previously reused colors and made unrelated hypotheses look
+    // like one detector. Each box is now visible only during that candidate's
+    // own evidence interval.
+    if debug.objectDetectionOnly, let experimental = debug.experimental {
+        let selectedIDs = experimental.objects.selectedCandidateIDs(at: sourceTime)
+        let birthStatus = Dictionary(uniqueKeysWithValues:
+            (debug.objectBirthAudit?.entries ?? []).map { ($0.candidateID, $0.status) }
+        )
+        for candidate in experimental.objects.activeCandidates(at: sourceTime) {
+            let color: CIColor
+            if birthStatus[candidate.id] == .unsupported {
+                color = CIColor(red: 1, green: 0.08, blue: 0.12, alpha: 0.98)
+            } else {
+                color = switch candidate.source {
+                case .trigger: CIColor(red: 1, green: 0.8, blue: 0.1, alpha: 0.85)
+                case .semanticContainer: CIColor(red: 0.18, green: 0.55, blue: 1, alpha: 0.95)
+                case .visualLifecycle: CIColor(red: 0.35, green: 1, blue: 0.25, alpha: 0.95)
+                case .visualResidual: CIColor(red: 1, green: 0.52, blue: 0.08, alpha: 0.9)
+                }
+            }
+            result = drawOutline(
+                projected(candidate.bounds), color: color,
+                width: (selectedIDs.contains(candidate.id) ? 7 : 3) * renderScale,
+                over: result
+            )
+        }
+        return result
+    }
+
+    // Layer 1: raw detector output. These boxes answer only "what changed?"
+    // and never imply that the camera selected the region.
+    for observation in debug.rawObservations where
+        abs(observation.time - sourceTime) <= 0.9
+        && SpatialMotion.isFramingEligible(observation) {
         let color: CIColor = switch observation.kind {
         case .translation: CIColor(red: 0.1, green: 0.55, blue: 1, alpha: 0.9)
         case .contextTransition: CIColor(red: 0.72, green: 0.32, blue: 1, alpha: 0.95)
         default: CIColor(red: 1, green: 0.18, blue: 0.32, alpha: 0.9)
         }
-        result = drawOutline(projected(bounds), color: color, width: 3 * renderScale, over: result)
+        result = drawOutline(
+            projected(canvasBounds(for: observation)),
+            color: color, width: 2 * renderScale, over: result
+        )
     }
+
+    // Layer 2: externally injected foreground-support endpoints. They are
+    // intentionally separate from raw motion so an oracle cannot masquerade
+    // as detector success in a diagnostic render.
+    for observationID in debug.supportObservationIDs.sorted() where
+        debug.planningObservations.indices.contains(observationID) {
+        let observation = debug.planningObservations[observationID]
+        guard abs(observation.time - sourceTime) <= 0.9 else { continue }
+        result = drawOutline(
+            projected(canvasBounds(for: observation)),
+            color: CIColor(red: 0.95, green: 0.2, blue: 1, alpha: 0.95),
+            width: 4 * renderScale,
+            over: result
+        )
+    }
+
+    // Factual/per-action evidence remains useful, but its legacy aggregate is
+    // no longer colored cyan when the experimental subject scheduler owns the
+    // camera. Cyan is reserved for the actual selected subject below.
     if let action = composition.actions.min(by: { abs($0.time - sourceTime) < abs($1.time - sourceTime) }),
        abs(action.time - sourceTime) <= 2.0,
        let attention = action.attention {
@@ -1459,7 +2321,68 @@ func directorDebugOverlay(
             }
             result = drawOutline(projected(evidence.bounds), color: color, width: 2 * renderScale, over: result)
         }
-        result = drawOutline(projected(attention.bounds), color: CIColor(red: 0.1, green: 0.95, blue: 1, alpha: 1), width: 5 * renderScale, over: result)
+        if debug.experimental == nil {
+            result = drawOutline(
+                projected(attention.bounds),
+                color: CIColor(red: 0.1, green: 0.95, blue: 1, alpha: 1),
+                width: 5 * renderScale, over: result
+            )
+        }
+    }
+
+    if let experimental = debug.experimental {
+        let selectedObjectIDs = experimental.objects.selectedCandidateIDs(at: sourceTime)
+        for candidate in experimental.objects.activeCandidates(at: sourceTime) {
+            let color: CIColor = switch candidate.source {
+            case .trigger: CIColor(red: 1, green: 0.8, blue: 0.1, alpha: 0.75)
+            case .semanticContainer: CIColor(red: 0.18, green: 0.55, blue: 1, alpha: 0.95)
+            case .visualLifecycle: CIColor(red: 0.35, green: 1, blue: 0.25, alpha: 0.95)
+            case .visualResidual: CIColor(red: 1, green: 0.52, blue: 0.08, alpha: 0.85)
+            }
+            result = drawOutline(
+                projected(candidate.bounds), color: color,
+                width: (selectedObjectIDs.contains(candidate.id) ? 7 : 3) * renderScale,
+                over: result
+            )
+        }
+        let activeSubjects = experimental.subjects.subjects.filter {
+            $0.sourceRange.contains(sourceTime)
+        }
+        for subject in activeSubjects {
+            let color = subject.isForegroundSupport
+                ? CIColor(red: 0.95, green: 0.2, blue: 1, alpha: 0.90)
+                : CIColor(red: 1, green: 0.52, blue: 0.08, alpha: 0.85)
+            result = drawOutline(
+                projected(subject.bounds), color: color,
+                width: 3 * renderScale, over: result
+            )
+        }
+
+        // Shot intervals may overlap because they retain semantic ownership.
+        // The most recently started active shot is the scheduler's current
+        // owner and therefore the only region entitled to the thick cyan box.
+        let selectedShot = experimental.schedule.selectedShot(at: outputTime)
+        if let shot = selectedShot,
+           let subjectID = shot.subjectID,
+           let subject = experimental.subjects.subjects.first(where: { $0.id == subjectID }) {
+            result = drawOutline(
+                projected(subject.bounds),
+                color: CIColor(red: 0.05, green: 0.95, blue: 1, alpha: 1),
+                width: 6 * renderScale, over: result
+            )
+            let scale = exp(shot.pose.logScale)
+            let targetViewport = CGRect(
+                x: shot.pose.x - logicalOutputSize.width / (2 * scale),
+                y: shot.pose.y - logicalOutputSize.height / (2 * scale),
+                width: logicalOutputSize.width / scale,
+                height: logicalOutputSize.height / scale
+            )
+            result = drawOutline(
+                projected(targetViewport),
+                color: CIColor(red: 1, green: 1, blue: 1, alpha: 0.9),
+                width: 2 * renderScale, over: result
+            )
+        }
     }
     return result.cropped(to: CGRect(origin: .zero, size: outputSize))
 }
@@ -1478,7 +2401,14 @@ func drawOutline(_ rect: CGRect, color: CIColor, width: CGFloat, over background
     }
 }
 
-func writeDirectorDebugReport(composition: NativeComposition, motionAnalysis: MotionAnalysis, output: URL) throws {
+func writeDirectorDebugReport(
+    composition: NativeComposition,
+    motionAnalysis: MotionAnalysis,
+    planningObservations: [VisualMotionObservation],
+    supportObservationIDs: Set<Int>,
+    experimental: ExperimentalProductionPlan?,
+    output: URL
+) throws {
     func rect(_ value: CGRect) -> [String: Double] {
         ["x": value.minX, "y": value.minY, "width": value.width, "height": value.height]
     }
@@ -1563,7 +2493,23 @@ func writeDirectorDebugReport(composition: NativeComposition, motionAnalysis: Mo
     let report: [String: Any] = [
         "version": 1,
         "output": ["width": Int(outputSize.width), "height": Int(outputSize.height), "duration": composition.outputDuration],
-        "legend": ["attention": "cyan", "appearance": "red", "translation": "blue", "contextTransition": "purple", "pointer": "yellow", "visualPointer": "orange", "accessibility": "green", "visualResponse": "magenta", "visualFocus": "mint"],
+        "legend": [
+            "selectedExperimentalSubject": "thick-cyan",
+            "selectedShotViewport": "white",
+            "verifiedForegroundSupport": "violet",
+            "inferredActiveSubject": "orange",
+            "rawAppearanceOrFocus": "red",
+            "rawTranslation": "blue",
+            "rawContextTransition": "purple",
+            "pointer": "yellow",
+            "visualPointerOrDrag": "orange",
+            "accessibility": "green",
+            "legacyVisualResponse": "magenta",
+            "legacyVisualFocus": "mint",
+            "episodeSemanticContainer": "blue",
+            "episodeVisualLifecycle": "lime",
+            "selectedEpisodeResponse": "thick-source-color"
+        ],
         "actions": actions,
         "shots": composition.shots.map { shot in
             ["id": shot.id, "start": shot.start, "end": shot.end, "baseScale": shot.scale, "actionIDs": shot.actions.map(\.id)] as [String: Any]
@@ -1574,6 +2520,9 @@ func writeDirectorDebugReport(composition: NativeComposition, motionAnalysis: Mo
             "movingFrames": motionAnalysis.motionFrames,
             "components": motionAnalysis.observations.map { observation in
                 var item: [String: Any] = ["time": observation.time, "kind": observation.kind.rawValue, "bounds": rect(observation.normalizedBounds), "changedFraction": observation.changedFraction, "magnitude": observation.magnitude]
+                if let polarity = observation.polarity {
+                    item["polarity"] = polarity.rawValue
+                }
                 if let transition = observation.focusTransition {
                     item["focusTransition"] = transition.rawValue
                 }
@@ -1636,7 +2585,106 @@ func writeDirectorDebugReport(composition: NativeComposition, motionAnalysis: Mo
                 }
                 return item
             }
-        ] as [String: Any]
+        ] as [String: Any],
+        "planningEvidence": planningObservations.indices.map { observationID in
+            let observation = planningObservations[observationID]
+            var item: [String: Any] = [
+                "id": observationID,
+                "source": supportObservationIDs.contains(observationID)
+                    ? "verified-foreground-support" : "raw-detector",
+                "time": observation.time,
+                "startTime": observation.startTime,
+                "kind": observation.kind.rawValue,
+                "bounds": rect(observation.normalizedBounds)
+            ]
+            if let transition = observation.focusTransition {
+                item["focusTransition"] = transition.rawValue
+            }
+            return item
+        },
+        "experimental": experimental.map { plan in
+            [
+                "subjects": plan.subjects.subjects.map { subject in
+                    [
+                        "id": subject.id,
+                        "kind": subject.kind.rawValue,
+                        "sourceStart": subject.sourceRange.lowerBound,
+                        "sourceEnd": subject.sourceRange.upperBound,
+                        "framingEligibleAt": subject.framingEligibleAt ?? NSNull(),
+                        "verifiedReleaseTime": subject.verifiedReleaseTime ?? NSNull(),
+                        "isForegroundSupport": subject.isForegroundSupport,
+                        "requiresOverview": subject.requiresOverview,
+                        "overviewBlame": subject.overviewBlame.map { blame in
+                            ["actions": blame.actions.map { evidence in
+                                [
+                                    "actionID": evidence.actionID,
+                                    "broadObservationIDs": evidence.broadObservationIDs.sorted(),
+                                    "preexistingBroadObservationIDs": evidence.preexistingBroadObservationIDs.sorted(),
+                                    "broadResponseEvidenceIDs": evidence.broadResponseEvidence.map(\.id),
+                                    "preexistingResponseEvidenceIDs": evidence.preexistingResponseEvidence.map(\.id),
+                                    "crossBoundaryResponseEvidenceIDs": evidence.crossBoundaryResponseEvidence.map(\.id),
+                                    "broadWeight": evidence.broadWeight,
+                                    "localizedObservationIDs": evidence.localizedObservationIDs.sorted(),
+                                    "localizedWeight": evidence.localizedWeight,
+                                    "causalBasis": evidence.causalBasis,
+                                    "reason": evidence.reason
+                                ] as [String: Any]
+                            }] as [String: Any]
+                        } ?? NSNull(),
+                        "bounds": rect(subject.bounds),
+                        "actionIDs": subject.actionIDs,
+                        "observationIDs": subject.observationIDs.sorted(),
+                        "framingHypotheses": subject.framingHypotheses.map { hypothesis in
+                            [
+                                "id": hypothesis.id,
+                                "bounds": rect(hypothesis.bounds),
+                                "observationIDs": hypothesis.observationIDs.sorted(),
+                                "evidenceCoverage": hypothesis.evidenceCoverage
+                            ] as [String: Any]
+                        }
+                    ] as [String: Any]
+                },
+                "objectCandidates": plan.objects.candidates.map { candidate in
+                    [
+                        "id": candidate.id,
+                        "source": candidate.source.rawValue,
+                        "sourceStart": candidate.sourceRange.lowerBound,
+                        "sourceEnd": candidate.sourceRange.upperBound,
+                        "bounds": rect(candidate.bounds),
+                        "actionIDs": candidate.actionIDs,
+                        "observationIDs": candidate.observationIDs.sorted(),
+                        "confidence": candidate.confidence,
+                        "causalScore": candidate.causalScore
+                    ] as [String: Any]
+                },
+                "interactionEpisodes": plan.objects.episodes.map { episode in
+                    [
+                        "id": episode.id,
+                        "actionIDs": episode.actionIDs,
+                        "sourceStart": episode.sourceRange.lowerBound,
+                        "sourceEnd": episode.sourceRange.upperBound,
+                        "triggerCandidateID": episode.triggerCandidateID ?? NSNull(),
+                        "candidateIDs": episode.candidateIDs,
+                        "selectedResponseCandidateID": episode.selectedResponseCandidateID ?? NSNull()
+                    ] as [String: Any]
+                },
+                "objectiveValue": plan.schedule.objectiveValue,
+                "shots": plan.schedule.shots.map { shot in
+                    [
+                        "id": shot.id,
+                        "subjectID": shot.subjectID ?? NSNull(),
+                        "intent": shot.intent.rawValue,
+                        "outputStart": shot.interval.lowerBound,
+                        "outputEnd": shot.interval.upperBound,
+                        "pose": [
+                            "x": shot.pose.x,
+                            "y": shot.pose.y,
+                            "scale": exp(shot.pose.logScale)
+                        ]
+                    ] as [String: Any]
+                }
+            ] as [String: Any]
+        } ?? NSNull()
     ]
     let data = try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])
     let url = output.deletingPathExtension().appendingPathExtension("director.json")

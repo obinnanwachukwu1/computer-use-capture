@@ -85,6 +85,8 @@ let captureMode;
 let captureFrames;
 let droppedNonMonotonicFrames = 0;
 let droppedBackpressureFrames = 0;
+let geometryDiscontinuityFrames = 0;
+let geometryMetadataIncompleteFrames = 0;
 let captureReady = false;
 let stopRequested = false;
 let liveTailersPromise;
@@ -138,6 +140,8 @@ readline.createInterface({ input: child.stdout, crlfDelay: Infinity }).on("line"
     captureFrames = Number(line.match(/frames=(\d+)/)?.[1]);
     droppedNonMonotonicFrames = Number(line.match(/droppedNonMonotonicFrames=(\d+)/)?.[1] ?? 0);
     droppedBackpressureFrames = Number(line.match(/droppedBackpressureFrames=(\d+)/)?.[1] ?? 0);
+    geometryDiscontinuityFrames = Number(line.match(/geometryDiscontinuityFrames=(\d+)/)?.[1] ?? 0);
+    geometryMetadataIncompleteFrames = Number(line.match(/geometryMetadataIncompleteFrames=(\d+)/)?.[1] ?? 0);
   }
 });
 
@@ -258,6 +262,14 @@ const warnings = [
     type: "capture_integrity_degraded",
     message: `ScreenCaptureKit writer dropped ${droppedNonMonotonicFrames + droppedBackpressureFrames} complete frame(s); waiting reduction will preserve uncertain intervals`
   }] : []),
+  ...(geometryDiscontinuityFrames > 0 ? [{
+    type: "capture_geometry_discontinuity",
+    message: `ScreenCaptureKit changed active frame geometry or effective resolution in ${geometryDiscontinuityFrames} complete frame(s); inspect the capture provenance before treating the source as quality-stable`
+  }] : []),
+  ...(geometryMetadataIncompleteFrames > 0 ? [{
+    type: "capture_geometry_partially_observable",
+    message: `ScreenCaptureKit omitted content or bounding geometry for ${geometryMetadataIncompleteFrames} complete frame(s); scale discontinuities remain detectable but active-raster placement cannot be fully verified`
+  }] : []),
   ...mappedEvents.filter(event => event.coordinateResolution?.provenance === "unresolved")
     .map(event => ({ type: "coordinate_unresolved", actionId: event.actionId, message: event.coordinateResolution.reason })),
   ...semanticObserverErrors.filter(Boolean).map(message => ({ type: "semantic_observer", message })),
@@ -283,7 +295,9 @@ const timeline = {
     integrity: {
       frames: captureFrames,
       droppedNonMonotonicFrames,
-      droppedBackpressureFrames
+      droppedBackpressureFrames,
+      geometryDiscontinuityFrames,
+      geometryMetadataIncompleteFrames
     }
   },
   introspection: {

@@ -61,6 +61,27 @@ These are hard constraints:
 
 Activation and response are distinct beats. A click may be framed in the current context while the resulting dialog, panel, graph, or page becomes the response pose. Closing a foreground surface can select an overview response without inventing an intermediate shot boundary.
 
+### Action-local response geometry
+
+The analyzer's rolling frame windows deliberately overlap. They preserve short
+changes, but they do not imply that one action owns an entire long-lived motion
+observation. Before broad motion can constrain a subject to overview,
+`ActionResponseSlicer` partitions the cached component stream at the resolved,
+ordered activation boundaries:
+
+- an interval may belong to at most one action;
+- a global interval already underway before activation remains context;
+- an interval crossing a later factual activation remains diagnostic and
+  cannot veto either action's framing;
+- synchronous components inside one exclusive slice may re-aggregate into one
+  distributed response field;
+- a temporal gap ends that field, and no clip-global object identity or
+  retrospective ownership is introduced.
+
+This is negative framing evidence only. It may preserve overview when a real
+action-local response is scene-scale, but it cannot create a camera subject or
+override factual pointer, Accessibility, or required-context evidence.
+
 ## Retiming
 
 `GlobalRetimePlanner` partitions source time once using all globally selected actions and all detected motion ranges. Action intervals remain 1x. Ambient UI motion is retained and may use the configured dead-time rate. Only static intervals are candidates for waiting reduction. It does not progressively edit gaps around one action at a time.
@@ -75,13 +96,17 @@ Plan without rendering:
 npm run compose -- artifacts/my-recording --plan-only
 ```
 
-The normal planner writes:
+The default global scheduler writes:
 
 - `.director.json`: renderer-facing resolved actions, attention, and retime;
 - `.camera-audit.json`: the exact sampled trajectory, factual alignment, and emergency correction count;
 - `.production-plan.json`: selected timing and attention hypothesis IDs, observation ownership, activation/response poses, camera moves, and cumulative costs.
+- `.action-response-slices.json`: every exclusive, preexisting, and
+  cross-boundary rolling motion interval used to audit causal geometry;
+- `.overview-blame.json`: the exact broad response field and localized evidence
+  behind every remaining overview constraint.
 
-Compare the normal and experimental planners on both standard fixtures:
+Compare the legacy and global schedulers on both standard fixtures:
 
 ```sh
 npm run compare:experimental
@@ -93,7 +118,7 @@ Or choose any planner set and fixture bases:
 node scripts/compare-camera-plans.mjs --planners normal,experimental artifacts/native-alignment-rig
 ```
 
-The normal planner must pass the factual alignment gate with zero renderer visibility corrections on fresh web/native captures and the deterministic fixture set. Default promotion does not delete the controls: prefer deleting an old component only after its remaining renderer/data contract has moved to a neutral type.
+The default scheduler must pass the factual alignment gate with zero renderer visibility corrections on fresh web/native captures and the deterministic fixture set. The previous action-local planner remains available through `--legacy-camera-planner`; delete it only after its remaining renderer/data contract has moved to a neutral type and the rollback window has closed.
 
 ## Current boundary
 

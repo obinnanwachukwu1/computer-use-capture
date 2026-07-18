@@ -888,6 +888,92 @@ test("system-owned foreground UI blocks both direct and AX-inferred cursor targe
   assert.equal(indexed.targetResolution.reason, "system-ui-frontmost");
 });
 
+test("direct drags retain their path and gain only a stable containing AX surface", () => {
+  const windowBounds = { x: 100, y: 50, width: 1000, height: 800 };
+  const target = { x: 540, y: 330, width: 12, height: 10 };
+  const stableSurface = { x: 300, y: 150, width: 600, height: 360 };
+  const observation = (observedAt, surface = stableSurface) => ({
+    observedAt, windowBounds, treeComplete: true, focused: true,
+    // The top-level focus summary may lag behind the factual gesture. The
+    // complete tree and direct path must independently agree on the slider.
+    role: "AXLink", title: "Old navigation", bounds: { x: 110, y: 350, width: 80, height: 30 },
+    elements: [
+      { index: 40, role: "AXSlider", title: "20", bounds: target },
+      { index: 41, role: "AXGroup", bounds: { x: 538, y: 329, width: 16, height: 13 } },
+      { index: 42, role: "AXGroup", bounds: surface },
+      { index: 43, role: "AXGroup", bounds: { x: 100, y: 50, width: 1000, height: 800 } }
+    ]
+  });
+  const resolved = resolveAccessibilityTarget({
+    event: {
+      actionId: "drag-slider", action: "drag", timestamp: "2026-07-13T12:00:02.000Z",
+      coordinates: {
+        from: { xNorm: 0.45, yNorm: 0.36 },
+        to: { xNorm: 0.58, yNorm: 0.36 }
+      },
+      coordinateResolution: { provenance: "direct", confidence: 0.99 },
+      timing: {
+        toolCallStartedAt: "2026-07-13T12:00:01.800Z",
+        toolCallEndedAt: "2026-07-13T12:00:02.300Z"
+      }
+    },
+    observations: [
+      observation("2026-07-13T12:00:01.700Z"),
+      observation("2026-07-13T12:00:02.100Z"),
+      // A transient wrapper cannot establish a stable surface by itself.
+      observation("2026-07-13T12:00:02.200Z", { x: 320, y: 160, width: 570, height: 340 }),
+      observation("2026-07-13T12:00:07.000Z")
+    ],
+    captureStartedAt: "2026-07-13T12:00:00.000Z",
+    captureWidth: 1000,
+    captureHeight: 800
+  });
+  assert.deepEqual(resolved.coordinates.from, { xNorm: 0.45, yNorm: 0.36 });
+  assert.equal(resolved.targetResolution.provenance, "direct");
+  assert.equal(resolved.semanticTarget.role, "AXSlider");
+  assert.equal(resolved.semanticTarget.interactionContainer.source, "macos-accessibility-stable-container");
+  assert.equal(resolved.semanticTarget.interactionContainer.bounds.xNorm, 0.2);
+  assert.equal(resolved.semanticTarget.interactionContainer.bounds.widthNorm, 0.6);
+  assert.equal(resolved.semanticTarget.interactionContainer.verifiedThroughOffsetMs, 5000);
+});
+
+test("repeated clicks retain the factual control and expose a stable containing surface", () => {
+  const target = { x: 780, y: 360, width: 30, height: 28 };
+  const surface = { x: 500, y: 180, width: 360, height: 360 };
+  const observation = observedAt => ({
+    observedAt,
+    treeComplete: true,
+    windowBounds: { x: 0, y: 0, width: 1000, height: 800 },
+    elements: [
+      { index: 40, role: "AXButton", title: "Next", bounds: target },
+      { index: 41, role: "AXGroup", bounds: surface },
+      { index: 42, role: "AXGroup", bounds: { x: 20, y: 20, width: 960, height: 740 } }
+    ]
+  });
+  const resolved = resolveAccessibilityTarget({
+    event: {
+      actionId: "click-next", action: "click", timestamp: "2026-07-13T12:00:10.000Z",
+      args: { element_index: 40 },
+      semanticTarget: { role: "AXButton", title: "Next", bounds: target },
+      timing: {
+        toolCallStartedAt: "2026-07-13T12:00:09.700Z",
+        toolCallEndedAt: "2026-07-13T12:00:10.300Z"
+      }
+    },
+    observations: [
+      observation("2026-07-13T12:00:02.000Z"),
+      observation("2026-07-13T12:00:09.900Z")
+    ],
+    captureStartedAt: "2026-07-13T12:00:00.000Z",
+    captureWidth: 1000,
+    captureHeight: 800
+  });
+
+  assert.equal(resolved.semanticTarget.bounds.xNorm, 0.78);
+  assert.equal(resolved.semanticTarget.interactionContainer.bounds.xNorm, 0.5);
+  assert.equal(resolved.semanticTarget.interactionContainer.bounds.widthNorm, 0.36);
+});
+
 test("an unrelated ordinary frontmost app does not invalidate application-filter capture", () => {
   const resolved = resolveAccessibilityTarget({
     event: {

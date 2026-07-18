@@ -202,7 +202,9 @@
                 "type": "string",
                 "enum": [
                   "application",
-                  "window"
+                  "window",
+                  "window-crop",
+                  "display-crop"
                 ],
                 "description": "The ScreenCaptureKit filtering mode selected for this recording."
               }
@@ -963,6 +965,20 @@
                   },
                   "timeline": {
                     "type": "object",
+                    "properties": {
+                      "uri": {
+                        "type": "string",
+                        "format": "uri"
+                      },
+                      "bytes": {
+                        "type": "integer"
+                      }
+                    },
+                    "additionalProperties": false
+                  },
+                  "frameProvenance": {
+                    "type": "object",
+                    "description": "ScreenCaptureKit frame timing and capture provenance sidecar.",
                     "properties": {
                       "uri": {
                         "type": "string",

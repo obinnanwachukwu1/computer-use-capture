@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 @testable import CaptureTruth
 
@@ -27,6 +28,117 @@ private func ledger(
 private let scroll = FactualActionWindow(
     id: 4, actionID: "scroll-4", kind: "scroll", start: 0.10, end: 0.20
 )
+
+private func geometry(
+    bufferWidth: Int = 1200,
+    bufferHeight: Int = 800,
+    content: CaptureFrameRect? = CaptureFrameRect(x: 0, y: 0, width: 1200, height: 800),
+    bounds: CaptureFrameRect? = CaptureFrameRect(x: 100, y: 80, width: 600, height: 400),
+    scaleFactor: Double? = 2,
+    contentScale: Double? = 1
+) -> CaptureFrameGeometry {
+    CaptureFrameGeometry(
+        bufferWidth: bufferWidth,
+        bufferHeight: bufferHeight,
+        contentRect: content,
+        boundingRect: bounds,
+        scaleFactor: scaleFactor,
+        contentScale: contentScale
+    )
+}
+
+@Test func captureGeometryMonitorUsesFirstFrameAsAnImmutableBaseline() {
+    var monitor = CaptureGeometryMonitor()
+    #expect(monitor.inspect(geometry()).isEmpty)
+    #expect(monitor.inspect(geometry()).isEmpty)
+
+    let shrunk = geometry(
+        content: CaptureFrameRect(x: 34, y: 0, width: 1132, height: 754),
+        contentScale: 0.944
+    )
+    let discontinuities = monitor.inspect(shrunk)
+    let kinds = Set(discontinuities.map(\.kind))
+    #expect(kinds.contains(.contentRectX))
+    #expect(kinds.contains(.contentRectWidth))
+    #expect(kinds.contains(.contentRectHeight))
+    #expect(kinds.contains(.contentScale))
+    #expect(kinds.contains(.effectivePixelsPerPointX))
+    #expect(kinds.contains(.effectivePixelsPerPointY))
+
+    // Persistent drift remains visible instead of silently becoming the new normal.
+    #expect(Set(monitor.inspect(shrunk).map(\.kind)) == kinds)
+    #expect(monitor.inspect(geometry()).isEmpty)
+}
+
+@Test func subpixelGeometryJitterDoesNotCreateAQualityDiscontinuity() {
+    var monitor = CaptureGeometryMonitor(baseline: geometry())
+    let jittered = geometry(
+        content: CaptureFrameRect(x: 0.4, y: 0.4, width: 1200.4, height: 799.6),
+        bounds: CaptureFrameRect(x: 100, y: 80, width: 600.2, height: 399.8),
+        scaleFactor: 2.0005,
+        contentScale: 0.9995
+    )
+    #expect(monitor.inspect(jittered).isEmpty)
+}
+
+@Test func missingPreviouslyAvailableGeometryIsAReportedDiscontinuity() {
+    var monitor = CaptureGeometryMonitor(baseline: geometry())
+    let missing = geometry(content: nil, bounds: nil, scaleFactor: nil, contentScale: nil)
+    let kinds = Set(monitor.inspect(missing).map(\.kind))
+    #expect(kinds.contains(.contentRectUnavailable))
+    #expect(kinds.contains(.boundingRectUnavailable))
+    #expect(kinds.contains(.scaleFactorUnavailable))
+    #expect(kinds.contains(.contentScaleUnavailable))
+}
+
+@Test func legacyCaptureLedgerRemainsDecodableAfterGeometryInstrumentation() throws {
+    let legacy = Data("""
+    {
+      "version": 1,
+      "sourceTimebase": "first-complete-frame-presentation-time",
+      "expectedFrameInterval": 0.016666666666666666,
+      "samples": [{
+        "sourceTime": 0,
+        "status": "complete",
+        "dirtyRects": [],
+        "writerDisposition": "appended",
+        "pixelComparison": "unavailable"
+      }],
+      "integrity": {
+        "invalidMetadataSamples": 0,
+        "preRollSamples": 0,
+        "droppedBackpressureFrames": 0,
+        "droppedNonMonotonicFrames": 0,
+        "appendFailedFrames": 0
+      }
+    }
+    """.utf8)
+    let decoded = try JSONDecoder().decode(CaptureFrameLedger.self, from: legacy)
+    #expect(decoded.version == 1)
+    #expect(decoded.samples[0].geometry == nil)
+    #expect(decoded.geometryContract == nil)
+}
+
+@Test func geometryDiscontinuityCannotBeReducedAsWaiting() {
+    let changedGeometry = CapturedFrameSample(
+        sourceTime: 0.05,
+        status: .complete,
+        writerDisposition: .appended,
+        pixelComparison: .identical,
+        geometry: geometry(contentScale: 0.94),
+        geometryDiscontinuities: [CaptureGeometryDiscontinuity(
+            kind: .contentScale, baseline: 1, observed: 0.94
+        )]
+    )
+    let analysis = CaptureTruthAnalyzer.analyze(
+        ledger: ledger([
+            sample(0, .complete, pixels: .unavailable), changedGeometry,
+            sample(0.10, .complete, pixels: .identical)
+        ]),
+        sourceDuration: 0.10
+    )
+    #expect(analysis.intervals.contains { $0.state == .visibleChange })
+}
 
 @Test func consecutiveIdleSamplesProveAnEmptyAction() {
     let analysis = CaptureTruthAnalyzer.analyze(

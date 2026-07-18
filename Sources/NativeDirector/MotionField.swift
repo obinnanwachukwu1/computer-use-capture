@@ -15,6 +15,12 @@ public struct MotionField: Sendable {
     public let backdrop: BackdropMotionContext?
     public let shifts: [MotionShiftComponent]
     public let structural: [StructuralMotionComponent]
+    /// Optional loss-preserving evidence retained for diagnostics and future
+    /// spatiotemporal inference. Unlike `structural` and `shifts`, this grid is
+    /// never formed from component bounding rectangles: it preserves the raw
+    /// per-pixel delta and the final explanation assigned to every analysis
+    /// tile, including unchanged tiles.
+    public let denseEvidence: DenseMotionEvidence?
 
     public init(
         beforeTime: Double,
@@ -24,7 +30,8 @@ public struct MotionField: Sendable {
         photometric: PhotometricMotionContext?,
         backdrop: BackdropMotionContext?,
         shifts: [MotionShiftComponent],
-        structural: [StructuralMotionComponent]
+        structural: [StructuralMotionComponent],
+        denseEvidence: DenseMotionEvidence? = nil
     ) {
         self.beforeTime = beforeTime
         self.afterTime = afterTime
@@ -34,6 +41,7 @@ public struct MotionField: Sendable {
         self.backdrop = backdrop
         self.shifts = shifts
         self.structural = structural
+        self.denseEvidence = denseEvidence
     }
 
     /// Structural evidence eligible to steer attention. When a backdrop
@@ -78,7 +86,8 @@ public struct MotionField: Sendable {
                 normalizedBounds: component.normalizedBounds,
                 changedFraction: component.changedFraction,
                 magnitude: component.energy,
-                kind: .appearance
+                kind: .appearance,
+                polarity: component.polarity
             )
         }
         let translations = shifts.map { component in
@@ -92,6 +101,70 @@ public struct MotionField: Sendable {
         }
         return structure + translations
     }
+}
+
+/// The observational channel assigned to one analysis tile. These values are
+/// descriptive, not editorial: `structural` does not by itself request a zoom,
+/// and `backdrop` is explicitly scene context rather than a subject.
+public enum MotionEvidenceChannel: UInt8, Sendable, Codable {
+    case unchanged
+    case structural
+    case translation
+    case photometric
+    case backdrop
+}
+
+public struct MotionEvidenceTile: Sendable {
+    public let index: Int
+    public let normalizedBounds: CGRect
+    public let channel: MotionEvidenceChannel
+    public let changedFraction: Double
+    public let energy: Double
+    public let meanLuminanceDelta: Double
+    public let beforeDetail: Double
+    public let afterDetail: Double
+    public let confidence: Double
+    public let normalizedVector: CGVector
+
+    public init(
+        index: Int,
+        normalizedBounds: CGRect,
+        channel: MotionEvidenceChannel,
+        changedFraction: Double,
+        energy: Double,
+        meanLuminanceDelta: Double,
+        beforeDetail: Double,
+        afterDetail: Double,
+        confidence: Double,
+        normalizedVector: CGVector
+    ) {
+        self.index = index
+        self.normalizedBounds = normalizedBounds
+        self.channel = channel
+        self.changedFraction = changedFraction
+        self.energy = energy
+        self.meanLuminanceDelta = meanLuminanceDelta
+        self.beforeDetail = beforeDetail
+        self.afterDetail = afterDetail
+        self.confidence = confidence
+        self.normalizedVector = normalizedVector
+    }
+}
+
+/// A dense evidence product for one frame comparison.
+///
+/// `rawDelta` is row-major and contains the maximum absolute RGB-channel delta
+/// for every pixel. `tiles` is also row-major and always has
+/// `tileColumns * tileRows` entries. Component rectangles may be derived from
+/// this representation, but they are never used to construct it.
+public struct DenseMotionEvidence: Sendable {
+    public let pixelWidth: Int
+    public let pixelHeight: Int
+    public let tileSize: Int
+    public let tileColumns: Int
+    public let tileRows: Int
+    public let rawDelta: [UInt8]
+    public let tiles: [MotionEvidenceTile]
 }
 
 public enum PhotometricDirection: String, Sendable, Codable {
@@ -173,6 +246,7 @@ public struct MotionFieldConfiguration: Sendable {
     public var photometricExpansionResidualThreshold: Double
     public var backdropResidualThreshold: Double
     public var backdropMinimumExplainedChange: Double
+    public var retainDenseEvidence: Bool
 
     public init(
         channelThreshold: Int = 20,
@@ -190,7 +264,8 @@ public struct MotionFieldConfiguration: Sendable {
         photometricSeedCoverage: Double = 0.04,
         photometricExpansionResidualThreshold: Double = 16,
         backdropResidualThreshold: Double = 15,
-        backdropMinimumExplainedChange: Double = 0.25
+        backdropMinimumExplainedChange: Double = 0.25,
+        retainDenseEvidence: Bool = false
     ) {
         self.channelThreshold = channelThreshold
         self.minimumChangedPixelsPerTile = minimumChangedPixelsPerTile
@@ -208,6 +283,7 @@ public struct MotionFieldConfiguration: Sendable {
         self.photometricExpansionResidualThreshold = photometricExpansionResidualThreshold
         self.backdropResidualThreshold = backdropResidualThreshold
         self.backdropMinimumExplainedChange = backdropMinimumExplainedChange
+        self.retainDenseEvidence = retainDenseEvidence
     }
 
     /// Returns a tile size with the same normalized width as the reference
@@ -257,6 +333,9 @@ public extension SpatialMotion {
         let tileSize = max(2, configuration.tileSize)
         let columns = Int(ceil(Double(width) / Double(tileSize)))
         let rows = Int(ceil(Double(height) / Double(tileSize)))
+        let rawDelta = configuration.retainDenseEvidence
+            ? perPixelDelta(previous: previous, current: current, width: width, height: height)
+            : nil
         var tiles: [ExplainedTile] = []
         tiles.reserveCapacity(columns * rows)
 
@@ -404,6 +483,18 @@ public extension SpatialMotion {
                 tileSize: tileSize
             )
         }
+        let denseEvidence = rawDelta.map {
+            makeDenseMotionEvidence(
+                rawDelta: $0,
+                tiles: tiles,
+                width: width,
+                height: height,
+                tileSize: tileSize,
+                columns: columns,
+                rows: rows,
+                configuration: configuration
+            )
+        }
         return MotionField(
             beforeTime: beforeTime,
             afterTime: afterTime,
@@ -412,9 +503,112 @@ public extension SpatialMotion {
             photometric: photometric,
             backdrop: backdrop,
             shifts: shifts,
-            structural: structural
+            structural: structural,
+            denseEvidence: denseEvidence
         )
     }
+}
+
+private func perPixelDelta(
+    previous: [UInt8],
+    current: [UInt8],
+    width: Int,
+    height: Int
+) -> [UInt8] {
+    var result = [UInt8](repeating: 0, count: width * height)
+    for pixel in 0..<(width * height) {
+        let offset = pixel * 4
+        let red = abs(Int(current[offset]) - Int(previous[offset]))
+        let green = abs(Int(current[offset + 1]) - Int(previous[offset + 1]))
+        let blue = abs(Int(current[offset + 2]) - Int(previous[offset + 2]))
+        result[pixel] = UInt8(max(red, max(green, blue)))
+    }
+    return result
+}
+
+private func makeDenseMotionEvidence(
+    rawDelta: [UInt8],
+    tiles changedTiles: [ExplainedTile],
+    width: Int,
+    height: Int,
+    tileSize: Int,
+    columns: Int,
+    rows: Int,
+    configuration: MotionFieldConfiguration
+) -> DenseMotionEvidence {
+    let changedByIndex = Dictionary(uniqueKeysWithValues: changedTiles.map { ($0.index, $0) })
+    let tiles = (0..<(columns * rows)).map { index -> MotionEvidenceTile in
+        let tileX = index % columns
+        let tileY = index / columns
+        let rect = PixelRect(
+            minX: tileX * tileSize,
+            minY: tileY * tileSize,
+            maxX: min(width, (tileX + 1) * tileSize),
+            maxY: min(height, (tileY + 1) * tileSize)
+        )
+        let bounds = CGRect(
+            x: CGFloat(rect.minX) / CGFloat(width),
+            y: CGFloat(rect.minY) / CGFloat(height),
+            width: CGFloat(rect.width) / CGFloat(width),
+            height: CGFloat(rect.height) / CGFloat(height)
+        )
+        guard let tile = changedByIndex[index] else {
+            return MotionEvidenceTile(
+                index: index,
+                normalizedBounds: bounds,
+                channel: .unchanged,
+                changedFraction: 0,
+                energy: 0,
+                meanLuminanceDelta: 0,
+                beforeDetail: 0,
+                afterDetail: 0,
+                confidence: 1,
+                normalizedVector: .zero
+            )
+        }
+        let channel: MotionEvidenceChannel
+        let confidence: Double
+        let vector: CGVector
+        switch tile.explanation {
+        case .structural:
+            channel = .structural
+            confidence = min(1, tile.energy / 80)
+            vector = .zero
+        case let .shift(dx, dy, shiftConfidence):
+            channel = .translation
+            confidence = shiftConfidence
+            vector = CGVector(dx: Double(dx) / Double(width), dy: Double(dy) / Double(height))
+        case let .photometric(_, _, residual):
+            channel = .photometric
+            confidence = max(0, 1 - residual / max(0.001, configuration.photometricExpansionResidualThreshold))
+            vector = .zero
+        case let .backdrop(residual):
+            channel = .backdrop
+            confidence = max(0, 1 - residual / max(0.001, configuration.backdropResidualThreshold))
+            vector = .zero
+        }
+        return MotionEvidenceTile(
+            index: index,
+            normalizedBounds: bounds,
+            channel: channel,
+            changedFraction: Double(tile.changedPixels) / Double(max(1, rect.area)),
+            energy: min(1, tile.energy / 80),
+            meanLuminanceDelta: tile.meanDelta,
+            beforeDetail: tile.beforeDetail,
+            afterDetail: tile.afterDetail,
+            confidence: confidence,
+            normalizedVector: vector
+        )
+    }
+    return DenseMotionEvidence(
+        pixelWidth: width,
+        pixelHeight: height,
+        tileSize: tileSize,
+        tileColumns: columns,
+        tileRows: rows,
+        rawDelta: rawDelta,
+        tiles: tiles
+    )
 }
 
 /// Registers the textured viewport as a whole over large vertical distances.
@@ -1009,7 +1203,7 @@ private func backdropDirection(
 private func indexComponents(_ indices: Set<Int>, columns: Int) -> [[Int]] {
     var remaining = indices
     var result: [[Int]] = []
-    while let seed = remaining.first {
+    while let seed = remaining.min() {
         remaining.remove(seed)
         var queue = [seed], cursor = 0, component: [Int] = []
         while cursor < queue.count {

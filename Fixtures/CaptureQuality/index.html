@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Capture Quality Fixture</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body { margin: 0; min-height: 100%; background: #f4f5f7; color: #111827; }
+    body { font: 14px/1.35 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    main { width: min(1180px, calc(100vw - 64px)); margin: 32px auto; }
+    header { display: flex; align-items: end; justify-content: space-between; margin-bottom: 24px; }
+    h1 { margin: 0; font-size: 28px; letter-spacing: -.025em; }
+    .subtitle { margin: 5px 0 0; color: #667085; }
+    .status { padding: 7px 10px; border: 1px solid #d0d5dd; border-radius: 999px; background: white; }
+    .grid { display: grid; grid-template-columns: 1.2fr .8fr; gap: 18px; }
+    .card { background: white; border: 1px solid #d7dbe2; border-radius: 14px; box-shadow: 0 1px 2px #1018280a; }
+    .card-title { padding: 16px 18px; border-bottom: 1px solid #e4e7ec; font-weight: 650; }
+    .card-body { padding: 18px; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th, td { padding: 8px 9px; text-align: left; border-bottom: 1px solid #eaecf0; }
+    th { color: #475467; background: #f9fafb; font-weight: 600; }
+    .red { color: #c11574; } .blue { color: #175cd3; } .green { color: #027a48; }
+    .controls { display: grid; gap: 13px; }
+    label { display: grid; gap: 6px; color: #344054; font-size: 12px; font-weight: 600; }
+    input, select, button { font: inherit; }
+    input, select { width: 100%; padding: 9px 10px; border: 1px solid #cfd4dc; border-radius: 8px; background: white; }
+    button { padding: 9px 12px; border: 0; border-radius: 8px; color: white; background: #155eef; font-weight: 650; }
+    .targets { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 16px; }
+    .target { height: 52px; border: 1px solid #d0d5dd; border-radius: 8px; background: repeating-linear-gradient(90deg, #fff 0 1px, #f2f4f7 1px 2px); }
+    .one-pixel { height: 38px; margin-top: 16px; border: 1px solid #000; background: repeating-linear-gradient(90deg, #000 0 1px, #fff 1px 2px); }
+    .moving { position: relative; overflow: hidden; height: 96px; margin-top: 18px; border-radius: 10px; background: #f2f4f7; }
+    .moving::before { content: "Encoded motion edge"; position: absolute; inset: 20px auto 20px 14px; display: grid; place-items: center; width: 180px; color: white; border-radius: 8px; background: #7f56d9; animation: travel 4s cubic-bezier(.4,0,.2,1) infinite alternate; }
+    @keyframes travel { to { transform: translateX(360px); background: #039855; } }
+    body.static .moving::before { animation: none; }
+    .fine { margin-top: 12px; font: 11px/1.25 ui-monospace, SFMono-Regular, Menlo, monospace; color: #101828; letter-spacing: .02em; }
+    .gradient { height: 32px; margin-top: 12px; border-radius: 6px; background: linear-gradient(90deg, #101828, #155eef, #f04438, #fef0c7); }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>Capture quality reference</h1>
+        <p class="subtitle">Stable text, chroma edges, one-pixel detail, and deterministic motion.</p>
+      </div>
+      <div class="status">60 fps reference · phase <span id="phase">0</span></div>
+    </header>
+    <section class="grid">
+      <article class="card">
+        <div class="card-title">High-frequency interface content</div>
+        <div class="card-body">
+          <table>
+            <thead><tr><th>Metric</th><th>Current</th><th>Change</th><th>Owner</th></tr></thead>
+            <tbody>
+              <tr><td>Activation rate</td><td>18.42%</td><td class="green">+2.31%</td><td>A. Rivera</td></tr>
+              <tr><td>Median latency</td><td>142 ms</td><td class="blue">−18 ms</td><td>M. Chen</td></tr>
+              <tr><td>Failed requests</td><td>0.031%</td><td class="red">+0.004%</td><td>S. Patel</td></tr>
+              <tr><td>Weekly retention</td><td>67.8%</td><td class="green">+4.9%</td><td>J. Okafor</td></tr>
+              <tr><td>Conversion value</td><td>$128,904</td><td class="green">+$8,120</td><td>K. Smith</td></tr>
+            </tbody>
+          </table>
+          <div class="one-pixel" aria-label="Alternating one pixel lines"></div>
+          <div class="gradient"></div>
+          <div class="fine">ABCDEFGHIJKLMNOPQRSTUVWXYZ · abcdefghijklmnopqrstuvwxyz · 0123456789 · {[(pixel-sharpness)]}</div>
+          <div class="moving"></div>
+        </div>
+      </article>
+      <aside class="card">
+        <div class="card-title">Control edge reference</div>
+        <div class="card-body controls">
+          <label>Report name<input value="Quarterly performance"></label>
+          <label>Resolution policy<select><option>Best available pixels</option></select></label>
+          <label>Threshold<input value="0.944 pixels per point"></label>
+          <button>Generate reference frame</button>
+          <div class="targets">
+            <div class="target"></div><div class="target"></div><div class="target"></div>
+            <div class="target"></div><div class="target"></div><div class="target"></div>
+          </div>
+        </div>
+      </aside>
+    </section>
+  </main>
+  <script>
+    const isStatic = new URLSearchParams(location.search).has("static")
+      || location.hash === "#static";
+    if (isStatic) document.title = "Capture Quality Fixture Static";
+    document.body.classList.toggle("static", isStatic);
+    if (!isStatic) {
+      const started = performance.now();
+      function update() {
+        document.querySelector("#phase").textContent = Math.floor((performance.now() - started) / 1000) % 10;
+        requestAnimationFrame(update);
+      }
+      update();
+    }
+  </script>
+</body>
+</html>

@@ -7,7 +7,7 @@ import Ajv2020 from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { RecorderService, renderQuality } from "../lib/recorder-service.mjs";
+import { captureModeFor, RecorderService, renderQuality } from "../lib/recorder-service.mjs";
 import { codexThreadId } from "../lib/codex-request-context.mjs";
 
 test("Codex request metadata binds recorder_start to the calling task", () => {
@@ -21,6 +21,13 @@ test("Codex request metadata binds recorder_start to the calling task", () => {
     "x-codex-turn-metadata": { session_id: "session-fallback" }
   }), "session-fallback");
   assert.equal(codexThreadId({}), undefined);
+});
+
+test("apps use selected-window display filtering unless an operator explicitly overrides it", () => {
+  assert.equal(captureModeFor("com.apple.TextEdit"), "window-crop");
+  assert.equal(captureModeFor("com.google.Chrome"), "window-crop");
+  assert.equal(captureModeFor("com.apple.TextEdit", "window"), "window");
+  assert.equal(captureModeFor("com.apple.TextEdit", "application"), "application");
 });
 
 test("render quality rejects causal-order inversions", () => {
@@ -52,6 +59,23 @@ test("render quality exposes a failed global camera plan", () => {
   ]);
 });
 
+test("render quality exposes low-density source enlargement", () => {
+  assert.deepEqual(renderQuality(
+    {
+      pointerRendering: { omittedUnresolved: 0 },
+      sourceRaster: { baseUpscaleFactor: 1.75 }
+    },
+    {
+      planFeasible: true,
+      semanticCoverage: { unframedSustainedResponses: 0 },
+      causalOrdering: { violations: 0 }
+    }
+  ), {
+    status: "degraded",
+    issues: ["source raster was enlarged 1.75× before camera zoom"]
+  });
+});
+
 test("recorder_start contract accepts the adapter fingerprint it emits", async () => {
   const contract = JSON.parse(await readFile(path.resolve("docs/mcp-tools.schema.json"), "utf8"));
   const startTool = contract.tools.find(tool => tool.name === "recorder_start");
@@ -67,7 +91,7 @@ test("recorder_start contract accepts the adapter fingerprint it emits", async (
       height: 1440,
       pixelsPerPoint: 2,
       codec: "hevc",
-      mode: "application"
+      mode: "window-crop"
     },
     introspection: {
       codexSession: "attached",
@@ -242,6 +266,18 @@ test("MCP server publishes the reviewed seven-tool contract", async () => {
       }],
       warnings: []
     }));
+    await writeFile(`${base}.capture.json`, JSON.stringify({
+      version: 1,
+      frames: [{ sequence: 0, presentationTime: 0 }]
+    }));
+
+    const recordingStatus = await client.callTool({
+      name: "recorder_get", arguments: { id: recordingId, include: ["actions", "warnings"] }
+    });
+    assert.equal(recordingStatus.isError, undefined);
+    assert.equal(recordingStatus.structuredContent.kind, "recording");
+    assert.ok(recordingStatus.structuredContent.artifacts.frameProvenance.uri);
+    assert.ok(recordingStatus.structuredContent.artifacts.frameProvenance.bytes > 0);
 
     const customWallpaper = path.join(store, "custom-wallpaper.png");
     await writeFile(customWallpaper, Buffer.from("project-owned-asset-fixture"));

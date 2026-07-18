@@ -37,9 +37,17 @@ public struct Timeline: Codable, Sendable {
                 public let toVisibleFraction: Double?
                 public let postActionOffsetMs: Double?
             }
+            public struct InteractionContainer: Codable, Sendable {
+                public let source: String?
+                public let confidence: Double?
+                public let bounds: Bounds?
+                public let verifiedThroughOffsetMs: Double?
+            }
             public let bounds: Bounds?
             public let role: String?
             public let title: String?
+            public let interactionContainer: InteractionContainer?
+            public let interactionCandidates: [InteractionContainer]?
             public let viewportRelocation: ViewportRelocation?
         }
         public struct TargetResolution: Codable, Sendable {
@@ -96,6 +104,9 @@ public struct DirectedAction: Sendable {
     public let to: CGPoint?
     public let duration: Double
     public let semanticBounds: CGRect?
+    public let interactionContainerBounds: CGRect?
+    public let interactionCandidateBounds: [CGRect]
+    public let interactionContainerVerifiedThrough: Double?
     public let pointProvenance: String?
     public let pointConfidence: Double
     public let cursorAllowed: Bool
@@ -190,6 +201,7 @@ public struct VisualMotionObservation: Sendable, Codable {
     public let magnitude: Double
     public let kind: VisualMotionKind
     public let focusTransition: MotionFocusTransition?
+    public let polarity: StructuralMotionPolarity?
 
     public init(
         time: Double,
@@ -198,6 +210,7 @@ public struct VisualMotionObservation: Sendable, Codable {
         magnitude: Double,
         kind: VisualMotionKind = .transformation,
         focusTransition: MotionFocusTransition? = nil,
+        polarity: StructuralMotionPolarity? = nil,
         startTime: Double? = nil
     ) {
         self.startTime = min(startTime ?? time, time)
@@ -207,6 +220,7 @@ public struct VisualMotionObservation: Sendable, Codable {
         self.magnitude = magnitude
         self.kind = kind
         self.focusTransition = focusTransition
+        self.polarity = polarity
     }
 
     public var timeRange: ClosedRange<Double> { startTime...time }
@@ -258,6 +272,11 @@ private struct PointerTravelInterval: Sendable {
 private struct FactualPointerInterval: Sendable {
     let interval: PointerTravelInterval
     let action: DirectedAction
+    /// False when an unresolved pointer action occurred after the previous
+    /// factual anchor. The renderer still needs a continuous visual path, but
+    /// that interpolation is not Computer Use ground truth and therefore may
+    /// not steer the camera until the next factual arrival.
+    let fullTravelIsFactual: Bool
 }
 
 public struct CameraState: Sendable, Equatable {
@@ -509,11 +528,10 @@ public struct NativeComposition: Sendable {
         )
         anchors = builtAnchors
         pointerTravel = builtPointerTravel
-        let actionsByID = Dictionary(uniqueKeysWithValues: episodeActions.map { ($0.id, $0) })
-        factualPointerTravel = builtPointerTravel.compactMap { interval in
-            guard let action = actionsByID[interval.actionID], action.rendersCursor else { return nil }
-            return FactualPointerInterval(interval: interval, action: action)
-        }
+        factualPointerTravel = Self.buildFactualPointerTravel(
+            pointerTravel: builtPointerTravel,
+            actions: episodeActions
+        )
         factualTypingActions = episodeActions.filter {
             typingActions.contains($0.kind) && $0.semanticBounds != nil
         }
@@ -571,11 +589,10 @@ public struct NativeComposition: Sendable {
         self.reducesWaiting = reducesWaiting
         self.interactionPhases = interactionPhases
         self.pointerTravel = pointerTravel
-        let actionsByID = Dictionary(uniqueKeysWithValues: actions.map { ($0.id, $0) })
-        factualPointerTravel = pointerTravel.compactMap { interval in
-            guard let action = actionsByID[interval.actionID], action.rendersCursor else { return nil }
-            return FactualPointerInterval(interval: interval, action: action)
-        }
+        factualPointerTravel = Self.buildFactualPointerTravel(
+            pointerTravel: pointerTravel,
+            actions: actions
+        )
         factualTypingActions = actions.filter {
             typingActions.contains($0.kind) && $0.semanticBounds != nil
         }
@@ -911,7 +928,10 @@ public struct NativeComposition: Sendable {
             let confirmationEnd = action.kind == "drag"
                 ? action.time + action.duration / 2 + 0.25
                 : action.time + 0.32
-            guard time >= interval.start, time <= confirmationEnd else { continue }
+            let factualStart = factual.fullTravelIsFactual
+                ? interval.start
+                : max(interval.start, interval.end - 0.12)
+            guard time >= factualStart, time <= confirmationEnd else { continue }
             let point = travel(
                 interval.from, interval.to, time,
                 interval.start, interval.end, interval.curve
@@ -957,22 +977,37 @@ public struct NativeComposition: Sendable {
             guard let x = value?.xNorm, let y = value?.yNorm, x.isFinite, y.isFinite else { return nil }
             return CGPoint(x: contentRect.minX + CGFloat(x) * contentRect.width, y: size.height - (contentRect.minY + CGFloat(y) * contentRect.height))
         }
-        var bounds: CGRect?
-        if let value = event.semanticTarget?.bounds,
-           let x = value.xNorm, let y = value.yNorm, let width = value.widthNorm, let height = value.heightNorm,
-           [x, y, width, height].allSatisfy(\.isFinite) {
-            bounds = CGRect(
+        func mappedBounds(_ value: Timeline.Event.SemanticTarget.Bounds?) -> CGRect? {
+            guard let value,
+                  let x = value.xNorm, let y = value.yNorm,
+                  let width = value.widthNorm, let height = value.heightNorm,
+                  [x, y, width, height].allSatisfy(\.isFinite)
+            else { return nil }
+            return CGRect(
                 x: contentRect.minX + CGFloat(x) * contentRect.width,
                 y: size.height - (contentRect.minY + CGFloat(y + height) * contentRect.height),
                 width: CGFloat(width) * contentRect.width,
                 height: CGFloat(height) * contentRect.height
             )
+        }
+        var bounds = mappedBounds(event.semanticTarget?.bounds)
+        if bounds != nil {
             let areaFraction = bounds!.area / max(1, contentRect.area)
             let role = event.semanticTarget?.role?.lowercased() ?? ""
             if areaFraction > 0.65 || ["axwebarea", "axwindow", "axapplication"].contains(role) {
                 bounds = nil
             }
         }
+        var interactionContainerBounds = mappedBounds(
+            event.semanticTarget?.interactionContainer?.bounds
+        )
+        if let container = interactionContainerBounds,
+           container.area / max(1, contentRect.area) > 0.65 {
+            interactionContainerBounds = nil
+        }
+        let interactionCandidateBounds = (event.semanticTarget?.interactionCandidates ?? [])
+            .compactMap { mappedBounds($0.bounds) }
+            .filter { $0.area / max(1, contentRect.area) <= 0.65 }
         let from = point(event.coordinates?.from)
         let to = point(event.coordinates?.to)
         let semanticPoint = bounds.map { CGPoint(x: $0.midX, y: $0.midY) }
@@ -989,7 +1024,12 @@ public struct NativeComposition: Sendable {
         return DirectedAction(
             id: id, actionId: event.actionId ?? "act_\(id)", kind: kind, time: time, point: actionPoint,
             from: evidenceOccluded ? nil : from, to: evidenceOccluded ? nil : to,
-            duration: duration, semanticBounds: evidenceOccluded ? nil : bounds, pointProvenance: pointProvenance,
+            duration: duration, semanticBounds: evidenceOccluded ? nil : bounds,
+            interactionContainerBounds: evidenceOccluded ? nil : interactionContainerBounds,
+            interactionCandidateBounds: evidenceOccluded ? [] : interactionCandidateBounds,
+            interactionContainerVerifiedThrough: evidenceOccluded ? nil : event.semanticTarget?
+                .interactionContainer?.verifiedThroughOffsetMs.map { time + max(0, $0 / 1000) },
+            pointProvenance: pointProvenance,
             pointConfidence: evidenceOccluded ? 0 : event.targetResolution?.confidence ?? 0,
             cursorAllowed: !evidenceOccluded && allowInferredTargets && (actionPoint != nil || to != nil),
             emphasis: event.editingIntent?.emphasis,
@@ -1035,6 +1075,9 @@ public struct NativeComposition: Sendable {
                     id: action.id, actionId: action.actionId, kind: action.kind, time: action.time,
                     point: inferredPoint, from: action.from, to: action.to,
                     duration: action.duration, semanticBounds: action.semanticBounds,
+                    interactionContainerBounds: action.interactionContainerBounds,
+                    interactionCandidateBounds: action.interactionCandidateBounds,
+                    interactionContainerVerifiedThrough: action.interactionContainerVerifiedThrough,
                     pointProvenance: "visual-inferred",
                     pointConfidence: 0.52,
                     cursorAllowed: allowInferredTargets,
@@ -1115,7 +1158,11 @@ public struct NativeComposition: Sendable {
             return DirectedAction(
                 id: action.id, actionId: action.actionId, kind: action.kind, time: action.time, point: action.point,
                 from: action.from, to: action.to, duration: action.duration,
-                semanticBounds: action.semanticBounds, pointProvenance: action.pointProvenance,
+                semanticBounds: action.semanticBounds,
+                interactionContainerBounds: action.interactionContainerBounds,
+                interactionCandidateBounds: action.interactionCandidateBounds,
+                interactionContainerVerifiedThrough: action.interactionContainerVerifiedThrough,
+                pointProvenance: action.pointProvenance,
                 pointConfidence: action.pointConfidence,
                 cursorAllowed: action.cursorAllowed,
                 emphasis: action.emphasis, holdExtension: action.holdExtension,
@@ -1226,7 +1273,11 @@ public struct NativeComposition: Sendable {
                 result[index] = DirectedAction(
                     id: action.id, actionId: action.actionId, kind: action.kind, time: action.time, point: action.point,
                     from: action.from, to: action.to, duration: action.duration,
-                    semanticBounds: action.semanticBounds, pointProvenance: action.pointProvenance,
+                    semanticBounds: action.semanticBounds,
+                    interactionContainerBounds: action.interactionContainerBounds,
+                    interactionCandidateBounds: action.interactionCandidateBounds,
+                    interactionContainerVerifiedThrough: action.interactionContainerVerifiedThrough,
+                    pointProvenance: action.pointProvenance,
                     pointConfidence: action.pointConfidence,
                     cursorAllowed: action.cursorAllowed,
                     emphasis: action.emphasis, holdExtension: action.holdExtension,
@@ -1456,6 +1507,41 @@ public struct NativeComposition: Sendable {
                     from: previous.point, to: next.point, actionID: next.actionID,
                     index: index, size: size, style: style
                 )
+            )
+        }
+    }
+
+    private static func buildFactualPointerTravel(
+        pointerTravel: [PointerTravelInterval],
+        actions: [DirectedAction]
+    ) -> [FactualPointerInterval] {
+        let actionsByID = Dictionary(uniqueKeysWithValues: actions.map { ($0.id, $0) })
+        let orderedPointerActions = actions
+            .filter { pointerActions.contains($0.kind) }
+            .sorted {
+                $0.time == $1.time ? $0.id < $1.id : $0.time < $1.time
+            }
+        return pointerTravel.compactMap { interval in
+            guard let action = actionsByID[interval.actionID], action.rendersCursor else {
+                return nil
+            }
+            let previousFactual = orderedPointerActions.last {
+                ($0.time < action.time || $0.time == action.time && $0.id < action.id)
+                    && $0.rendersCursor
+            }
+            let hasUnresolvedGap = orderedPointerActions.contains { candidate in
+                let afterPrevious = previousFactual.map {
+                    candidate.time > $0.time
+                        || candidate.time == $0.time && candidate.id > $0.id
+                } ?? false
+                let beforeCurrent = candidate.time < action.time
+                    || candidate.time == action.time && candidate.id < action.id
+                return afterPrevious && beforeCurrent && !candidate.rendersCursor
+            }
+            return FactualPointerInterval(
+                interval: interval,
+                action: action,
+                fullTravelIsFactual: !hasUnresolvedGap
             )
         }
     }

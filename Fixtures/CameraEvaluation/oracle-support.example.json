@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "coordinateSpace": "source-window-normalized-top-left",
+  "observations": [
+    {
+      "id": "foreground-1",
+      "lifecycleId": "foreground-surface-1",
+      "startTime": 3.2,
+      "endTime": 7.4,
+      "bounds": {"x": 0.28, "y": 0.16, "width": 0.58, "height": 0.7},
+      "confidence": 1.0,
+      "abstained": false,
+      "note": "Visible foreground support only; no occluded-region claim."
+    }
+  ]
+}

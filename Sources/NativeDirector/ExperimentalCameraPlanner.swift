@@ -4,20 +4,26 @@ import Foundation
 public struct ExperimentalProductionPlan: Sendable {
     public let camera: CameraPlan
     public let subjects: SubjectGraph
+    public let objects: InteractionObjectGraph
     public let schedule: ShotSchedule
+    public let responseCoverageConstraints: [ActionResponseCoverageAudit.Constraint]
     public let factualSamples: Int
     public let trackingSamples: Int
 
     public init(
         camera: CameraPlan,
         subjects: SubjectGraph,
+        objects: InteractionObjectGraph,
         schedule: ShotSchedule,
+        responseCoverageConstraints: [ActionResponseCoverageAudit.Constraint] = [],
         factualSamples: Int,
         trackingSamples: Int
     ) {
         self.camera = camera
         self.subjects = subjects
+        self.objects = objects
         self.schedule = schedule
+        self.responseCoverageConstraints = responseCoverageConstraints
         self.factualSamples = factualSamples
         self.trackingSamples = trackingSamples
     }
@@ -44,27 +50,101 @@ public enum ExperimentalCameraPlanner {
         graph: ProductionPlanGraph,
         composition: NativeComposition,
         base: CameraState,
+        episodeVisualEvidence: [EpisodeVisualEvidence] = [],
         policy: Policy = .default
     ) -> ExperimentalProductionPlan {
-        let subjects = SubjectGraph.make(graph: graph, composition: composition)
-        let schedule = ShotSchedulePlanner.plan(
+        let subjects = SubjectGraph.make(
+            graph: graph,
+            composition: composition
+        )
+        let objects = InteractionObjectGraph.make(
+            graph: graph,
+            composition: composition,
+            episodeVisualEvidence: episodeVisualEvidence
+        )
+        let preliminarySchedule = ShotSchedulePlanner.plan(
             subjects: subjects,
             composition: composition,
             base: base,
             policy: policy.shotPolicy
         )
-        let compiled = compileTrajectory(
-            moves: schedule.moves,
+        let preliminaryCompiled = compileTrajectory(
+            moves: preliminarySchedule.moves,
             composition: composition,
             base: base,
             policy: policy
         )
+        let preliminaryCamera = CameraPlan(
+            moves: preliminarySchedule.moves,
+            tracks: preliminaryCompiled.tracks,
+            diagnostics: .init(plannerVersion: "response-coverage-probe", feasible: true)
+        )
+        let preliminaryCoverage = ActionResponseCoverageAudit.evaluate(
+            slices: graph.actionResponseSlices,
+            contentRect: graph.contentRect,
+            outputSize: graph.size,
+            cameraAtSourceTime: {
+                cameraState(
+                    at: composition.outputTime(atSourceTime: $0),
+                    plan: preliminaryCamera,
+                    base: base
+                )
+            }
+        )
+        let responseCoverageConstraints = preliminaryCoverage.croppedMaterialResponses.map {
+            ActionResponseCoverageAudit.Constraint(
+                actionID: $0.actionID,
+                sourceRange: $0.sourceRange,
+                normalizedBounds: $0.normalizedBounds,
+                evidenceIDs: $0.evidenceIDs,
+                relativeSignal: $0.relativeSignal
+            )
+        }
+        let schedule: ShotSchedule
+        let compiled: CompiledTracking
+        if responseCoverageConstraints.isEmpty {
+            schedule = preliminarySchedule
+            compiled = preliminaryCompiled
+        } else {
+            schedule = ShotSchedulePlanner.plan(
+                subjects: subjects,
+                composition: composition,
+                base: base,
+                responseCoverageConstraints: responseCoverageConstraints,
+                contentRect: graph.contentRect,
+                policy: policy.shotPolicy
+            )
+            compiled = compileTrajectory(
+                moves: schedule.moves,
+                composition: composition,
+                base: base,
+                policy: policy
+            )
+        }
+        let finalCamera = CameraPlan(
+            moves: schedule.moves,
+            tracks: compiled.tracks,
+            diagnostics: .init(plannerVersion: "response-coverage-validation", feasible: true)
+        )
+        let remainingCoverageFailures = ActionResponseCoverageAudit.evaluate(
+            slices: graph.actionResponseSlices,
+            contentRect: graph.contentRect,
+            outputSize: graph.size,
+            cameraAtSourceTime: {
+                cameraState(
+                    at: composition.outputTime(atSourceTime: $0),
+                    plan: finalCamera,
+                    base: base
+                )
+            }
+        ).croppedMaterialResponses.count
+        let feasible = compiled.violations == 0 && remainingCoverageFailures == 0
         let diagnostics = CameraPlanDiagnostics(
             plannerVersion: "experimental-subject-schedule",
-            feasible: compiled.violations == 0,
-            failure: compiled.violations == 0
-                ? nil
-                : "compiled trajectory has \(compiled.violations) factual visibility violations"
+            feasible: feasible,
+            failure: !feasible
+                ? "compiled trajectory has \(compiled.violations) factual visibility violations and \(remainingCoverageFailures) response coverage violations"
+                : nil
         )
         return ExperimentalProductionPlan(
             camera: CameraPlan(
@@ -73,7 +153,9 @@ public enum ExperimentalCameraPlanner {
                 diagnostics: diagnostics
             ),
             subjects: subjects,
+            objects: objects,
             schedule: schedule,
+            responseCoverageConstraints: responseCoverageConstraints,
             factualSamples: compiled.factualSamples,
             trackingSamples: compiled.trackingSamples
         )

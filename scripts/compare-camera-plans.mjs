@@ -31,6 +31,7 @@ for (const fixture of fixtures) {
       "--output", output, "--plan-only",
       "--director-debug"
     ];
+    if (planner === "normal") composeArgs.push("--legacy-camera-planner");
     if (planner === "experimental") composeArgs.push("--experimental-camera-planner");
     await run(process.execPath, composeArgs);
     const auditPath = output.replace(/\.mp4$/, ".camera-audit.json");

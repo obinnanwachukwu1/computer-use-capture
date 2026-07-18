@@ -17,6 +17,7 @@ const timelinePath = `${base}.timeline.json`;
 const cliArgs = process.argv.slice(3);
 const outputIndex = cliArgs.indexOf("--output");
 const outputPath = outputIndex >= 0 ? path.resolve(cliArgs[outputIndex + 1]) : `${base}.directed.mp4`;
+await mkdir(path.dirname(outputPath), {recursive: true});
 const outputScaleIndex = cliArgs.indexOf("--output-scale");
 const outputScale = outputScaleIndex >= 0
   ? cliArgs[outputScaleIndex + 1]
@@ -61,9 +62,12 @@ const keepWaiting = cliArgs.includes("--keep-waiting")
   || process.env.COMPUTER_USE_CAPTURE_REDUCE_WAITING === "0";
 nativeArgs.push(keepWaiting ? "--keep-waiting" : "--reduce-waiting");
 if (cliArgs.includes("--director-debug")) nativeArgs.push("--director-debug");
+if (cliArgs.includes("--object-detection-debug")) nativeArgs.push("--object-detection-debug");
+if (cliArgs.includes("--overview-blame-debug")) nativeArgs.push("--overview-blame-debug");
 if (cliArgs.includes("--plan-only")) nativeArgs.push("--plan-only");
 if (cliArgs.includes("--no-analysis-cache")) nativeArgs.push("--no-analysis-cache");
 if (cliArgs.includes("--experimental-camera-planner")) nativeArgs.push("--experimental-camera-planner");
+if (cliArgs.includes("--legacy-camera-planner")) nativeArgs.push("--legacy-camera-planner");
 if (cliArgs.includes("--profile")) {
   const index = cliArgs.indexOf("--profile");
   nativeArgs.push("--profile");
@@ -74,6 +78,14 @@ if (cliArgs.includes("--profile")) {
 for (const flag of ["--cursor-path", "--cursor-tilt-strength"]) {
   const index = cliArgs.indexOf(flag);
   if (index >= 0 && cliArgs[index + 1] !== undefined) nativeArgs.push(flag, cliArgs[index + 1]);
+}
+for (const flag of ["--camera-eval-condition", "--oracle-support"]) {
+  const index = cliArgs.indexOf(flag);
+  if (index >= 0 && cliArgs[index + 1] !== undefined) {
+    nativeArgs.push(flag, flag === "--oracle-support"
+      ? path.resolve(cliArgs[index + 1])
+      : cliArgs[index + 1]);
+  }
 }
 const waitingTimeIndex = cliArgs.indexOf("--waiting-time");
 const waitingTime = waitingTimeIndex >= 0

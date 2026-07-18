@@ -15,6 +15,7 @@ private struct MotionAnalysisCacheFile: Codable {
     let motionFrames: Int
     let observations: [VisualMotionObservation]
     let interactionPhases: [Int: InteractionPhases]
+    let episodeVisualEvidence: [EpisodeVisualEvidence]
 }
 
 private struct MotionAnalysisFingerprint: Codable {
@@ -48,9 +49,10 @@ enum MotionAnalysisCache {
     // change. The source digest alone cannot invalidate derived evidence when
     // the implementation evolves.
     private static let formatVersion = 1
-    // Revision 4 adds energy-weighted sustained-response episodes so long
-    // animations remain first-class global planning evidence.
-    private static let analyzerRevision = 4
+    // Revision 15 makes the pre-activation sample the causal baseline. The
+    // sampled frame carrying activation belongs to the response; using it as
+    // the baseline erased instantaneous births and releases.
+    private static let analyzerRevision = 15
 
     static func resolve(
         source: URL,
@@ -82,7 +84,8 @@ enum MotionAnalysisCache {
                 motionFrames: cached.motionFrames,
                 observations: cached.observations,
                 interactionPhases: cached.interactionPhases,
-                motionFields: []
+                motionFields: [],
+                episodeVisualEvidence: cached.episodeVisualEvidence
             ), true)
         }
 
@@ -95,7 +98,8 @@ enum MotionAnalysisCache {
             sampledFrames: analysis.sampledFrames,
             motionFrames: analysis.motionFrames,
             observations: analysis.observations,
-            interactionPhases: analysis.interactionPhases
+            interactionPhases: analysis.interactionPhases,
+            episodeVisualEvidence: analysis.episodeVisualEvidence
         )
         do {
             let encoder = JSONEncoder()

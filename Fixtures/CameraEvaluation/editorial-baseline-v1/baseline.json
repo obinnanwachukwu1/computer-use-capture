@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "name": "editorial-baseline-v1",
+  "planner": "experimental-subject-schedule",
+  "evaluationCondition": "d-oracle-gated",
+  "status": "accepted-editorial-reference",
+  "expected": {
+    "correctBeats": 12,
+    "totalBeats": 12,
+    "moveCount": 6,
+    "falseEmphasis": 0,
+    "factualViolations": 0,
+    "continuityViolations": 0
+  },
+  "editorialInvariants": [
+    "anticipate a causally linked transient surface so its opener remains visible",
+    "wait for factual cursor entry before tightening onto an outside-triggered sustained surface",
+    "hold the parent shot when a nested surface is already comfortably framed",
+    "reframe a nested surface when the parent cannot show it readably and safely",
+    "return cleanly when a foreground lifecycle ends",
+    "never invent support for an invisible or abstained surface"
+  ]
+}

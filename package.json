@@ -1,8 +1,16 @@
 {
   "name": "computer-use-capture",
-  "version": "0.1.6",
+  "version": "0.2.0",
   "license": "MIT",
   "description": "Turn Codex Computer Use sessions into polished macOS product-demo videos.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/obinnanwachukwu1/computer-use-capture.git"
+  },
+  "homepage": "https://github.com/obinnanwachukwu1/computer-use-capture#readme",
+  "bugs": {
+    "url": "https://github.com/obinnanwachukwu1/computer-use-capture/issues"
+  },
   "type": "module",
   "bin": {
     "computer-use-capture": "scripts/mcp-server.mjs"
@@ -23,6 +31,7 @@
     "scripts/recorder-daemon.mjs",
     "scripts/record-session.mjs",
     "scripts/compose-recording.mjs",
+    "scripts/analyze-capture-quality.mjs",
     "vendor/darwin-arm64/"
   ],
   "scripts": {
@@ -42,6 +51,10 @@
     "golden:update": "node scripts/golden-director-plans.mjs update",
     "test:golden": "node scripts/golden-director-plans.mjs verify",
     "benchmark:pipeline": "node scripts/benchmark-pipeline.mjs",
+    "analyze:capture-quality": "node scripts/analyze-capture-quality.mjs",
+    "evaluate:camera": "node scripts/evaluate-camera-factorial.mjs",
+    "evaluate:camera-bakeoff": "node scripts/evaluate-camera-bakeoff.mjs",
+    "verify:oracle": "node scripts/verify-oracle-support.mjs",
     "mcp": "node scripts/mcp-server.mjs"
   },
   "dependencies": {

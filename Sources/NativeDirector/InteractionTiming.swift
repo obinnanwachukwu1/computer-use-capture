@@ -37,6 +37,23 @@ public enum InteractionTimingTarget {
     }
 }
 
+/// Establishes the causal ordering between sampled video frames and a
+/// measured interaction boundary.
+public enum CausalFrameOrdering {
+    /// Returns the final sample that is strictly earlier than activation.
+    /// The sample carrying activation belongs to the response and must never
+    /// be reused as its own baseline.
+    public static func preActivationSampleIndex(
+        in orderedTimes: [Double],
+        activationBoundary: Double,
+        clockTolerance: Double = 0.000_1
+    ) -> Int? {
+        orderedTimes.indices.last {
+            orderedTimes[$0] < activationBoundary - clockTolerance
+        }
+    }
+}
+
 public struct InteractionActivitySample: Sendable {
     public let time: Double
     public let magnitude: Double
@@ -110,7 +127,13 @@ public enum InteractionPhaseDetector {
         rawEstimate: Double,
         toolStart: Double,
         toolEnd: Double,
-        finalActionInToolCall: Bool
+        finalActionInToolCall: Bool,
+        /// The globally ordered interval owned by this action when one tool
+        /// call contains several Computer Use actions. Target-local pixels
+        /// from a later action must not be reused as the activation of every
+        /// earlier action in the same call. The interval is derived from the
+        /// midpoints between factual action timestamps, not a fixed latency.
+        actionWindow: ClosedRange<Double>? = nil
     ) -> InteractionPhases {
         let ordered = samples.sorted { $0.time < $1.time }
         let baseline = ordered.filter { $0.time < toolStart }.map(\.magnitude)
@@ -122,13 +145,23 @@ public enum InteractionPhaseDetector {
         let active = ordered.filter { $0.time >= toolStart - 0.05 && $0.magnitude >= threshold }
         let clusters = activityClusters(active, threshold: threshold)
 
-        let activationWindow = (toolStart - 0.05)...(toolEnd + 0.18)
+        let activationWindow = actionWindow ?? (toolStart - 0.05)...(toolEnd + 0.18)
         let rawSpanningCandidate = clusters
-            .filter { $0.start <= rawEstimate + 0.03 && $0.end >= rawEstimate - 0.03 }
+            .filter {
+                activationWindow.overlaps($0.start...$0.end)
+                    && $0.start <= rawEstimate + 0.03
+                    && $0.end >= rawEstimate - 0.03
+            }
             .max { $0.peak < $1.peak }
+        // A single-action tool call retains the measured completion prior:
+        // hover commonly precedes the click inside that envelope. Only a
+        // partitioned multi-action call switches to the individual factual
+        // timestamp, because its shared tool completion belongs to the batch,
+        // not to every action.
+        let candidateReference = actionWindow == nil ? toolEnd : rawEstimate
         let candidate = rawSpanningCandidate ?? clusters
             .filter { activationWindow.contains($0.start) }
-            .min { abs($0.start - toolEnd) < abs($1.start - toolEnd) }
+            .min { abs($0.start - candidateReference) < abs($1.start - candidateReference) }
 
         let activation: Double
         let source: String
@@ -149,12 +182,15 @@ public enum InteractionPhaseDetector {
         let hover = clusters
             .filter { cluster in
                 cluster.end < (candidate?.start ?? activation) - 0.03
-                    && cluster.start >= toolStart - 0.05
+                    && activationWindow.overlaps(cluster.start...cluster.end)
             }
             .last
         let prePointerActivity = hover.flatMap { hover in
             clusters
-                .filter { $0.end < hover.start - 0.03 && $0.start >= toolStart - 0.05 }
+                .filter {
+                    $0.end < hover.start - 0.03
+                        && activationWindow.overlaps($0.start...$0.end)
+                }
                 .last
         }
         let pointerArrival: Double
@@ -178,7 +214,15 @@ public enum InteractionPhaseDetector {
             pointerArrival = min(activation, rawEstimate)
             pointerArrivalSource = "telemetry-estimate"
         }
-        let response = clusters.first { $0.start >= activation + 0.10 }
+        let response = clusters.first {
+            $0.start >= activation + 0.10
+                // A response may begin after a single-action tool envelope
+                // has completed, so the legacy/default path must retain the
+                // complete observed tail. Only a genuinely partitioned batch
+                // has an action-ownership boundary that can exclude a later
+                // action's pixels.
+                && (actionWindow?.overlaps($0.start...$0.end) ?? true)
+        }
 
         return InteractionPhases(
             rawEstimate: rawEstimate,

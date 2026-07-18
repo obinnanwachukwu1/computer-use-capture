@@ -11,6 +11,7 @@ struct MotionAnalysis {
     let observations: [VisualMotionObservation]
     let interactionPhases: [Int: InteractionPhases]
     let motionFields: [ActionMotionField]
+    let episodeVisualEvidence: [EpisodeVisualEvidence]
 }
 
 struct ActionMotionField {
@@ -38,6 +39,25 @@ private struct ResponseFrame {
 }
 
 enum MotionAnalyzer {
+    /// Cache hits and fresh analysis must expose the same canonical evidence
+    /// identities. Keeping this normalization outside the decoder also makes
+    /// older caches safe to reuse after deterministic ordering was introduced.
+    static func canonicalized(_ analysis: MotionAnalysis) -> MotionAnalysis {
+        MotionAnalysis(
+            ranges: analysis.ranges,
+            sampledFrames: analysis.sampledFrames,
+            motionFrames: analysis.motionFrames,
+            observations: analysis.observations.sorted(by: observationComesBefore),
+            interactionPhases: analysis.interactionPhases,
+            motionFields: analysis.motionFields,
+            episodeVisualEvidence: analysis.episodeVisualEvidence.sorted {
+                $0.startTime == $1.startTime
+                    ? $0.endTime < $1.endTime
+                    : $0.startTime < $1.startTime
+            }
+        )
+    }
+
     static func analyze(
         asset: AVAsset,
         track: AVAssetTrack,
@@ -80,8 +100,24 @@ enum MotionAnalyzer {
         var localActivity: [Int: [InteractionActivitySample]] = [:]
         var responseFrames: [Int: [ResponseFrame]] = [:]
         var fallbackObservations: [Int: [VisualMotionObservation]] = [:]
+        var episodeVisualEvidence: [EpisodeVisualEvidence] = []
+        var globalEvidenceFrames: [ResponseFrame] = []
         var nextProgressTime = 10.0
         let probedActionIDs = Set(timingProbes.map(\.actionID))
+        let orderedFallbackActionTimes = fallbackActionTimes.sorted { left, right in
+            left.key == right.key ? left.value < right.value : left.key < right.key
+        }
+        let responseWidth = analysisWidth / 2
+        let responseHeight = analysisHeight / 2
+        // Preserve the default detector's normalized grid density after the
+        // response frames are downsampled for bounded memory. A fixed six-pixel
+        // tile at half resolution doubles focus padding and merges foreground
+        // features that remain distinct in the detector debugger.
+        let responseConfiguration = MotionFieldConfiguration(
+            tileSize: MotionFieldConfiguration.normalizedTileSize(forRasterWidth: responseWidth),
+            maximumShift: 28,
+            shiftStep: 4
+        )
 
         while autoreleasepool(invoking: {
             guard let sample = output.copyNextSampleBuffer() else { return false }
@@ -124,6 +160,9 @@ enum MotionAnalyzer {
                 colorSpace: colorSpace
             )
             sampledFrames += 1
+            let responsePixels = halfScaleRGBA(
+                pixels, sourceWidth: analysisWidth, sourceHeight: analysisHeight
+            )
             let activeResponseProbes = timingProbes.filter {
                 time >= min($0.toolStart, $0.rawEstimate) - 0.30 &&
                 time <= max($0.toolEnd, $0.rawEstimate) + 1.0
@@ -133,21 +172,61 @@ enum MotionAnalyzer {
                 // analysis frame at 320x234 for every click scales poorly on
                 // longer recordings. A half-resolution copy preserves the
                 // regional motion needed for framing while bounding memory.
-                let responsePixels = halfScaleRGBA(
-                    pixels, sourceWidth: analysisWidth, sourceHeight: analysisHeight
-                )
                 for probe in activeResponseProbes {
                     responseFrames[probe.actionID, default: []].append(
                         ResponseFrame(time: time, pixels: responsePixels)
                     )
                 }
             }
+            // The deterministic scene runner and native applications can
+            // produce meaningful visual episodes without a contemporaneous
+            // Computer Use action. Compare overlapping quarter-second windows
+            // across the full recording and retain only structural components.
+            // A small rolling buffer keeps memory bounded independently of
+            // recording duration.
+            globalEvidenceFrames.append(ResponseFrame(time: time, pixels: responsePixels))
+            if globalEvidenceFrames.count >= 4 {
+                let start = globalEvidenceFrames[0]
+                let end = globalEvidenceFrames[3]
+                let field = SpatialMotion.motionField(
+                    previous: start.pixels,
+                    current: end.pixels,
+                    width: responseWidth,
+                    height: responseHeight,
+                    beforeTime: start.time,
+                    afterTime: end.time,
+                    configuration: responseConfiguration
+                )
+                episodeVisualEvidence += field.structural.map { component in
+                    EpisodeVisualEvidence(
+                        actionID: -1,
+                        startTime: field.beforeTime,
+                        endTime: field.afterTime,
+                        normalizedBounds: component.normalizedBounds,
+                        changedFraction: component.changedFraction,
+                        confidence: component.energy,
+                        kind: .appearance
+                    )
+                }
+                episodeVisualEvidence += field.shifts.map { component in
+                    EpisodeVisualEvidence(
+                        actionID: -1,
+                        startTime: field.beforeTime,
+                        endTime: field.afterTime,
+                        normalizedBounds: component.normalizedBounds,
+                        changedFraction: component.supportFraction,
+                        confidence: component.confidence,
+                        kind: .translation
+                    )
+                }
+                globalEvidenceFrames.removeFirst(2)
+            }
             if time >= nextProgressTime {
                 let percent = sourceDuration > 0 ? min(100, Int(time / sourceDuration * 100)) : 0
                 print("motion analysis \(percent)% source=\(Int(time))s/\(Int(sourceDuration))s samples=\(sampledFrames)")
                 nextProgressTime += 10
             }
-            for (index, actionTime) in fallbackActionTimes {
+            for (index, actionTime) in orderedFallbackActionTimes {
                 if time <= actionTime - 0.85 { baselineSnapshots[index] = pixels }
                 if time <= actionTime - 0.1 { beforeSnapshots[index] = pixels }
                 if afterSnapshots[index] == nil, time >= actionTime + 0.75 { afterSnapshots[index] = pixels }
@@ -169,7 +248,7 @@ enum MotionAnalyzer {
         guard reader.status == .completed else {
             throw Failure(reader.error?.localizedDescription ?? "motion analysis failed")
         }
-        for (index, actionTime) in fallbackActionTimes {
+        for (index, actionTime) in orderedFallbackActionTimes {
             guard let before = beforeSnapshots[index], let after = afterSnapshots[index] else { continue }
             let response = SpatialMotion.components(
                 previous: before, current: after, width: analysisWidth, height: analysisHeight,
@@ -185,13 +264,15 @@ enum MotionAnalyzer {
                 VisualMotionObservation(time: actionTime + 0.75, normalizedBounds: $0.normalizedBounds, changedFraction: $0.changedFraction, magnitude: $0.magnitude, kind: $0.kind)
             }
         }
+        let actionWindows = orderedActionWindows(for: timingProbes)
         let interactionPhases = Dictionary(uniqueKeysWithValues: timingProbes.map { probe in
             let phases = InteractionPhaseDetector.detect(
                 samples: localActivity[probe.actionID] ?? [],
                 rawEstimate: probe.rawEstimate,
                 toolStart: probe.toolStart,
                 toolEnd: probe.toolEnd,
-                finalActionInToolCall: probe.finalActionInToolCall
+                finalActionInToolCall: probe.finalActionInToolCall,
+                actionWindow: actionWindows[probe.actionID]
             )
             return (probe.actionID, phases)
         })
@@ -202,17 +283,6 @@ enum MotionAnalyzer {
         // deliberately taken after the new viewport is established; comparing
         // against the old viewport would make the scroll overlap and erase the
         // real response during ambient-motion rejection.
-        let responseWidth = analysisWidth / 2
-        let responseHeight = analysisHeight / 2
-        // Preserve the default detector's normalized grid density after the
-        // response frames are downsampled for bounded memory. A fixed six-pixel
-        // tile at half resolution doubles focus padding and merges foreground
-        // features that remain distinct in the detector debugger.
-        let responseConfiguration = MotionFieldConfiguration(
-            tileSize: MotionFieldConfiguration.normalizedTileSize(forRasterWidth: responseWidth),
-            maximumShift: 28,
-            shiftStep: 4
-        )
         var actionsWithEligibleActivationResponse = Set<Int>()
         var motionFields: [ActionMotionField] = []
         var focusTracker = MotionFocusTracker()
@@ -220,10 +290,21 @@ enum MotionAnalyzer {
             guard let phase = interactionPhases[probe.actionID],
                   let frames = responseFrames[probe.actionID], frames.count >= 2
             else { continue }
-            let beforeCutoff = probe.hasSpatialTarget
-                ? phase.activation + 0.02
-                : probe.rawEstimate + 0.02
-            guard let before = frames.last(where: { $0.time <= beforeCutoff }) else { continue }
+
+            let activationBoundary = probe.hasSpatialTarget
+                ? phase.activation
+                : probe.rawEstimate
+            // `InteractionPhaseDetector` reports the sampled frame carrying
+            // the activation change. Treating that frame as the response
+            // baseline erases instantaneous state changes (a surface can be
+            // gone in the very frame that establishes the click). The causal
+            // comparison must begin at the last sampled frame strictly before
+            // the measured boundary. This is a clock-ordering invariant, not
+            // a UI-specific delay: the activation frame belongs to the result.
+            guard let beforeIndex = CausalFrameOrdering.preActivationSampleIndex(
+                in: frames.map(\.time), activationBoundary: activationBoundary
+            ) else { continue }
+            let before = frames[beforeIndex]
             let desiredResponseTime = phase.activation + 0.68
             let after = frames.first(where: { $0.time >= desiredResponseTime })
                 ?? frames.last(where: { $0.time >= phase.activation + 0.30 })
@@ -277,7 +358,9 @@ enum MotionAnalyzer {
                     normalizedBounds: $0.normalizedBounds,
                     changedFraction: $0.changedFraction,
                     magnitude: $0.magnitude,
-                    kind: $0.kind
+                    kind: $0.kind,
+                    polarity: $0.polarity,
+                    startTime: before.time
                 )
             }
             let activationObservations: [VisualMotionObservation]
@@ -294,6 +377,7 @@ enum MotionAnalyzer {
                         changedFraction: component.changedFraction,
                         magnitude: component.energy,
                         kind: .appearance,
+                        polarity: component.polarity,
                         startTime: before.time
                     )
                 }
@@ -311,9 +395,13 @@ enum MotionAnalyzer {
                     at: after.time,
                     intent: probe.focusIntent
                 )
+                // A detector-owned focus hypothesis is optional evidence, not
+                // a lossy replacement for the action-aligned structural
+                // response. Preserve both streams so the clip-global graph can
+                // select or abstain when focus state is stale or ambiguous.
                 activationObservations = trackedObservations.contains { $0.kind == .focus }
-                    ? trackedObservations
-                    : causalObservations
+                    ? trackedObservations + causalObservations
+                    : trackedObservations
             }
             if activationObservations.contains(where: { SpatialMotion.isFramingEligible($0) }) {
                 actionsWithEligibleActivationResponse.insert(probe.actionID)
@@ -328,28 +416,53 @@ enum MotionAnalyzer {
                     activeFocus: focusTracker.activeFocus,
                     focusTransition: focusTracker.lastTransition
                 ))
-                let anchors = [
-                    before,
-                    frames.first(where: { $0.time >= phase.activation + 0.20 }),
-                    frames.first(where: { $0.time >= phase.activation + 0.45 }),
-                    after
-                ].compactMap { $0 }
-                var uniqueAnchors: [ResponseFrame] = []
-                for anchor in anchors where uniqueAnchors.last?.time != anchor.time {
-                    uniqueAnchors.append(anchor)
+            }
+            let anchors = [
+                before,
+                frames.first(where: { $0.time >= phase.activation + 0.20 }),
+                frames.first(where: { $0.time >= phase.activation + 0.45 }),
+                after
+            ].compactMap { $0 }
+            var uniqueAnchors: [ResponseFrame] = []
+            for anchor in anchors where uniqueAnchors.last?.time != anchor.time {
+                uniqueAnchors.append(anchor)
+            }
+            for pair in zip(uniqueAnchors, uniqueAnchors.dropFirst()) where pair.1.time > pair.0.time {
+                let intermediate = SpatialMotion.motionField(
+                    previous: pair.0.pixels,
+                    current: pair.1.pixels,
+                    width: responseWidth,
+                    height: responseHeight,
+                    beforeTime: pair.0.time,
+                    afterTime: pair.1.time,
+                    configuration: responseConfiguration
+                )
+                episodeVisualEvidence += intermediate.structural.map { component in
+                    EpisodeVisualEvidence(
+                        actionID: probe.actionID,
+                        startTime: intermediate.beforeTime,
+                        endTime: intermediate.afterTime,
+                        normalizedBounds: component.normalizedBounds,
+                        changedFraction: component.changedFraction,
+                        confidence: component.energy,
+                        kind: .appearance
+                    )
                 }
-                for pair in zip(uniqueAnchors, uniqueAnchors.dropFirst()) where pair.1.time > pair.0.time {
+                episodeVisualEvidence += intermediate.shifts.map { component in
+                    EpisodeVisualEvidence(
+                        actionID: probe.actionID,
+                        startTime: intermediate.beforeTime,
+                        endTime: intermediate.afterTime,
+                        normalizedBounds: component.normalizedBounds,
+                        changedFraction: component.supportFraction,
+                        confidence: component.confidence,
+                        kind: .translation
+                    )
+                }
+                if collectMotionFields {
                     motionFields.append(ActionMotionField(
                         actionID: probe.actionID,
-                        field: SpatialMotion.motionField(
-                            previous: pair.0.pixels,
-                            current: pair.1.pixels,
-                            width: responseWidth,
-                            height: responseHeight,
-                            beforeTime: pair.0.time,
-                            afterTime: pair.1.time,
-                            configuration: responseConfiguration
-                        ),
+                        field: intermediate,
                         isActivationResponse: false,
                         activeFocus: focusTracker.activeFocus,
                         focusTransition: nil
@@ -357,7 +470,8 @@ enum MotionAnalyzer {
                 }
             }
         }
-        for (actionID, fallback) in fallbackObservations {
+        for actionID in fallbackObservations.keys.sorted() {
+            guard let fallback = fallbackObservations[actionID] else { continue }
             if !probedActionIDs.contains(actionID) {
                 observations += fallback
                 continue
@@ -378,14 +492,78 @@ enum MotionAnalyzer {
             ranges: motionRanges,
             components: globalMotionComponents
         )
+        // Observation IDs are durable planner/report identities. Canonicalize
+        // once at the analysis boundary so dictionary hash seeds and component
+        // discovery order cannot silently renumber otherwise identical scene
+        // evidence across processes.
+        observations.sort(by: observationComesBefore)
         return MotionAnalysis(
             ranges: motionRanges,
             sampledFrames: sampledFrames,
             motionFrames: motionTimes.count,
             observations: observations,
             interactionPhases: interactionPhases,
-            motionFields: motionFields
+            motionFields: motionFields,
+            episodeVisualEvidence: episodeVisualEvidence
         )
+    }
+
+    private static func observationComesBefore(
+        _ left: VisualMotionObservation,
+        _ right: VisualMotionObservation
+    ) -> Bool {
+        if left.startTime != right.startTime { return left.startTime < right.startTime }
+        if left.time != right.time { return left.time < right.time }
+        if left.kind.rawValue != right.kind.rawValue {
+            return left.kind.rawValue < right.kind.rawValue
+        }
+        let leftFocus = left.focusTransition?.rawValue ?? ""
+        let rightFocus = right.focusTransition?.rawValue ?? ""
+        if leftFocus != rightFocus { return leftFocus < rightFocus }
+        let leftBounds = left.normalizedBounds
+        let rightBounds = right.normalizedBounds
+        for pair in [
+            (leftBounds.minX, rightBounds.minX),
+            (leftBounds.minY, rightBounds.minY),
+            (leftBounds.width, rightBounds.width),
+            (leftBounds.height, rightBounds.height),
+            (left.changedFraction, right.changedFraction),
+            (left.magnitude, right.magnitude)
+        ] where pair.0 != pair.1 {
+            return pair.0 < pair.1
+        }
+        return false
+    }
+
+    /// Partitions a batched Computer Use call into factual action ownership
+    /// intervals. Without this total ordering, one late hover or page change
+    /// can become the detected activation for every earlier action whose
+    /// timing aperture happens to contain it. Midpoint boundaries adapt to
+    /// the actual action cadence and disappear entirely for single-action
+    /// calls.
+    private static func orderedActionWindows(
+        for probes: [InteractionTimingProbe]
+    ) -> [Int: ClosedRange<Double>] {
+        let groups = Dictionary(grouping: probes) { probe in
+            "\(Int((probe.toolStart * 1_000).rounded())):\(Int((probe.toolEnd * 1_000).rounded()))"
+        }
+        var result: [Int: ClosedRange<Double>] = [:]
+        for group in groups.values {
+            let ordered = group.sorted {
+                if $0.rawEstimate != $1.rawEstimate { return $0.rawEstimate < $1.rawEstimate }
+                return $0.actionID < $1.actionID
+            }
+            for (index, probe) in ordered.enumerated() {
+                let lower = index > 0
+                    ? (ordered[index - 1].rawEstimate + probe.rawEstimate) / 2
+                    : probe.toolStart - 0.05
+                let upper = index + 1 < ordered.count
+                    ? (probe.rawEstimate + ordered[index + 1].rawEstimate) / 2
+                    : probe.toolEnd + 0.18
+                result[probe.actionID] = min(lower, probe.rawEstimate)...max(upper, probe.rawEstimate)
+            }
+        }
+        return result
     }
 
     private static func sustainedMotionObservations(
@@ -481,7 +659,8 @@ enum MotionAnalyzer {
                 normalizedBounds: $0.normalizedBounds,
                 changedFraction: $0.changedFraction,
                 magnitude: $0.magnitude,
-                kind: $0.kind
+                kind: $0.kind,
+                polarity: $0.polarity
             )
         }
     }

@@ -97,7 +97,7 @@ render, so moving the original file does not break later edits.
 
 Computer Use is authoritative about which actions occurred. Direct coordinates and verified Accessibility matches can render a cursor; unresolved targets remain cursorless rather than being shown at a guessed location. Every factual click or drag that is rendered must remain visible throughout its interaction.
 
-Safari uses application-filter capture so Safari-owned popovers can remain visible. Other apps default to strict window capture. System-owned permission, open, and save panels may not appear in the captured app surface.
+All apps use a display-bound selected-window filter cropped to the target window. This preserves the source at native pixel density, excludes overlapping windows from other applications, and retains app-owned menus and popovers in the controlled macOS test matrix. System-owned permission, open, and save panels may not appear in the captured surface.
 
 ## Privacy and storage
 
@@ -112,8 +112,8 @@ The recorder stores source video, a value-redacted Accessibility sidecar, the re
 ## Current limitations
 
 - The action adapter supports Codex Computer Use task logs and screenshot coordinates; this is not a generic MCP screen recorder.
-- The target window cannot move or resize during a recording without invalidating affected direct coordinates.
-- System-owned surfaces may be absent from application or strict-window capture.
+- The target window cannot move or resize during a recording without invalidating affected direct coordinates or leaving the selected-window crop.
+- System-owned surfaces may be absent from the selected-window capture.
 - Capture and composition are video-only; audio is not supported.
 - Ambiguous or unavailable action evidence fails open to a cursorless timeline.
 
@@ -124,7 +124,7 @@ The recorder stores source video, a value-redacted Accessibility sidecar, the re
 - [Accessibility vocabulary and matching](docs/accessibility-vocabulary.md)
 - [Motion-field detector](docs/motion-field.md)
 - [Production camera planner](docs/production-planner.md)
-- [Experimental camera planner](docs/experimental-camera-planner.md)
+- [Global camera scheduler architecture](docs/experimental-camera-planner.md)
 
 ## Build from source
 
