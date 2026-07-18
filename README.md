@@ -1,4 +1,8 @@
-# Computer Use Capture
+<p align="center">
+  <img src="https://raw.githubusercontent.com/obinnanwachukwu1/computer-use-capture/main/assets/icon.png" width="128" alt="Computer Use Capture icon">
+</p>
+
+<h1 align="center">Computer Use Capture</h1>
 
 Computer Use Capture turns a Codex Computer Use session into a polished product-demo video. Codex starts recording, uses Computer Use normally, and stops recording. The recorder passively reconstructs the factual cursor path and produces a directed 60fps render with smooth camera movement, a native macOS cursor, motion blur, and proven waiting time removed.
 
@@ -6,6 +10,12 @@ The recorder does not wrap or replace Computer Use. It is a local, macOS-only MC
 Every Codex task connects to one shared local recorder daemon, so a recording
 started in one task is visible to subsequent MCP calls from that task even when
 Codex creates a fresh MCP stdio process.
+
+## Demo
+
+[![Computer Use Capture recording Google Calendar](https://raw.githubusercontent.com/obinnanwachukwu1/computer-use-capture/main/demo/google-calendar-e2e-poster.jpg)](https://github.com/obinnanwachukwu1/computer-use-capture/raw/refs/heads/main/demo/google-calendar-computer-use-e2e.mp4)
+
+This 38-second demo was recorded end to end by Codex creating and configuring a Google Calendar event through Computer Use.
 
 ## Requirements
 
@@ -69,7 +79,7 @@ The complete wire contract is [`docs/mcp-tools.schema.json`](docs/mcp-tools.sche
 
 ## Defaults and guarantees
 
-The default `product-demo` render uses automatic semantic framing, a native `3x` macOS cursor, motion blur, and 100 ms handles around proven-idle cuts. Factual action intervals remain at normal speed; otherwise-waiting intervals with verified UI motion play at a conservative 2x instead of being removed. Before calling `recorder_edit`, inspect a completed render and provide its render ID plus the specific visual defect being corrected; duration or quality metadata alone is not a review. `recorder_edit` can set `waiting.motionRate` from 1 to 6.
+The default `product-demo` render uses automatic semantic framing, a native `3x` macOS cursor, motion blur, and 100 ms handles around proven-idle cuts. Factual action intervals remain at normal speed; otherwise-waiting intervals with verified UI motion play at a conservative 2x instead of being removed. A periodic insertion caret may be treated as idle only when its exact narrow pixel delta stays inside a text field identified by Computer Use or Accessibility evidence; generic spinners and other application animation remain visible motion. Before calling `recorder_edit`, inspect a completed render and provide its render ID plus the specific visual defect being corrected; duration or quality metadata alone is not a review. `recorder_edit` can set `waiting.motionRate` from 1 to 6.
 
 The default wallpaper and cursor are loaded from the Mac's installed system
 resources. They can be replaced for a re-render with `recorder_edit`:
@@ -151,10 +161,7 @@ suite with:
 ```sh
 npm test
 swift test
-npm run audit:privacy
 ```
-
-The privacy audit requires [Gitleaks](https://github.com/gitleaks/gitleaks).
 
 ## Build the npm package
 

@@ -11,6 +11,7 @@ private struct MotionAnalysisCacheFile: Codable {
     let version: Int
     let fingerprint: String
     let ranges: [Range]
+    let caretBlinkRanges: [Range]
     let sampledFrames: Int
     let motionFrames: Int
     let observations: [VisualMotionObservation]
@@ -38,9 +39,20 @@ private struct MotionAnalysisFingerprint: Codable {
         let focusIntent: String
     }
 
+    struct TextInput: Codable {
+        let time: Double
+        let validFrom: Double
+        let validThrough: Double?
+        let x: Double
+        let y: Double
+        let width: Double
+        let height: Double
+    }
+
     let analyzerRevision: Int
     let fallbackActionTimes: [ActionTime]
     let timingProbes: [Probe]
+    let textInputs: [TextInput]
     let relocationActionIDs: [Int]
 }
 
@@ -49,15 +61,15 @@ enum MotionAnalysisCache {
     // change. The source digest alone cannot invalidate derived evidence when
     // the implementation evolves.
     private static let formatVersion = 1
-    // Revision 15 makes the pre-activation sample the causal baseline. The
-    // sampled frame carrying activation belongs to the response; using it as
-    // the baseline erased instantaneous births and releases.
-    private static let analyzerRevision = 15
+    // Revision 19 bounds text-input evidence by factual action lifetimes in
+    // addition to exact pixel deltas and hard non-caret proof boundaries.
+    private static let analyzerRevision = 19
 
     static func resolve(
         source: URL,
         fallbackActionTimes: [Int: Double],
         timingProbes: [InteractionTimingProbe],
+        textInputEvidence: [TextInputEvidence],
         relocationActionIDs: Set<Int>,
         enabled: Bool,
         collectMotionFields: Bool,
@@ -70,6 +82,7 @@ enum MotionAnalysisCache {
             source: source,
             fallbackActionTimes: fallbackActionTimes,
             timingProbes: timingProbes,
+            textInputEvidence: textInputEvidence,
             relocationActionIDs: relocationActionIDs
         )
         let url = cacheURL(for: source)
@@ -80,6 +93,7 @@ enum MotionAnalysisCache {
             print("motion analysis cache=hit path=\(url.path)")
             return (MotionAnalysis(
                 ranges: cached.ranges.map { $0.start...$0.end },
+                caretBlinkRanges: cached.caretBlinkRanges.map { $0.start...$0.end },
                 sampledFrames: cached.sampledFrames,
                 motionFrames: cached.motionFrames,
                 observations: cached.observations,
@@ -95,6 +109,9 @@ enum MotionAnalysisCache {
             version: formatVersion,
             fingerprint: fingerprint,
             ranges: analysis.ranges.map { .init(start: $0.lowerBound, end: $0.upperBound) },
+            caretBlinkRanges: analysis.caretBlinkRanges.map {
+                .init(start: $0.lowerBound, end: $0.upperBound)
+            },
             sampledFrames: analysis.sampledFrames,
             motionFrames: analysis.motionFrames,
             observations: analysis.observations,
@@ -121,6 +138,7 @@ enum MotionAnalysisCache {
         source: URL,
         fallbackActionTimes: [Int: Double],
         timingProbes: [InteractionTimingProbe],
+        textInputEvidence: [TextInputEvidence],
         relocationActionIDs: Set<Int>
     ) throws -> String {
         let input = MotionAnalysisFingerprint(
@@ -141,6 +159,21 @@ enum MotionAnalysisCache {
                     targetHeight: $0.normalizedTarget.height,
                     hasSpatialTarget: $0.hasSpatialTarget,
                     focusIntent: $0.focusIntent == .dismissal ? "dismissal" : "automatic"
+                )
+            },
+            textInputs: textInputEvidence.sorted {
+                $0.time == $1.time
+                    ? $0.normalizedBounds.minX < $1.normalizedBounds.minX
+                    : $0.time < $1.time
+            }.map {
+                .init(
+                    time: $0.time,
+                    validFrom: $0.validFrom,
+                    validThrough: $0.validThrough,
+                    x: $0.normalizedBounds.minX,
+                    y: $0.normalizedBounds.minY,
+                    width: $0.normalizedBounds.width,
+                    height: $0.normalizedBounds.height
                 )
             },
             relocationActionIDs: relocationActionIDs.sorted()

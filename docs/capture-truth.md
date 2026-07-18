@@ -100,6 +100,20 @@ The implementation fails closed. These conditions prevent idle proof:
 
 Old recordings without a capture-truth sidecar retain the legacy motion-based waiting behavior for reproducibility. A new timeline that declares a sidecar but cannot supply valid evidence preserves all unverified time at 1x.
 
+## Insertion-caret exception
+
+Capture truth continues to report a blinking insertion caret as `visibleChange`; the recorder never rewrites that factual record. The editorial retimer has one deliberately narrow exception so a focused text field does not turn agent thinking time into a long ambient-motion span.
+
+A change qualifies only when all of the following agree:
+
+- the exact thresholded pixel delta is a small vertical bar at a stationary location;
+- at least four transitions recur with a stable blink cadence;
+- the delta is contained by a text-field bound supplied by a typing action or Accessibility role;
+- that text-field evidence is still inside its factual action-bounded lifetime;
+- no other visual change occurs in the same sampled frame.
+
+Every non-caret change is a hard proof boundary: caret ranges receive no temporal padding and are never merged across it. Factual action intervals still have higher priority than the caret classification. A square spinner, progress indicator, counter, irregular flicker, or small animation without text-field evidence remains application-owned motion and is preserved.
+
 ## Factual action policy
 
 All Computer Use actions remain in the timeline. Pointer and input actions retain their normal factual presentation rules. Scroll is the only action currently eligible to lose its generic protected hold because it has no synthetic pointer or keyboard overlay.
@@ -122,5 +136,6 @@ Removing a no-op scroll's hold does not remove the action record. It lets the or
 - blank and suspended capture.
 - persistent scale and active-raster drift from an immutable baseline;
 - missing geometry metadata and subpixel-jitter tolerances.
+- periodic caret recognition, generic spinner preservation, and hard non-caret proof boundaries.
 
 Director tests verify that a factual action stays protected without proof, a proven no-op can lose only its generic hold, and every unverified interval remains contiguous at 1x. This preserves the intended asymmetric behavior: uncertainty can retain too much time, but it cannot delete visible information.

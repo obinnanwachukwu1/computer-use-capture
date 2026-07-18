@@ -427,6 +427,7 @@ public struct NativeComposition: Sendable {
         reduceWaiting: Bool = false,
         waitingTime: Double = 0.1,
         motionRanges: [ClosedRange<Double>] = [],
+        caretBlinkRanges: [ClosedRange<Double>] = [],
         motionObservations: [VisualMotionObservation] = [],
         interactionPhases: [Int: InteractionPhases] = [:],
         verifiedIdleRanges: [ClosedRange<Double>]? = nil,
@@ -512,6 +513,7 @@ public struct NativeComposition: Sendable {
             reduceWaiting: reduceWaiting,
             waitingTime: max(0, waitingTime),
             motionRanges: motionRanges,
+            caretBlinkRanges: caretBlinkRanges,
             interactionStarts: interactionStarts,
             verifiedIdleRanges: verifiedIdleRanges,
             provenIdleActionIDs: provenIdleActionIDs
@@ -1562,6 +1564,7 @@ public struct NativeComposition: Sendable {
         reduceWaiting: Bool,
         waitingTime: Double,
         motionRanges: [ClosedRange<Double>],
+        caretBlinkRanges: [ClosedRange<Double>],
         interactionStarts: [Int: Double],
         verifiedIdleRanges: [ClosedRange<Double>]?,
         provenIdleActionIDs: Set<Int>
@@ -1604,14 +1607,21 @@ public struct NativeComposition: Sendable {
                 let relevantMotion = motionRanges.filter {
                     $0.upperBound > start && $0.lowerBound < end
                 }
+                let caretBlink = caretBlinkRanges.filter {
+                    $0.upperBound > start && $0.lowerBound < end
+                }
                 let boundaries = Set(
                     [start, end]
                         + idle.flatMap { [max(start, $0.lowerBound), min(end, $0.upperBound)] }
                         + relevantMotion.flatMap { [max(start, $0.lowerBound), min(end, $0.upperBound)] }
+                        + caretBlink.flatMap {
+                            [max(start, $0.lowerBound), min(end, $0.upperBound)]
+                        }
                 ).sorted()
                 for pair in zip(boundaries, boundaries.dropFirst()) where pair.1 > pair.0 {
                     let midpoint = (pair.0 + pair.1) / 2
-                    if idle.contains(where: { $0.contains(midpoint) }) {
+                    if idle.contains(where: { $0.contains(midpoint) })
+                        || caretBlink.contains(where: { $0.contains(midpoint) }) {
                         appendStaticGap(pair.0, pair.1)
                     } else if relevantMotion.contains(where: { $0.contains(midpoint) }) {
                         raw.append((pair.0, pair.1, rate))

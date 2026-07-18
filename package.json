@@ -42,7 +42,6 @@
     "record": "node scripts/record-session.mjs",
     "audit:accessibility": "node scripts/audit-accessibility-vocabulary.mjs",
     "audit:alignment": "node scripts/validate-alignment.mjs",
-    "audit:privacy": "node scripts/audit-repository-hygiene.mjs",
     "build:prebuilt": "node scripts/build-prebuilt.mjs",
     "verify:prebuilt": "node scripts/verify-prebuilt.mjs",
     "smoke:package": "node scripts/smoke-package.mjs",

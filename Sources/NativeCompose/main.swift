@@ -224,6 +224,7 @@ func render(_ options: Options) async throws {
         scale: contentScale
     )
     let timingProbes = interactionTimingProbes(timeline: timeline)
+    let textInputs = textInputEvidence(timeline: timeline)
     let relocationActionIDs = Set(timeline.events.enumerated().compactMap { id, event in
         event.semanticTarget?.viewportRelocation?.kind == "target-entered-viewport" ? id : nil
     })
@@ -245,6 +246,7 @@ func render(_ options: Options) async throws {
         source: options.source,
         fallbackActionTimes: fallbackActionTimes,
         timingProbes: timingProbes,
+        textInputEvidence: textInputs,
         relocationActionIDs: relocationActionIDs,
         enabled: options.useAnalysisCache,
         collectMotionFields: collectMotionFields
@@ -256,6 +258,7 @@ func render(_ options: Options) async throws {
             sourceDuration: sourceDuration,
             fallbackActionTimes: fallbackActionTimes,
             timingProbes: timingProbes,
+            textInputEvidence: textInputs,
             relocationActionIDs: relocationActionIDs,
             collectMotionFields: collectMotionFields
         )
@@ -297,6 +300,10 @@ func render(_ options: Options) async throws {
             "\(String(format: "%.2f", $0.lowerBound))-\(String(format: "%.2f", $0.upperBound))"
         }.joined(separator: ",")
         print("motion ranges=\(rangeSummary)")
+        let caretSummary = motionAnalysis.caretBlinkRanges.map {
+            "\(String(format: "%.2f", $0.lowerBound))-\(String(format: "%.2f", $0.upperBound))"
+        }.joined(separator: ",")
+        print("caret blink ranges=\(caretSummary)")
     }
     let baseComposition = NativeComposition(
         timeline: timeline,
@@ -306,6 +313,7 @@ func render(_ options: Options) async throws {
         reduceWaiting: options.reduceWaiting,
         waitingTime: options.waitingTime,
         motionRanges: motionAnalysis.ranges,
+        caretBlinkRanges: motionAnalysis.caretBlinkRanges,
         motionObservations: motionAnalysis.observations,
         interactionPhases: motionAnalysis.interactionPhases,
         verifiedIdleRanges: captureTruth.verifiedIdleRanges,
@@ -838,6 +846,49 @@ func interactionTimingProbes(timeline: Timeline) -> [InteractionTimingProbe] {
     }
 }
 
+func textInputEvidence(timeline: Timeline) -> [TextInputEvidence] {
+    let typingActions: Set<String> = ["type_text", "set_value", "select_text"]
+    return timeline.events.enumerated().compactMap { index, event in
+        let kind = event.action ?? event.method ?? ""
+        guard let time = event.time,
+              let bounds = normalizedSemanticBounds(event),
+              typingActions.contains(kind) || isTextInputRole(event.semanticTarget?.role)
+        else { return nil }
+        // A typing action corroborates a focus that may have begun when the
+        // preceding action revealed the field. Any subsequent non-typing
+        // action closes this evidence lifetime; later caret-like motion must
+        // earn new text-input evidence instead of inheriting stale context.
+        let validFrom = typingActions.contains(kind)
+            ? timeline.events[..<index].reversed().compactMap(\.time).first ?? time
+            : time
+        let validThrough = timeline.events.dropFirst(index + 1).first {
+            guard let nextKind = $0.action ?? $0.method else { return false }
+            return !typingActions.contains(nextKind)
+        }?.time
+        return TextInputEvidence(
+            time: time,
+            normalizedBounds: bounds,
+            validFrom: validFrom,
+            validThrough: validThrough
+        )
+    }
+}
+
+func isTextInputRole(_ role: String?) -> Bool {
+    guard let role = role?.lowercased() else { return false }
+    return role.contains("textfield") || role.contains("text field")
+        || role.contains("textarea") || role.contains("text area")
+}
+
+func normalizedSemanticBounds(_ event: Timeline.Event) -> CGRect? {
+    guard let bounds = event.semanticTarget?.bounds,
+          let x = bounds.xNorm, let y = bounds.yNorm,
+          let width = bounds.widthNorm, let height = bounds.heightNorm,
+          [x, y, width, height].allSatisfy(\.isFinite), width > 0, height > 0
+    else { return nil }
+    return CGRect(x: x, y: y, width: width, height: height)
+}
+
 func motionFocusIntent(_ event: Timeline.Event) -> MotionFocusIntent {
     let title = event.semanticTarget?.title?
         .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -847,14 +898,7 @@ func motionFocusIntent(_ event: Timeline.Event) -> MotionFocusIntent {
 }
 
 func normalizedTimingTarget(_ event: Timeline.Event) -> CGRect? {
-    let semanticBounds: CGRect? = {
-        guard let bounds = event.semanticTarget?.bounds,
-              let x = bounds.xNorm, let y = bounds.yNorm,
-              let width = bounds.widthNorm, let height = bounds.heightNorm,
-              [x, y, width, height].allSatisfy(\.isFinite), width > 0, height > 0
-        else { return nil }
-        return CGRect(x: x, y: y, width: width, height: height)
-    }()
+    let semanticBounds = normalizedSemanticBounds(event)
     let point: CGPoint? = {
         guard let x = event.coordinates?.xNorm, let y = event.coordinates?.yNorm,
               x.isFinite, y.isFinite else { return nil }
@@ -1004,6 +1048,7 @@ private func makeCameraPlan(
             actions: resolvedComposition.actions,
             sourceDuration: sourceDuration,
             motionRanges: motionAnalysis.ranges,
+            caretBlinkRanges: motionAnalysis.caretBlinkRanges,
             protectedInteractionRanges: resolvedComposition.protectedPointerTravelRanges(
                 sourceDuration: sourceDuration
             ),
@@ -1065,6 +1110,7 @@ private func makeCameraPlan(
                 actions: actions,
                 sourceDuration: sourceDuration,
                 motionRanges: motionAnalysis.ranges,
+                caretBlinkRanges: motionAnalysis.caretBlinkRanges,
                 protectedInteractionRanges: choreography.protectedPointerTravelRanges(
                     sourceDuration: sourceDuration
                 ),

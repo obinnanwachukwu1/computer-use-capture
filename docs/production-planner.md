@@ -84,7 +84,7 @@ override factual pointer, Accessibility, or required-context evidence.
 
 ## Retiming
 
-`GlobalRetimePlanner` partitions source time once using all globally selected actions and all detected motion ranges. Action intervals remain 1x. Ambient UI motion is retained and may use the configured dead-time rate. Only static intervals are candidates for waiting reduction. It does not progressively edit gaps around one action at a time.
+`GlobalRetimePlanner` partitions source time once using all globally selected actions and all detected motion ranges. Action intervals remain 1x. Ambient UI motion is retained and may use the configured dead-time rate. Only static intervals are candidates for waiting reduction, plus the narrowly proven insertion-caret exception documented in [`capture-truth.md`](capture-truth.md). Generic spinners and application animation are not idle. The planner does not progressively edit gaps around one action at a time.
 
 Because retiming changes camera scheduling and selected timing changes retiming, the CLI runs a bounded fixed-point iteration and emits the final stable decision set. The iteration count is diagnostic and not an additional policy layer.
 

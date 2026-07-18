@@ -6,6 +6,7 @@ import NativeDirector
 
 struct MotionAnalysis {
     let ranges: [ClosedRange<Double>]
+    let caretBlinkRanges: [ClosedRange<Double>]
     let sampledFrames: Int
     let motionFrames: Int
     let observations: [VisualMotionObservation]
@@ -45,6 +46,7 @@ enum MotionAnalyzer {
     static func canonicalized(_ analysis: MotionAnalysis) -> MotionAnalysis {
         MotionAnalysis(
             ranges: analysis.ranges,
+            caretBlinkRanges: analysis.caretBlinkRanges,
             sampledFrames: analysis.sampledFrames,
             motionFrames: analysis.motionFrames,
             observations: analysis.observations.sorted(by: observationComesBefore),
@@ -65,6 +67,7 @@ enum MotionAnalyzer {
         sourceDuration: Double,
         fallbackActionTimes: [Int: Double] = [:],
         timingProbes: [InteractionTimingProbe] = [],
+        textInputEvidence: [TextInputEvidence] = [],
         relocationActionIDs: Set<Int> = [],
         samplesPerSecond: Double = 12,
         channelThreshold: Int = 20,
@@ -91,6 +94,7 @@ enum MotionAnalyzer {
         var previous: [UInt8]?
         var motionTimes: [Double] = []
         var globalMotionComponents: [(time: Double, component: DetectedMotionComponent)] = []
+        var timedMotionSamples: [TimedMotionSample] = []
         var observations: [VisualMotionObservation] = []
         var sampledFrames = 0
         var beforeSnapshots: [Int: [UInt8]] = [:]
@@ -240,6 +244,18 @@ enum MotionAnalyzer {
                 if !components.isEmpty {
                     motionTimes.append(time)
                     globalMotionComponents += components.map { (time, $0) }
+                    if let exactDelta = exactDeltaComponent(
+                        previous: previous,
+                        current: pixels,
+                        width: analysisWidth,
+                        height: analysisHeight,
+                        channelThreshold: channelThreshold
+                    ) {
+                        timedMotionSamples.append(TimedMotionSample(
+                            time: time,
+                            components: [exactDelta]
+                        ))
+                    }
                 }
             }
             previous = pixels
@@ -488,6 +504,10 @@ enum MotionAnalyzer {
             }
         }
         let motionRanges = MotionDetection.ranges(forMotionTimes: motionTimes)
+        let caretBlinkRanges = CaretBlinkDetection.ranges(
+            samples: timedMotionSamples,
+            textInputs: textInputEvidence
+        )
         observations += sustainedMotionObservations(
             ranges: motionRanges,
             components: globalMotionComponents
@@ -499,6 +519,7 @@ enum MotionAnalyzer {
         observations.sort(by: observationComesBefore)
         return MotionAnalysis(
             ranges: motionRanges,
+            caretBlinkRanges: caretBlinkRanges,
             sampledFrames: sampledFrames,
             motionFrames: motionTimes.count,
             observations: observations,
@@ -676,6 +697,47 @@ enum MotionAnalyzer {
             channels += 3
         }
         return channels == 0 ? 0 : Double(total) / Double(channels)
+    }
+
+    /// Camera components intentionally carry tile padding. Caret recognition
+    /// needs the opposite representation: the exact thresholded delta bounds
+    /// so a two-pixel insertion bar is not mistaken for a square UI object.
+    private static func exactDeltaComponent(
+        previous: [UInt8],
+        current: [UInt8],
+        width: Int,
+        height: Int,
+        channelThreshold: Int
+    ) -> DetectedMotionComponent? {
+        guard previous.count == current.count, current.count == width * height * 4 else {
+            return nil
+        }
+        var minX = width, minY = height, maxX = -1, maxY = -1, changed = 0
+        for pixel in 0..<(width * height) {
+            let offset = pixel * 4
+            let delta = max(
+                abs(Int(current[offset]) - Int(previous[offset])),
+                abs(Int(current[offset + 1]) - Int(previous[offset + 1])),
+                abs(Int(current[offset + 2]) - Int(previous[offset + 2]))
+            )
+            guard delta >= channelThreshold else { continue }
+            let x = pixel % width, y = pixel / width
+            minX = min(minX, x); minY = min(minY, y)
+            maxX = max(maxX, x); maxY = max(maxY, y)
+            changed += 1
+        }
+        guard changed > 0 else { return nil }
+        return DetectedMotionComponent(
+            normalizedBounds: CGRect(
+                x: CGFloat(minX) / CGFloat(width),
+                y: CGFloat(minY) / CGFloat(height),
+                width: CGFloat(maxX - minX + 1) / CGFloat(width),
+                height: CGFloat(maxY - minY + 1) / CGFloat(height)
+            ),
+            changedFraction: Double(changed) / Double(width * height),
+            magnitude: 1,
+            kind: .appearance
+        )
     }
 
     private static func halfScaleRGBA(

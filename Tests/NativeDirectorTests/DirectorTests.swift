@@ -434,6 +434,163 @@ private struct TimelineFixture: Encodable {
     #expect(blinkRanges[0].upperBound > 3.5)
 }
 
+@Test func periodicCaretInsideKnownTextInputIsEditoriallyIncidental() {
+    let input = TextInputEvidence(
+        time: 1.2,
+        normalizedBounds: CGRect(x: 0.2, y: 0.3, width: 0.45, height: 0.10),
+        validFrom: 1.0
+    )
+    let samples = [1.0, 1.5, 2.0, 2.5, 3.0].map { time in
+        TimedMotionSample(time: time, components: [DetectedMotionComponent(
+            normalizedBounds: CGRect(x: 0.42, y: 0.32, width: 0.006, height: 0.05),
+            changedFraction: 0.0002,
+            magnitude: 0.8,
+            kind: .appearance
+        )])
+    }
+
+    let ranges = CaretBlinkDetection.ranges(samples: samples, textInputs: [input])
+    #expect(ranges.count == 1)
+    #expect(ranges[0].lowerBound == 1.0)
+    #expect(ranges[0].upperBound == 3.0)
+}
+
+@Test func smallPeriodicSpinnerRemainsApplicationMotion() {
+    let input = TextInputEvidence(
+        time: 1.2,
+        normalizedBounds: CGRect(x: 0.2, y: 0.3, width: 0.45, height: 0.10),
+        validFrom: 1.0
+    )
+    let samples = [1.0, 1.5, 2.0, 2.5, 3.0].map { time in
+        TimedMotionSample(time: time, components: [DetectedMotionComponent(
+            normalizedBounds: CGRect(x: 0.42, y: 0.33, width: 0.03, height: 0.03),
+            changedFraction: 0.0004,
+            magnitude: 0.8,
+            kind: .transformation
+        )])
+    }
+
+    #expect(CaretBlinkDetection.ranges(samples: samples, textInputs: [input]).isEmpty)
+}
+
+@Test func caretShapeWithoutTextEvidenceOrStableCadenceIsNotRemoved() {
+    let bounds = CGRect(x: 0.42, y: 0.32, width: 0.006, height: 0.05)
+    let component = DetectedMotionComponent(
+        normalizedBounds: bounds,
+        changedFraction: 0.0002,
+        magnitude: 0.8,
+        kind: .appearance
+    )
+    let irregular = [1.0, 1.31, 1.92, 2.29, 3.0].map {
+        TimedMotionSample(time: $0, components: [component])
+    }
+    let input = TextInputEvidence(
+        time: 1.2,
+        normalizedBounds: CGRect(x: 0.2, y: 0.3, width: 0.45, height: 0.10),
+        validFrom: 1.0
+    )
+
+    #expect(CaretBlinkDetection.ranges(samples: irregular, textInputs: [input]).isEmpty)
+    #expect(CaretBlinkDetection.ranges(samples: irregular, textInputs: []).isEmpty)
+}
+
+@Test func nonCaretChangeSplitsCaretProofWithoutBeingSwallowedByHandles() {
+    let input = TextInputEvidence(
+        time: 1.2,
+        normalizedBounds: CGRect(x: 0.2, y: 0.3, width: 0.45, height: 0.10),
+        validFrom: 1.0
+    )
+    let caret = DetectedMotionComponent(
+        normalizedBounds: CGRect(x: 0.42, y: 0.32, width: 0.006, height: 0.05),
+        changedFraction: 0.0002,
+        magnitude: 0.8,
+        kind: .appearance
+    )
+    let applicationChange = DetectedMotionComponent(
+        normalizedBounds: CGRect(x: 0.72, y: 0.15, width: 0.08, height: 0.08),
+        changedFraction: 0.004,
+        magnitude: 0.8,
+        kind: .transformation
+    )
+    var samples = [1.0, 1.5, 2.0, 2.5].map {
+        TimedMotionSample(time: $0, components: [caret])
+    }
+    samples.append(TimedMotionSample(time: 2.7, components: [applicationChange]))
+    samples += [3.0, 3.5, 4.0, 4.5].map {
+        TimedMotionSample(time: $0, components: [caret])
+    }
+
+    let ranges = CaretBlinkDetection.ranges(samples: samples, textInputs: [input])
+    #expect(ranges == [1.0...2.5, 3.0...4.5])
+    #expect(!ranges.contains { $0.contains(2.7) })
+}
+
+@Test func periodicCaretShapeCannotReuseExpiredTextInputEvidence() {
+    let input = TextInputEvidence(
+        time: 1.0,
+        normalizedBounds: CGRect(x: 0.2, y: 0.3, width: 0.45, height: 0.10),
+        validFrom: 1.0,
+        validThrough: 3.0
+    )
+    let component = DetectedMotionComponent(
+        normalizedBounds: CGRect(x: 0.42, y: 0.32, width: 0.006, height: 0.05),
+        changedFraction: 0.0002,
+        magnitude: 0.8,
+        kind: .appearance
+    )
+    let samples = [4.0, 4.5, 5.0, 5.5, 6.0].map {
+        TimedMotionSample(time: $0, components: [component])
+    }
+
+    #expect(CaretBlinkDetection.ranges(samples: samples, textInputs: [input]).isEmpty)
+}
+
+@Test func globalRetimeCutsProvenCaretBlinkButPreservesGenericSpinner() {
+    let caret = GlobalRetimePlanner.plan(
+        actions: [],
+        sourceDuration: 10,
+        motionRanges: [2...8],
+        caretBlinkRanges: [2...8],
+        verifiedIdleRanges: [],
+        reduceWaiting: true,
+        waitingTime: 0.1,
+        deadTimeRate: 2
+    )
+    let spinner = GlobalRetimePlanner.plan(
+        actions: [],
+        sourceDuration: 10,
+        motionRanges: [2...8],
+        verifiedIdleRanges: [],
+        reduceWaiting: true,
+        waitingTime: 0.1,
+        deadTimeRate: 2
+    )
+
+    #expect(!caret.contains { $0.sourceStart < 5 && $0.sourceEnd > 5 })
+    #expect(spinner.contains { $0.sourceStart <= 2 && $0.sourceEnd >= 8 && $0.rate == 2 })
+}
+
+@Test func factualActionStillOutranksCaretAndBroadResponseProtectionDoesNot() throws {
+    let directed = try composition(
+        "[{\"action\":\"click\",\"time\":5.0,\"coordinates\":{\"xNorm\":0.5,\"yNorm\":0.5},\"targetResolution\":{\"provenance\":\"direct\",\"confidence\":0.99}}]",
+        duration: 10
+    )
+    let retime = GlobalRetimePlanner.plan(
+        actions: directed.actions,
+        sourceDuration: 10,
+        motionRanges: [2...8],
+        caretBlinkRanges: [2...8],
+        protectedResponseRanges: [2...8],
+        verifiedIdleRanges: [],
+        reduceWaiting: true,
+        waitingTime: 0.1,
+        deadTimeRate: 2
+    )
+
+    #expect(retime.contains { $0.sourceStart <= 5 && $0.sourceEnd >= 5 && $0.rate == 1 })
+    #expect(!retime.contains { $0.sourceStart < 3 && $0.sourceEnd > 3 })
+}
+
 @Test func spatialMotionSeparatesTranslationFromAppearance() {
     let width = 80, height = 60
     var before = [UInt8](repeating: 245, count: width * height * 4)

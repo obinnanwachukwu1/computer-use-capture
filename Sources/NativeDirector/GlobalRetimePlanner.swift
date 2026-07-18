@@ -4,7 +4,9 @@ import Foundation
 /// detected motion ranges. It never scans gaps and commits them incrementally;
 /// instead it labels one global interval partition, then emits the time map.
 public enum GlobalRetimePlanner {
-    private enum Label: Int { case staticGap, ambientMotion, unverified, protectedResponse, action }
+    private enum Label: Int {
+        case staticGap, caretBlink, ambientMotion, unverified, protectedResponse, action
+    }
 
     /// Converts globally retained structural observations into source ranges
     /// whose UI animation and settled result must remain readable. The scene
@@ -28,6 +30,7 @@ public enum GlobalRetimePlanner {
         actions: [DirectedAction],
         sourceDuration: Double,
         motionRanges: [ClosedRange<Double>],
+        caretBlinkRanges: [ClosedRange<Double>] = [],
         protectedInteractionRanges: [ClosedRange<Double>] = [],
         protectedResponseRanges: [ClosedRange<Double>] = [],
         verifiedIdleRanges: [ClosedRange<Double>]? = nil,
@@ -42,6 +45,9 @@ public enum GlobalRetimePlanner {
             max(0, $0.lowerBound)...min(sourceDuration, $0.upperBound)
         }.filter { $0.upperBound > $0.lowerBound }
         let verifiedIdle = verifiedIdleRanges?.map {
+            max(0, $0.lowerBound)...min(sourceDuration, $0.upperBound)
+        }.filter { $0.upperBound > $0.lowerBound }
+        let caretBlink = caretBlinkRanges.map {
             max(0, $0.lowerBound)...min(sourceDuration, $0.upperBound)
         }.filter { $0.upperBound > $0.lowerBound }
         let leadingTrimStart = computeLeadingTrimStart(
@@ -69,6 +75,7 @@ public enum GlobalRetimePlanner {
         if let leadingTrimStart { boundaryValues.append(leadingTrimStart) }
         boundaryValues += actionRanges.flatMap { [$0.lowerBound, $0.upperBound] }
         boundaryValues += motion.flatMap { [$0.lowerBound, $0.upperBound] }
+        boundaryValues += caretBlink.flatMap { [$0.lowerBound, $0.upperBound] }
         boundaryValues += protectedResponses.flatMap { [$0.lowerBound, $0.upperBound] }
         boundaryValues += (verifiedIdle ?? []).flatMap { [$0.lowerBound, $0.upperBound] }
         let boundaries = Set(boundaryValues).sorted()
@@ -77,6 +84,7 @@ public enum GlobalRetimePlanner {
             let midpoint = (pair.0 + pair.1) / 2
             let label: Label
             if actionRanges.contains(where: { $0.contains(midpoint) }) { label = .action }
+            else if caretBlink.contains(where: { $0.contains(midpoint) }) { label = .caretBlink }
             else if protectedResponses.contains(where: { $0.contains(midpoint) }) { label = .protectedResponse }
             else if let verifiedIdle {
                 if verifiedIdle.contains(where: { $0.contains(midpoint) }) { label = .staticGap }
@@ -105,7 +113,7 @@ public enum GlobalRetimePlanner {
                 raw.append((intervalStart, interval.end, 1))
             case .ambientMotion:
                 raw.append((intervalStart, interval.end, max(1, deadTimeRate)))
-            case .staticGap:
+            case .staticGap, .caretBlink:
                 if !reduceWaiting {
                     raw.append((intervalStart, interval.end, max(1, deadTimeRate)))
                     continue
