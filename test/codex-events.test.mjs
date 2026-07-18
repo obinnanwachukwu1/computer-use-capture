@@ -6,6 +6,7 @@ import path from "node:path";
 import {
   extractComputerUseEvents,
   extractSkyCalls,
+  findCodexSessions,
   mergeAccessibilityState,
   parseAccessibilityElements
 } from "../lib/codex-events.mjs";
@@ -16,6 +17,36 @@ import {
 import { mapEventCoordinates, validateCoordinateSpace } from "../lib/coordinate-mapper.mjs";
 import { redactEventForPersistence } from "../lib/redaction.mjs";
 import { CodexEventTailer } from "../lib/codex-event-tailer.mjs";
+
+test("exact Codex task binding survives canonical working-directory aliases", async () => {
+  const sessionsRoot = await mkdtemp(path.join(os.tmpdir(), "computer-use-capture-sessions-"));
+  const sessionFile = path.join(sessionsRoot, "rollout.jsonl");
+  await writeFile(sessionFile, `${JSON.stringify({
+    type: "session_meta",
+    payload: { id: "thread-exact-fixture", cwd: "/tmp/release-smoke" }
+  })}\n`);
+
+  const exact = await findCodexSessions({
+    cwd: "/private/tmp/release-smoke",
+    threadId: "thread-exact-fixture",
+    sessionsRoot
+  });
+  assert.equal(exact.length, 1);
+  assert.equal(exact[0].threadId, "thread-exact-fixture");
+
+  const wrongThread = await findCodexSessions({
+    cwd: "/tmp/release-smoke",
+    threadId: "thread-other-fixture",
+    sessionsRoot
+  });
+  assert.deepEqual(wrongThread, []);
+
+  const cwdFallback = await findCodexSessions({
+    cwd: "/private/tmp/release-smoke",
+    sessionsRoot
+  });
+  assert.deepEqual(cwdFallback, []);
+});
 
 test("extracts unchanged sky x-y actions through local variables", () => {
   const calls = extractSkyCalls(`
