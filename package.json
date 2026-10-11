@@ -57,7 +57,7 @@
     "mcp": "node scripts/mcp-server.mjs"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@modelcontextprotocol/sdk": "^1.31.0",
     "acorn": "^8.17.0",
     "ajv": "^8.20.0",
     "ajv-formats": "^3.0.1",
@@ -68,6 +68,7 @@
     "fast-uri": "3.1.8",
     "hono": "4.13.7",
     "ip-address": "10.7.3",
-    "qs": "6.16.0"
+    "qs": "6.16.0",
+    "proxy-addr": "2.0.8"
   }
 }
